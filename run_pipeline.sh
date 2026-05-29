@@ -14,7 +14,7 @@ SCRIPT_LOG_FILE="$PROJECT_DIR/logs/pipeline_execution.log"
 if [ -d "/home/ubuntu" ]; then
     CONDA_BASE_PATH=$(conda info --base 2>/dev/null || echo "/home/ubuntu/miniconda3")
 else
-    CONDA_BASE_PATH=$(conda info --base 2>/dev/null || echo "/home/ec2-user/miniconda3")
+    CONDA_BASE_PATH=$(conda info --base 2>/dev/null || echo "/home/ec2-user/miniconda")
 fi
 
 # --- Archivos de Datos ---
