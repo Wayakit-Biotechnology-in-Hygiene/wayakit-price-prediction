@@ -46,6 +46,11 @@ run_command() {
     fi
 }
 
+# --- Apagado garantizado ---
+# Se dispara en CUALQUIER salida del script (exito o exit 1), garantizando que
+# la instancia siempre se apague y no quede encendida acumulando costos.
+trap 'rc=$?; log_message "Pipeline finalizado (codigo=$rc). Programando apagado en 1 minuto."; sudo shutdown -h +1' EXIT
+
 # --- Lógica de Etapas (Stages) ---
 STAGE=1
 if [ "$1" == "--stage" ] && [ "$2" == "2" ]; then
@@ -116,12 +121,9 @@ if [ "$STAGE" == "1" ]; then
     log_message "--- ETAPA 1 (Preparación) completada ---"
     log_message "Desactivando entorno Conda."
     conda deactivate
-    
-    # --- Apagado automático ---
-    log_message "El servidor se apagará en 1 minuto."
+
     log_message "========================================"
-    sudo shutdown -h +1
-    exit 0
+    exit 0  # el trap EXIT programa el apagado
 
 fi
 # --- FIN DE ETAPA 1 ---
@@ -225,13 +227,9 @@ if [ "$STAGE" == "2" ]; then
 
     log_message "Desactivando entorno Conda."
     conda deactivate
-    
-    # --- Apagado INMEDIATO de Etapa 2 ---
+
     log_message "Pipeline Wayakit (ETAPA 2) completado."
-    log_message "El servidor se apagará en 1 minuto."
     log_message "========================================"
-    
-    sudo shutdown -h +1
-    exit 0
+    exit 0  # el trap EXIT programa el apagado
 fi
 # --- FIN DE ETAPA 2 ---
