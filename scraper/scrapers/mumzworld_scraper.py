@@ -41,10 +41,12 @@ class MumzworldScraper:
         }
         try:
             driver.get(product_url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.ProductDetails_productName__lcVK_")))
+            # Selectores por prefijo: el hash de CSS-modules (ej. __lcVK_) cambia
+            # con cada redeploy del frontend; el prefijo de la clase no.
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1[class*='ProductDetails_productName__']")))
             soup = BeautifulSoup(driver.page_source, 'html.parser')
 
-            product_name_tag = soup.find('h1', class_='ProductDetails_productName__lcVK_')
+            product_name_tag = soup.select_one("h1[class*='ProductDetails_productName__']")
             product_name = self._safe_get_text(product_name_tag)
             if product_name:
                 details['Product'] = product_name
@@ -63,7 +65,7 @@ class MumzworldScraper:
                     details['Unit of measurement'] = parsed_data['unit']
                     logger.debug(f"      -> Extracted amount: {details['Total quantity']} {parsed_data['unit']}")
 
-            price_tag = soup.find('span', class_='Price_integer__3ngZQ')
+            price_tag = soup.select_one("span[class*='Price_integer__']")
             if price_tag:
                 details['Price_SAR'] = self._safe_get_text(price_tag).replace(',', '')
         except Exception as e:
@@ -74,7 +76,7 @@ class MumzworldScraper:
         self._log(f"  [Mumzworld Scraper] Searching: '{keyword}' (Mode: {search_mode})")
         search_url = f"{self.base_url}search?q={quote(keyword)}"
         valid_products_found = []
-        products_to_find = 2
+        products_to_find = 10
 
         service = ChromeService(executable_path=self.driver_path)
         options = webdriver.ChromeOptions()
@@ -98,11 +100,11 @@ class MumzworldScraper:
         try:
             logger.info(f"    > Navigating to: {search_url}")
             driver.get(search_url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.ProductCard_productCard__kFgss")))
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='ProductCard_productCard__']")))
             logger.info("    > Search results page loaded. Analyzing products...")
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
-            product_containers = soup.select("div.ProductCard_productCard__kFgss")
+            product_containers = soup.select("div[class*='ProductCard_productCard__']")
 
             if not product_containers:
                 logger.warning("    ! Warning: No product containers found.")
@@ -113,7 +115,7 @@ class MumzworldScraper:
                     logger.info(f"    > Limit of {products_to_find} VALID products reached.")
                     break
 
-                link_tag = container.find('a', class_='ProductCard_productName__Dz1Yx')
+                link_tag = container.select_one("a[class*='ProductCard_productName__']")
                 if link_tag and link_tag.has_attr('href'):
                     product_url = urljoin(self.base_url, link_tag['href'])
                     logger.debug(f"      -> Visiting: {product_url[:80]}...")

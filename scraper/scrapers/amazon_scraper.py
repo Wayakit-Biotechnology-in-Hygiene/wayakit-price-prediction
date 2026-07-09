@@ -1,5 +1,5 @@
 from bs4 import BeautifulSoup
-from selenium.webdriver.common.by import Byclaud
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from urllib.parse import urljoin
@@ -118,7 +118,7 @@ class AmazonScraper:
     def scrape(self, keyword, search_mode):
         self._log(f"   [Amazon Scraper] Searching: '{keyword}' (Mode: {search_mode})")
         found_products = []
-        products_to_find = 2
+        products_to_find = 50
         search_url = f"{self.base_url}/s?k={keyword.replace(' ', '+')}&language=en_AE"
 
         service = ChromeService(executable_path=self.driver_path)

@@ -3,7 +3,6 @@ import re
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select
 from selenium.common.exceptions import TimeoutException
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
@@ -21,7 +20,7 @@ class GoGreenScraper:
         self.driver_path = driver_path
         self.relevance_agent = relevance_agent
         self.base_url = "https://gogreen.com.sa/"
-        self.products_to_find_limit = 2
+        self.products_to_find_limit = 5
 
     def _log(self, msg):
         logger.info(msg)
@@ -30,24 +29,16 @@ class GoGreenScraper:
         return soup_element.get_text(strip=True) if soup_element else None
 
     def _set_language_to_english(self, driver):
+        # El sitio ahora corre sobre la plataforma Zid: guardar el idioma en su
+        # dialogo solo setea la cookie 'locale', asi que la ponemos directo y
+        # recargamos en vez de interactuar con la UI.
         try:
             html_tag = driver.find_element(By.TAG_NAME, "html")
             if html_tag.get_attribute("lang") == "en":
                 return True
-            logger.info("    -> Changing language to English...")
-            lang_button = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "a.js-language-shipping"))
-            )
-            lang_button.click()
-            language_select_element = WebDriverWait(driver, 10).until(
-                EC.visibility_of_element_located((By.ID, "floatingSelectLanguage"))
-            )
-            select = Select(language_select_element)
-            select.select_by_value("en")
-            save_button = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.js-button-save"))
-            )
-            save_button.click()
+            logger.info("    -> Changing language to English (cookie locale=en-sa)...")
+            driver.add_cookie({'name': 'locale', 'value': 'en-sa'})
+            driver.get(self.base_url)
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, "//html[@lang='en']"))
             )
@@ -64,16 +55,17 @@ class GoGreenScraper:
         }
         try:
             driver.get(product_url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.h5")))
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.title-product")))
             soup = BeautifulSoup(driver.page_source, 'html.parser')
 
-            name_tag = soup.select_one("h1.h5")
+            name_tag = soup.select_one("h1.title-product")
             product_name = self._safe_get_text(name_tag)
             details['Product'] = product_name
 
-            price_tag = soup.select_one("span.js-product-price")
+            price_tag = soup.select_one("p.product-formatted-price")
             if price_tag:
-                price_text = re.search(r'([\d,]+\.\d{2})', price_tag.get_text())
+                # el tema nuevo muestra el precio sin decimales (ej. '182')
+                price_text = re.search(r'([\d,]+(?:\.\d{1,2})?)', price_tag.get_text())
                 if price_text:
                     details['Price_SAR'] = price_text.group(1).replace(',', '')
 
@@ -103,7 +95,7 @@ class GoGreenScraper:
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
         options.add_experimental_option('useAutomationExtension', False)
         options.add_argument('--disable-notifications')
-        # options.add_argument('--headless=new')
+        options.add_argument('--headless=new')
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--disable-gpu')
         options.add_argument('--disable-webgl')
@@ -129,17 +121,17 @@ class GoGreenScraper:
             search_url = urljoin(self.base_url, f"products?search={quote(keyword)}")
             driver.get(search_url)
 
-            WebDriverWait(driver, 15).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.card.card-product")))
-            
+            WebDriverWait(driver, 15).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.product-box")))
+
             soup = BeautifulSoup(driver.page_source, 'html.parser')
-            product_containers = soup.select("div.card.card-product")
+            product_containers = soup.select("div.product-box")
             logger.debug(f"    -> Found {len(product_containers)} products on results page.")
 
             for container in product_containers:
                 if len(all_found_products) >= self.products_to_find_limit:
                     break
 
-                link_tag = container.select_one("a.css-thumbnail")
+                link_tag = container.select_one("a.tp-image-product")
                 if not link_tag or not link_tag.has_attr('href'):
                     continue
                 

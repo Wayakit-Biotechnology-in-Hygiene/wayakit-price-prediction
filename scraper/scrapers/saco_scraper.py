@@ -1,8 +1,9 @@
+import json
 import time
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementClickInterceptedException, InvalidSessionIdException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, InvalidSessionIdException
 from bs4 import BeautifulSoup
 from urllib.parse import quote
 from utils import parse_volume_string, parse_count_string, parse_saco_count_string
@@ -39,33 +40,43 @@ class SacoScraper:
         logger.debug(f"        -> Extracting details from: {product_url}")
         driver.get(product_url)
         WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "h1.product-title"))
+            EC.presence_of_element_located((By.TAG_NAME, "h1"))
         )
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        
+
         details = {
             'Product': 'Not found', 'Price_SAR': '0.00', 'Company': 'Brand not found',
             'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
         }
 
-        title_tag = soup.select_one("h1.product-title")
-        product_name = title_tag.get_text(strip=True) if title_tag else "Not found"
-        details['Product'] = product_name
+        # El sitio nuevo de SACO (Next.js/Tailwind) no tiene clases CSS estables;
+        # el dato confiable es el JSON-LD (schema.org/Product) con nombre y precio.
+        product_data = None
+        for tag in soup.select("script[type='application/ld+json']"):
+            try:
+                data = json.loads(tag.string or '')
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get('@type') == 'Product':
+                product_data = data
+                break
 
-        price_tag = soup.select_one("span.discount-price")
-        if price_tag:
-            price_text = price_tag.get_text(separator='.', strip=True)
-            details['Price_SAR'] = price_text
+        if product_data:
+            details['Product'] = product_data.get('name') or 'Not found'
+            offers = product_data.get('offers') or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            if offers.get('price'):
+                details['Price_SAR'] = str(offers['price'])
+            brand = product_data.get('brand') or {}
+            if isinstance(brand, dict) and brand.get('name'):
+                details['Company'] = brand['name']
+        else:
+            title_tag = soup.find('h1')
+            if title_tag:
+                details['Product'] = title_tag.get_text(strip=True)
 
-        additional_info_items = soup.select("ul.details-box li")
-        for item in additional_info_items:
-            label_tag = item.find("label")
-            if label_tag and "Brand:" in label_tag.get_text():
-                brand_span = label_tag.find_next_sibling("span")
-                if brand_span:
-                    details['Company'] = brand_span.get_text(strip=True)
-                    break
-
+        product_name = details['Product']
         if product_name != "Not found":
             if search_mode == 'units':
                 parsed_data = parse_saco_count_string(product_name)
@@ -84,11 +95,10 @@ class SacoScraper:
     def scrape(self, keyword, search_mode):
         self._log(f"  [Saco Scraper] Searching: '{keyword}'")
         search_keyword = quote(keyword)
-        search_url = f"{self.base_url}search/{search_keyword}"
-        
+        search_url = f"{self.base_url}products-search?q={search_keyword}"
+
         all_found_products = []
-        page_num = 1
-        products_to_find_limit = 2
+        products_to_find_limit = 6
 
         service = ChromeService(executable_path=self.driver_path)
         options = webdriver.ChromeOptions()
@@ -114,114 +124,54 @@ class SacoScraper:
 
         try:
             WebDriverWait(driver, 25).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.product-inner-container"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/en/product/']"))
             )
         except TimeoutException:
-            logger.warning("    > No product containers found on the initial page. Skipping keyword.")
+            logger.warning("    > No product links found on the initial page. Skipping keyword.")
             if driver:
                 driver.quit()
             return []
 
-        while len(all_found_products) < products_to_find_limit:
-            logger.info(f"--- Analyzing Page {page_num} ---")
-            
-            search_page_url = driver.current_url
-            time.sleep(5)
+        time.sleep(3)
 
-            
-            product_containers = driver.find_elements(By.CSS_SELECTOR, "div.product-inner-container")
-            num_containers = len(product_containers)
+        # El sitio nuevo repite el mismo href en varios <a> por card (imagen y
+        # titulo): recolectamos hrefs unicos y los visitamos directo, sin el
+        # flujo viejo de click-y-regresar. Con el limite tan bajo de productos
+        # la primera pagina de resultados siempre alcanza (sin paginacion).
+        product_hrefs = []
+        for link in driver.find_elements(By.CSS_SELECTOR, "a[href*='/en/product/']"):
+            href = link.get_attribute('href')
+            if href and href not in product_hrefs:
+                product_hrefs.append(href)
 
-            if num_containers == 0:
-                logger.warning("    ! No products containers found on this page.")
-                break
+        logger.debug(f"    > Found {len(product_hrefs)} unique products on results page.")
 
-            logger.debug(f"    > Found {num_containers} product containers on this page.")
-
-            
-            for i in range(num_containers):
-                if len(all_found_products) >= products_to_find_limit:
-                    break
-                try:
-                    
-                    current_containers = driver.find_elements(By.CSS_SELECTOR, "div.product-inner-container")
-                    if i >= len(current_containers):
-                        break
-                    
-                    container = current_containers[i]
-
-                    
-                    try:
-                        product_link = container.find_element(By.CSS_SELECTOR, "p.product-name a")
-                        if not product_link.text.strip():
-                            logger.debug(f"      -> Skipping empty product container #{i+1}.")
-                            continue 
-                    except NoSuchElementException:
-                        logger.debug(f"      -> Skipping container #{i+1} (no product link found inside).")
-                        continue 
-
-                    logger.debug(f"      -> Processing product {i+1}/{num_containers}...")
-                    
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", product_link)
-                    time.sleep(1)
-                    product_link.click()
-
-                    WebDriverWait(driver, 30).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "h1.product-title"))
-                    )
-                    
-                    product_url = driver.current_url
-                    product_details = self._extract_product_details(driver, product_url, search_mode)
-                    
-                    if product_details and product_details.get('Total quantity', 0) > 0:
-                        is_relevant = self.relevance_agent.is_relevant(product_details.get('Product'), keyword)
-                        if is_relevant:
-                            all_found_products.append(product_details)
-                            logger.info(f"      -> AI VALIDATED. Product saved: {product_details['Product'][:60]}...")
-                        else:
-                            logger.info(f"      -> DISCARDED BY AI (Not relevant): {product_details['Product'][:60]}...")
-                    else:
-                        logger.info(f"      -> DISCARDED (no quantity): {product_details.get('Product', 'N/A')[:60]}...")
-
-                    driver.get(search_page_url)
-                    WebDriverWait(driver, 30).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.product-inner-container"))
-                    )
-                    time.sleep(2)
-
-                except (TimeoutException, StaleElementReferenceException, ElementClickInterceptedException) as e:
-                    logger.warning(f"      -> WARNING: Could not process product {i+1}. Skipping. Reason: {type(e).__name__}")
-                    driver.get(search_page_url)
-                    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.product-inner-container")))
-                    continue
-                except InvalidSessionIdException:
-                    logger.error(f"      -> FATAL ERROR: Browser session lost. Aborting scrape for '{keyword}'.")
-                    if driver:
-                        driver.quit()
-                    return all_found_products
-            
+        for idx, product_url in enumerate(product_hrefs, 1):
             if len(all_found_products) >= products_to_find_limit:
                 logger.info(f"    > Target of {products_to_find_limit} products reached.")
                 break
-            
             try:
-                current_page_url = driver.current_url
-                next_page_button = driver.find_element(By.CSS_SELECTOR, "a.next")
-                logger.debug("    > Next page button found. Attempting to navigate...")
-                
-                driver.execute_script("arguments[0].click();", next_page_button)
-                time.sleep(3)
+                logger.debug(f"      -> Processing product {idx}/{len(product_hrefs)}...")
+                product_details = self._extract_product_details(driver, product_url, search_mode)
 
-                if driver.current_url == current_page_url:
-                    logger.info("    > URL did not change. Reached the last page.")
-                    break
+                if product_details and product_details.get('Total quantity', 0) > 0:
+                    is_relevant = self.relevance_agent.is_relevant(product_details.get('Product'), keyword)
+                    if is_relevant:
+                        all_found_products.append(product_details)
+                        logger.info(f"      -> AI VALIDATED. Product saved: {product_details['Product'][:60]}...")
+                    else:
+                        logger.info(f"      -> DISCARDED BY AI (Not relevant): {product_details['Product'][:60]}...")
                 else:
-                    page_num += 1
-                    logger.info("    > Successfully navigated to the next page.")
+                    logger.info(f"      -> DISCARDED (no quantity): {product_details.get('Product', 'N/A')[:60]}...")
 
-            except:
-                logger.debug("    > No more pages found. Ending pagination.")
-                break
+            except TimeoutException:
+                logger.warning(f"      -> WARNING: Could not process product {idx}. Skipping.")
+                continue
+            except InvalidSessionIdException:
+                logger.error(f"      -> FATAL ERROR: Browser session lost. Aborting scrape for '{keyword}'.")
+                if driver:
+                    driver.quit()
+                return all_found_products
 
         logger.info(f"\n  [Saco Scraper] Finished scraping. Found data for {len(all_found_products)} products.")
         if driver:

@@ -7,25 +7,21 @@ CSV_COLUMNS = [
 ]
 
 TARGET_MAP = {
-    'Facilities management': ['gogreen'],
+    'Home': ['amazon', 'mumzworld', 'saco'],
+    'Automotive': ['amazon', 'saco'],
+    'Pets': ['amazon'],
+    'Aviation': ['aerosense'],
+    'Airports': ['fine'],
+    'Restaurants': ['fine'],
+    'Facilities management': ['fine', 'gogreen', 'officesupply'],
+    'Faith': ['fine', 'gogreen', 'officesupply'],
+    'Gyms': ['fine', 'gogreen', 'officesupply'],
+    'Land Transportation': ['fine', 'gogreen'],
+    'Spas and salons': ['fine', 'gogreen', 'officesupply'],
+    'Hotels': ['fine', 'gogreen', 'officesupply'],
+    'Healthcare': ['fine', 'saco'],
+    'Industrial facilities': ['fine', 'gogreen', 'officesupply'],
 }
-
-# TARGET_MAP = {
-#     'Home': ['amazon', 'mumzworld', 'saco'],
-#     'Automotive': ['amazon', 'saco'],
-#     'Pets': ['amazon'],
-#     'Aviation': ['aerosense'],
-#     'Airports': ['fine'],
-#     'Restaurants': ['fine'],
-#     'Facilities management': ['fine', 'gogreen', 'officesupply'],
-#     'Faith': ['fine', 'gogreen', 'officesupply'],
-#     'Gyms': ['fine', 'gogreen', 'officesupply'],
-#     'Land Transportation': ['fine', 'gogreen'],
-#     'Spas and salons': ['fine', 'gogreen', 'officesupply'],
-#     'Hotels': ['fine', 'gogreen', 'officesupply'],
-#     'Healthcare': ['fine', 'saco'],
-#     'Industrial facilities': ['fine', 'gogreen', 'officesupply'],
-# }
 
 MUMZWORLD_EXCLUSIONS = [
     'oven and grill cleaner',
