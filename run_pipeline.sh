@@ -64,32 +64,13 @@ fi
 # ==================================================================
 if [ "$STAGE" == "1" ]; then
 
-    IS_FULL_RUN="false"
-    NOW_TS=$(date -u +%s)
-    THREE_MONTHS_AGO_TS=$(date -u -d '1 month ago' +%s)
+    # Modo partial deshabilitado (legacy): el pipeline siempre corre completo, mes con mes.
+    IS_FULL_RUN="true"
 
     log_message "========================================"
     log_message "Iniciando Pipeline Wayakit (ETAPA 1)"
     log_message "========================================"
-    log_message "Verificando tipo de ejecución..."
-
-    if [ ! -f "$LAST_FULL_RUN_FILE" ]; then
-        log_message "Archivo '$LAST_FULL_RUN_FILE' no encontrado. Ejecución COMPLETA requerida."
-        IS_FULL_RUN="true"
-    else
-        LAST_RUN_STR=$(cat "$LAST_FULL_RUN_FILE")
-        LAST_RUN_TS=$(date -u -d "$LAST_RUN_STR" +%s 2>/dev/null)
-        if [ -z "$LAST_RUN_TS" ]; then
-             log_message "ERROR: Formato de fecha inválido. Ejecución COMPLETA requerida."
-             IS_FULL_RUN="true"
-        elif [ "$LAST_RUN_TS" -lt "$THREE_MONTHS_AGO_TS" ]; then
-             log_message "Última ejecución completa ($LAST_RUN_STR) fue hace más de 3 meses. Ejecución COMPLETA requerida."
-             IS_FULL_RUN="true"
-        else
-             log_message "Última ejecución completa ($LAST_RUN_STR) es reciente. Ejecución PARCIAL."
-             IS_FULL_RUN="false"
-        fi
-    fi
+    log_message "Modo partial deshabilitado: siempre ejecución COMPLETA."
 
     log_message "Cambiando a directorio: $PROJECT_DIR"
     cd "$PROJECT_DIR" || { log_message "ERROR: No se pudo acceder a $PROJECT_DIR"; exit 1; }

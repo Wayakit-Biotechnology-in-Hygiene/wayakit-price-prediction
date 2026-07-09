@@ -32,22 +32,15 @@ def prepare_prediction_data():
     """Loads Wayakit products, cleans them and enriches with past quotation data."""
     logger.info("\n--- 2. Preparing Wayakit product list for prediction ---")
     df_wayakit = pd.read_csv('ml_model/wayakit_products_to_predict_odoo.csv')
-    df_quotes_raw = pd.read_csv('ml_model/wayakit_cotizations.csv')
 
-    # --- ORDER CORRECTION (AS YOU SUGGESTED) ---
-    # 1. Clean and rename columns BEFORE merging.
+    # 1. Clean and rename columns.
     df_wayakit.columns = df_wayakit.columns.str.strip()
     df_wayakit.rename(columns={
-        'SubIndustry': 'subindustry', 'Industry': 'industry', 
+        'SubIndustry': 'subindustry', 'Industry': 'industry',
         'Generic product type': 'generic_product_type', 'Type_of_product':'type_of_product'
     }, inplace=True)
 
-    # 2. Prepare and merge with quotations.
-    quotes_df = df_quotes_raw[['Product_ID', 'approved_quote_price']].drop_duplicates(subset='Product_ID', keep='last')
-    df_wayakit = pd.merge(df_wayakit, quotes_df, on='Product_ID', how='left')
-    df_wayakit['approved_quote_price'] = df_wayakit['approved_quote_price'].fillna(0.0)
-
-    # 3. Add 'company' and 'channel' columns.
+    # 2. Add 'company' and 'channel' columns.
     df_wayakit['company'] = 'Wayakit'
     b2c_subindustries = ['home', 'automotive', 'pets']
     df_wayakit['channel'] = np.where(df_wayakit['subindustry'].str.lower().isin(b2c_subindustries), 'B2C', 'B2B')
@@ -90,6 +83,7 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
         market_min = 0.0
         market_max = 0.0
         competitor_count = 0
+        volume_outside_market = False
         
         single_product_df = pd.DataFrame([row])
         model_predicted_price = 0
@@ -97,8 +91,8 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
 
         if is_volumetric:
             single_product_df = single_product_df.rename(columns={'Volume_Liters': 'volume_liters'})
-            features_to_encode = ['volume_liters', 'type_of_product', 'subindustry', 'company', 'channel', 'approved_quote_price']
-            X_pred_encoded = pd.get_dummies(single_product_df[features_to_encode], columns=['type_of_product', 'subindustry', 'company', 'channel'])
+            cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
+            X_pred_encoded = pd.get_dummies(single_product_df[['volume_liters'] + cat_features], columns=cat_features)
             X_pred_aligned = X_pred_encoded.reindex(columns=vol_cols, fill_value=0)
             predicted_price_per_unit = model_vol.predict(X_pred_aligned)[0]
             model_predicted_price = predicted_price_per_unit * row['Volume_Liters']
@@ -110,11 +104,12 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
                 market_min = stat_row.iloc[0]['market_min'] * row['Volume_Liters']
                 market_max = stat_row.iloc[0]['market_max'] * row['Volume_Liters']
                 competitor_count = int(stat_row.iloc[0]['competitor_count'])
+                volume_outside_market = not (stat_row.iloc[0]['vol_min'] <= row['Volume_Liters'] <= stat_row.iloc[0]['vol_max'])
         
         elif is_unit:
             single_product_df = single_product_df.rename(columns={'Pack_quantity_Units': 'total_quantity'})
-            features_to_encode = ['total_quantity', 'type_of_product', 'subindustry', 'company', 'channel', 'approved_quote_price']
-            X_pred_encoded = pd.get_dummies(single_product_df[features_to_encode], columns=['type_of_product', 'subindustry', 'company', 'channel'])
+            cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
+            X_pred_encoded = pd.get_dummies(single_product_df[['total_quantity'] + cat_features], columns=cat_features)
             X_pred_aligned = X_pred_encoded.reindex(columns=unit_cols, fill_value=0)
             predicted_price_per_unit = model_unit.predict(X_pred_aligned)[0]
             model_predicted_price = predicted_price_per_unit * row['Pack_quantity_Units']
@@ -126,6 +121,15 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
                 market_min = stat_row.iloc[0]['market_min'] * row['Pack_quantity_Units']
                 market_max = stat_row.iloc[0]['market_max'] * row['Pack_quantity_Units']
                 competitor_count = int(stat_row.iloc[0]['competitor_count'])
+                volume_outside_market = not (stat_row.iloc[0]['vol_min'] <= row['Pack_quantity_Units'] <= stat_row.iloc[0]['vol_max'])
+
+        # Clamp al rango de mercado observado en competidores; el piso de rentabilidad siempre gana.
+        # Se exigen >=3 competidores: con 1-2 filas el rango colapsa a un punto y fuerza precios absurdos.
+        clamped_to_market = False
+        if competitor_count >= 3 and model_predicted_price > 0:
+            clamped_price = min(max(model_predicted_price, market_min), market_max)
+            clamped_to_market = clamped_price != model_predicted_price
+            model_predicted_price = clamped_price
 
         cost = row['Unit_cost_SAR']
         min_profitable_price = cost * 1.30
@@ -143,6 +147,8 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
             'market_min_found': round(market_min, 2),
             'market_max_found': round(market_max, 2),
             'competitors_count': competitor_count,
+            'clamped_to_market': clamped_to_market,
+            'volume_outside_market': volume_outside_market,
         })
         
     return pd.DataFrame(report_list)

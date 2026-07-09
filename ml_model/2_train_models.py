@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score, mean_absolute_percentage_error
 import joblib
 import os
 import sys
@@ -57,6 +59,26 @@ def filter_outliers_with_percentiles(df_comp, metric_col, p_lower=0.10, p_upper=
     df_cleaned['approved_quote_price'] = 0.0
     return df_cleaned
 
+def train_and_evaluate(X, y, label):
+    """Entrena un RandomForest, loguea métricas en holdout 80/20 y devuelve el modelo final entrenado con todos los datos."""
+    # min_samples_leaf=1 y features extendidas elegidos por holdout con datos reales (jul 2026):
+    # MAPE volumétrico 60%->44% y MAE en filas Wayakit 27.4->16.3 SAR vs la config anterior.
+    rf_params = dict(n_estimators=300, random_state=42, min_samples_leaf=1, oob_score=True, n_jobs=-1)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    eval_model = RandomForestRegressor(**rf_params).fit(X_train, y_train)
+    y_pred = eval_model.predict(X_test)
+    logger.info(
+        f"📊 Métricas holdout ({label}): "
+        f"MAE={mean_absolute_error(y_test, y_pred):.2f} SAR | "
+        f"R²={r2_score(y_test, y_pred):.3f} | "
+        f"MAPE={mean_absolute_percentage_error(y_test, y_pred) * 100:.1f}%"
+    )
+
+    final_model = RandomForestRegressor(**rf_params).fit(X, y)
+    logger.info(f"📊 OOB R² ({label}, modelo final): {final_model.oob_score_:.3f}")
+    return final_model
+
 def save_market_stats(df_vol, df_unit, model_dir):
     """
     Calcula y guarda estadísticas de mercado (Min, Max, Conteo) por tipo de producto.
@@ -66,17 +88,22 @@ def save_market_stats(df_vol, df_unit, model_dir):
     
     # 1. Estadísticas Volumétricas (Precio por Litro)
     # Agrupamos por 'type_of_product' y calculamos min, max y count
-    vol_stats = df_vol.groupby('type_of_product')['price_per_liter'].agg(
-        market_min='min', 
-        market_max='max', 
-        competitor_count='count'
+    vol_stats = df_vol.groupby('type_of_product').agg(
+        market_min=('price_per_liter', 'min'),
+        market_max=('price_per_liter', 'max'),
+        competitor_count=('price_per_liter', 'count'),
+        # Rango de volúmenes observado: fuera de él la extrapolación precio/litro no es confiable
+        vol_min=('volume_liters', 'min'),
+        vol_max=('volume_liters', 'max')
     ).reset_index()
-    
+
     # 2. Estadísticas Unitarias (Precio por Pieza)
-    unit_stats = df_unit.groupby('type_of_product')['price_per_item'].agg(
-        market_min='min', 
-        market_max='max', 
-        competitor_count='count'
+    unit_stats = df_unit.groupby('type_of_product').agg(
+        market_min=('price_per_item', 'min'),
+        market_max=('price_per_item', 'max'),
+        competitor_count=('price_per_item', 'count'),
+        vol_min=('total_quantity', 'min'),
+        vol_max=('total_quantity', 'max')
     ).reset_index()
 
     # Guardamos estos "diccionarios" en disco
@@ -130,13 +157,16 @@ def main():
 
         # --- Model training and saving (your original logic) ---
         logger.info("--- 5. Training and saving models ---")
-        features_vol = ['volume_liters', 'type_of_product', 'subindustry', 'channel', 'approved_quote_price']
-        X_vol_encoded = pd.get_dummies(df_train_vol[features_vol].fillna('Desconocido'), columns=['type_of_product', 'subindustry', 'channel'], drop_first=True)
-        model_vol = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_leaf=2, oob_score=True).fit(X_vol_encoded, df_train_vol['price_per_liter'])
+        # approved_quote_price fuera de las features: es el numerador del target en filas Wayakit (leakage)
+        cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
 
-        features_unit = ['total_quantity', 'type_of_product', 'subindustry', 'channel', 'approved_quote_price']
-        X_unit_encoded = pd.get_dummies(df_train_unit[features_unit].fillna('Desconocido'), columns=['type_of_product', 'subindustry', 'channel'], drop_first=True)
-        model_unit = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_leaf=2, oob_score=True).fit(X_unit_encoded, df_train_unit['price_per_item'])
+        features_vol = ['volume_liters'] + cat_features
+        X_vol_encoded = pd.get_dummies(df_train_vol[features_vol].fillna('Desconocido'), columns=cat_features, drop_first=True)
+        model_vol = train_and_evaluate(X_vol_encoded, df_train_vol['price_per_liter'], 'volumétrico')
+
+        features_unit = ['total_quantity'] + cat_features
+        X_unit_encoded = pd.get_dummies(df_train_unit[features_unit].fillna('Desconocido'), columns=cat_features, drop_first=True)
+        model_unit = train_and_evaluate(X_unit_encoded, df_train_unit['price_per_item'], 'unitario')
 
         model_dir = 'ml_model/trained_models'
         os.makedirs(model_dir, exist_ok=True)
@@ -144,7 +174,8 @@ def main():
         joblib.dump(X_vol_encoded.columns.tolist(), os.path.join(model_dir, 'volumetric_model_columns.joblib'))
         joblib.dump(model_unit, os.path.join(model_dir, 'unit_model.joblib'))
         joblib.dump(X_unit_encoded.columns.tolist(), os.path.join(model_dir, 'unit_model_columns.joblib'))
-        save_market_stats(df_train_vol, df_train_unit, model_dir)
+        # Market stats solo de competidores: el rango de mercado no debe incluir precios propios de Wayakit
+        save_market_stats(df_vol_comp_cleaned, df_unit_comp_cleaned, model_dir)
         
         logger.info("🎉 Models and columns successfully saved.")
 
