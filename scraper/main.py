@@ -46,7 +46,7 @@
 
 #     for industry_to_scrape in config.TARGET_MAP.keys():
 #         logger.info(f"\n=================================================")
-#         logger.info(f"  INICIANDO PROCESO PARA LA SUBINDUSTRIA: '{industry_to_scrape}'")
+#         logger.info(f"  STARTING PROCESS FOR SUBINDUSTRY: '{industry_to_scrape}'")
 #         logger.info(f"=================================================\n")
 
 #         df_industry_instructions = df_instructions[df_instructions['Sub industry'] == industry_to_scrape].copy()
@@ -103,9 +103,9 @@
             
 #             search_mode = 'units' if any(keyword in original_type_of_product_lower for keyword in ['wipes', 'rags', 'microfiber', 'brush']) else 'volume'
 
-#             logger.info(f">> Buscando '{base_keyword}' para '{sub_industry}' (Modo: {search_mode})")
+#             logger.info(f">> Searching '{base_keyword}' for '{sub_industry}' (Mode: {search_mode})")
 #             for site, kword in site_specific_keywords.items():
-#                 logger.debug(f"   -> {site.capitalize()} usará el término específico: '{kword}'")
+#                 logger.debug(f"   -> {site.capitalize()} will use the specific term: '{kword}'")
 
 #             sites_to_scrape = config.TARGET_MAP.get(sub_industry, []).copy()
             
@@ -123,10 +123,10 @@
 #                     for keyword_to_use in keywords_to_use:
 #                         if site_name in ['fine', 'gogreen', 'officesupply', 'aerosense']:
 #                              if site_name not in site_specific_keywords:
-#                                 logger.debug(f"   -> Saltando '{site_name}' porque no se proveyó una etiqueta específica (ej. '{site_name}:...')")
+#                                 logger.debug(f"   -> Skipping '{site_name}' because no specific tag was provided (e.g. '{site_name}:...')")
 #                                 continue
                         
-#                         logger.info(f"   -> Buscando en '{site_name}' con la palabra clave: '{keyword_to_use}'")
+#                         logger.info(f"   -> Searching '{site_name}' with the keyword: '{keyword_to_use}'")
 #                         found_products = scraper.scrape(keyword_to_use, search_mode)
                         
 #                         b2c_subindustries = ['home', 'automotive', 'pets']
@@ -183,7 +183,7 @@
 #         logger.error(f"[FATAL] Unhandled exception", exc_info=True)
 #         traceback.print_exc()
 
-# scraper/main.py (Modificaciones + Argumentos)
+# scraper/main.py (Modifications + Arguments)
 import pandas as pd
 import time
 import csv
@@ -208,77 +208,77 @@ from scrapers.officesupply_scraper import OfficeSupplyScraper
 from scrapers.aerosense_scraper import AeroSenseScraper
 from log_config import get_logger
 
-logger = get_logger() # <-- AÑADIDO
+logger = get_logger() # <-- ADDED
 
-# --- Argumentos --- AÑADIDO ---
-parser = argparse.ArgumentParser(description="Ejecuta el scraping de precios de competidores.")
+# --- Arguments --- ADDED ---
+parser = argparse.ArgumentParser(description="Runs the scraping of competitor prices.")
 parser.add_argument('--analysis_file', default=config.INSTRUCTIONS_FILE,
-                    help=f"Archivo CSV con instrucciones de scraping (default: {config.INSTRUCTIONS_FILE})")
+                    help=f"CSV file with scraping instructions (default: {config.INSTRUCTIONS_FILE})")
 parser.add_argument('--output_mode', default='overwrite', choices=['overwrite', 'append'],
-                    help="Modo de escritura para el archivo de salida ('overwrite' o 'append', default: overwrite)")
+                    help="Write mode for the output file ('overwrite' or 'append', default: overwrite)")
 parser.add_argument('--output_file', default=config.OUTPUT_CSV_FILE,
-                    help=f"Archivo CSV de salida para los resultados (default: {config.OUTPUT_CSV_FILE})")
+                    help=f"Output CSV file for the results (default: {config.OUTPUT_CSV_FILE})")
 args = parser.parse_args()
-# --- FIN Argumentos ---
+# --- END Arguments ---
 
-# --- Renombrar variables de argumentos y config --- AÑADIDO ---
+# --- Rename argument and config variables --- ADDED ---
 INPUT_ANALYSIS_FILE = args.analysis_file
 OUTPUT_MODE = args.output_mode
 OUTPUT_SCRAPING_FILE = args.output_file
-# --- FIN Renombrar ---
+# --- END Rename ---
 
 def main():
-    logger.info(f"Iniciando scraping. Modo de salida: {OUTPUT_MODE}")
-    logger.info(f"Usando archivo de instrucciones: {INPUT_ANALYSIS_FILE}")
-    logger.info(f"Archivo de salida: {OUTPUT_SCRAPING_FILE}")
+    logger.info(f"Starting scraping. Output mode: {OUTPUT_MODE}")
+    logger.info(f"Using instructions file: {INPUT_ANALYSIS_FILE}")
+    logger.info(f"Output file: {OUTPUT_SCRAPING_FILE}")
 
     try:
-        # Usar el archivo de análisis pasado como argumento
+        # Use the analysis file passed as an argument
         df_instructions = pd.read_csv(INPUT_ANALYSIS_FILE)
         df_instructions = df_instructions.dropna(subset=['Type of product', 'Sub industry'])
-        logger.info(f"Instrucciones cargadas desde '{INPUT_ANALYSIS_FILE}'. {len(df_instructions)} tareas encontradas.")
+        logger.info(f"Instructions loaded from '{INPUT_ANALYSIS_FILE}'. {len(df_instructions)} tasks found.")
     except FileNotFoundError:
-        logger.error(f"Archivo de instrucciones '{INPUT_ANALYSIS_FILE}' no encontrado.")
+        logger.error(f"Instructions file '{INPUT_ANALYSIS_FILE}' not found.")
         return
     except Exception as e:
-        logger.error(f"Error leyendo '{INPUT_ANALYSIS_FILE}'.", exc_info=True)
+        logger.error(f"Error reading '{INPUT_ANALYSIS_FILE}'.", exc_info=True)
         return
 
-    # --- Determinar modo de escritura y cabecera --- MODIFICADO ---
+    # --- Determine write mode and header --- MODIFIED ---
     file_exists = os.path.exists(OUTPUT_SCRAPING_FILE)
     write_mode = 'w' if OUTPUT_MODE == 'overwrite' else 'a'
-    write_header = (OUTPUT_MODE == 'overwrite') or (not file_exists) # Escribir cabecera si se sobrescribe o si el archivo no existe en modo append
+    write_header = (OUTPUT_MODE == 'overwrite') or (not file_exists) # Write the header when overwriting or when the file does not exist in append mode
 
-    # Usar 'with open' fuera del bucle para mejor manejo del archivo
+    # Use 'with open' outside the loop for better file handling
     try:
         with open(OUTPUT_SCRAPING_FILE, write_mode, newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=config.CSV_COLUMNS)
             if write_header:
                 writer.writeheader()
-                logger.info(f"Escribiendo cabecera en '{OUTPUT_SCRAPING_FILE}'.")
-            # --- FIN Modificación ---
+                logger.info(f"Writing header to '{OUTPUT_SCRAPING_FILE}'.")
+            # --- END Modification ---
 
-            logger.info("Descargando y configurando ChromeDriver...")
+            logger.info("Downloading and configuring ChromeDriver...")
             try:
                 driver_path = ChromeDriverManager().install()
-                logger.info(f"ChromeDriver listo en: {driver_path}")
+                logger.info(f"ChromeDriver ready at: {driver_path}")
             except Exception as e:
-                logger.critical("No se pudo instalar ChromeDriver.", exc_info=True)
-                return # Salir si no hay driver
+                logger.critical("Could not install ChromeDriver.", exc_info=True)
+                return # Exit if there is no driver
 
-            ai_agent = RelevanceAgent() # Asume que RelevanceAgent ya usa Secrets Manager internamente
+            ai_agent = RelevanceAgent() # Assumes RelevanceAgent already uses Secrets Manager internally
 
-            # Agrupar por subindustria para procesar como lo hacías
+            # Group by subindustry to process the way you did
             for sub_industry_group, df_industry_instructions in df_instructions.groupby('Sub industry'):
                 logger.info(f"\n=================================================")
-                logger.info(f"  PROCESANDO SUBINDUSTRIA: '{sub_industry_group}'")
+                logger.info(f"  PROCESSING SUBINDUSTRY: '{sub_industry_group}'")
                 logger.info(f"=================================================\n")
 
                 if df_industry_instructions.empty:
-                    logger.warning(f"No hay instrucciones para '{sub_industry_group}'.")
+                    logger.warning(f"There are no instructions for '{sub_industry_group}'.")
                     continue
 
-                # Crear scrapers (puedes mover esto fuera del bucle si prefieres)
+                # Create scrapers (you can move this outside the loop if you prefer)
                 scrapers = {
                     'amazon': AmazonScraper(driver_path=driver_path, relevance_agent=ai_agent),
                     'mumzworld': MumzworldScraper(driver_path=driver_path, relevance_agent=ai_agent),
@@ -286,14 +286,14 @@ def main():
                     'fine': FineScraper(driver_path=driver_path, relevance_agent=ai_agent),
                     'gogreen': GoGreenScraper(driver_path=driver_path, relevance_agent=ai_agent),
                     'officesupply': OfficeSupplyScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'aerosense': AeroSenseScraper(driver_path=driver_path) # Aerosense no usa AI agent? Verificar
+                    'aerosense': AeroSenseScraper(driver_path=driver_path) # Aerosense does not use the AI agent? Verify
                 }
 
-                all_found_products_for_group = [] # Acumular productos por grupo
+                all_found_products_for_group = [] # Accumulate products per group
 
                 for index, row in df_industry_instructions.iterrows():
-                    # ... (lógica para extraer base_keyword, modifiers, search_keyword, search_mode - sin cambios) ...
-                    sub_industry = row['Sub industry'] # Asegurar que sub_industry se define aquí
+                    # ... (logic to extract base_keyword, modifiers, search_keyword, search_mode - unchanged) ...
+                    sub_industry = row['Sub industry'] # Make sure sub_industry is defined here
                     original_type_of_product = str(row['Type of product'])
                     original_type_of_product_lower = original_type_of_product.lower()
                     generic_type_of_product = str(row['Generic product type'])
@@ -314,7 +314,7 @@ def main():
                             mod = mod.strip()
                             if ':' in mod:
                                 site, keyword = mod.split(':', 1)
-                                site = site.strip().lower() # asegurar minúsculas
+                                site = site.strip().lower() # ensure lowercase
                                 keyword = keyword.strip()
                                 if site not in site_specific_keywords:
                                     site_specific_keywords[site] = []
@@ -326,49 +326,49 @@ def main():
                     search_keyword = f"{base_keyword} {general_modifiers_text}".strip()
 
                     search_mode = 'units' if any(kw in original_type_of_product_lower for kw in ['wipes', 'rags', 'microfiber', 'brush']) else 'volume'
-                    # ... (fin lógica extracción) ...
+                    # ... (end of extraction logic) ...
 
-                    logger.info(f">> Buscando '{base_keyword}' para '{sub_industry}' (Modo: {search_mode})")
-                    # ... (lógica de sitios a scrapear, exclusiones - sin cambios) ...
+                    logger.info(f">> Searching '{base_keyword}' for '{sub_industry}' (Mode: {search_mode})")
+                    # ... (logic for sites to scrape, exclusions - unchanged) ...
                     sites_to_scrape = config.TARGET_MAP.get(sub_industry, []).copy()
 
                     if base_keyword in config.MUMZWORLD_EXCLUSIONS and 'mumzworld' in sites_to_scrape:
                         sites_to_scrape.remove('mumzworld')
-                        logger.debug(f"Excluyendo Mumzworld para '{base_keyword}'")
+                        logger.debug(f"Excluding Mumzworld for '{base_keyword}'")
 
                     if base_keyword in config.SACO_EXCLUSIONS and 'saco' in sites_to_scrape:
                         sites_to_scrape.remove('saco')
-                        logger.debug(f"Excluyendo Saco para '{base_keyword}'")
+                        logger.debug(f"Excluding Saco for '{base_keyword}'")
 
 
                     for site_name in sites_to_scrape:
                         scraper = scrapers.get(site_name)
                         if scraper:
-                            # Decidir qué keyword usar: específico del sitio o el general
+                            # Decide which keyword to use: the site-specific one or the general one
                             keywords_to_use = site_specific_keywords.get(site_name, [search_keyword])
 
                             for keyword_to_use in keywords_to_use:
-                                # Lógica para sitios B2B que requieren keyword específica
+                                # Logic for B2B sites that require a specific keyword
                                 if site_name in ['fine', 'gogreen', 'officesupply', 'aerosense']:
-                                     if site_name not in site_specific_keywords and not general_modifiers: # Saltar si no hay keyword específica Y TAMPOCO modificadores generales
-                                        logger.warning(f"Saltando '{site_name}' para '{base_keyword}' porque no se proveyó keyword específica o modificador general.")
+                                     if site_name not in site_specific_keywords and not general_modifiers: # Skip if there is no specific keyword AND NO general modifiers either
+                                        logger.warning(f"Skipping '{site_name}' for '{base_keyword}' because no specific keyword or general modifier was provided.")
                                         continue
 
-                                logger.info(f"   -> Buscando en '{site_name}' con keyword: '{keyword_to_use}'")
+                                logger.info(f"   -> Searching '{site_name}' with keyword: '{keyword_to_use}'")
                                 try:
                                     found_products = scraper.scrape(keyword_to_use, search_mode)
                                 except Exception as scrape_error:
-                                     logger.error(f"Error durante scraping de '{site_name}' con keyword '{keyword_to_use}'.", exc_info=True)
-                                     found_products = [] # Continuar con el siguiente sitio/keyword
+                                     logger.error(f"Error while scraping '{site_name}' with keyword '{keyword_to_use}'.", exc_info=True)
+                                     found_products = [] # Continue with the next site/keyword
 
-                                b2c_subindustries = ['home', 'automotive', 'pets'] # Usar minúsculas para comparación
+                                b2c_subindustries = ['home', 'automotive', 'pets'] # Use lowercase for comparison
                                 channel_value = 'B2C' if sub_industry.lower() in b2c_subindustries else 'B2B'
 
                                 for product in found_products:
                                     row_data = {
-                                        # ... (mapeo de datos - sin cambios) ...
+                                        # ... (data mapping - unchanged) ...
                                         'date': time.strftime("%Y-%m-%d"),
-                                        'industry': df_industry_instructions.iloc[0]['Industry'], # Obtener de la primera fila del grupo
+                                        'industry': df_industry_instructions.iloc[0]['Industry'], # Get it from the first row of the group
                                         'subindustry': sub_industry,
                                         'type_of_product': original_type_of_product,
                                         'generic_product_type': generic_type_of_product,
@@ -382,36 +382,36 @@ def main():
                                         'channel': channel_value,
                                     }
                                     all_found_products_for_group.append(row_data)
-                                    logger.debug(f"    -> Producto añadido: {product.get('Product', 'N/A')[:60]}...") # Cambiado a DEBUG para menos verbosidad
+                                    logger.debug(f"    -> Product added: {product.get('Product', 'N/A')[:60]}...") # Changed to DEBUG for less verbosity
                         else:
-                            logger.warning(f"   -> No se encontró scraper para '{site_name}'.")
+                            logger.warning(f"   -> No scraper found for '{site_name}'.")
 
-                # Escribir los resultados del grupo actual al archivo CSV
+                # Write the results of the current group to the CSV file
                 if all_found_products_for_group:
-                    logger.info(f"Escribiendo {len(all_found_products_for_group)} productos encontrados para '{sub_industry_group}' en '{OUTPUT_SCRAPING_FILE}'...")
+                    logger.info(f"Writing {len(all_found_products_for_group)} products found for '{sub_industry_group}' to '{OUTPUT_SCRAPING_FILE}'...")
                     writer.writerows(all_found_products_for_group)
                 else:
-                    logger.info(f"No se encontraron productos para guardar en '{sub_industry_group}'.")
+                    logger.info(f"No products found to save for '{sub_industry_group}'.")
 
-                logger.info(f"Proceso para '{sub_industry_group}' completado.")
-                logger.info("Descansando 5 segundos antes de la siguiente subindustria...") # Reducido tiempo de descanso?
+                logger.info(f"Process for '{sub_industry_group}' completed.")
+                logger.info("Resting 5 seconds before the next subindustry...") # Reduced rest time?
                 time.sleep(5)
 
     except IOError as e:
-        logger.critical(f"Error fatal al abrir/escribir en '{OUTPUT_SCRAPING_FILE}'.", exc_info=True)
+        logger.critical(f"Fatal error opening/writing '{OUTPUT_SCRAPING_FILE}'.", exc_info=True)
     except Exception as e:
-        logger.critical("Error inesperado en el proceso principal de scraping.", exc_info=True)
+        logger.critical("Unexpected error in the main scraping process.", exc_info=True)
 
-    logger.info("\n\n--- PROCESO DE SCRAPING COMPLETADO ---")
+    logger.info("\n\n--- SCRAPING PROCESS COMPLETED ---")
 
 
 if __name__ == "__main__":
     try:
-        # sys.stdout.reconfigure ya no es necesario con logging bien configurado
+        # sys.stdout.reconfigure is no longer needed with properly configured logging
         main()
     except Exception as e:
-        # Captura final por si algo falla fuera de main()
-        # logger puede no estar inicializado aquí si falla muy temprano
+        # Final catch in case something fails outside main()
+        # logger may not be initialized here if it fails very early
         print(f"[FATAL] Unhandled exception: {e}")
         import traceback
         traceback.print_exc()

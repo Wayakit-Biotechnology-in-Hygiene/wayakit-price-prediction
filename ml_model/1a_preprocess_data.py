@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-# Añadir el directorio raíz al path para poder importar log_config
+# Add the root directory to the path so log_config can be imported
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from log_config import get_logger
 

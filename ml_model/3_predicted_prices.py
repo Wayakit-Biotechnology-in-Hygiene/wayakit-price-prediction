@@ -49,13 +49,13 @@ def prepare_prediction_data():
     return df_wayakit
 
 def calculate_confidence(model, X):
-    """Calcula la confianza de la predicción basada en la varianza de los árboles."""
+    """Computes the prediction confidence based on the variance of the trees."""
     
-    # --- CORRECCIÓN: Convertir DataFrame a numpy array ---
-    # Esto elimina los warnings porque los árboles internos esperan solo números, no nombres.
+    # --- FIX: Convert DataFrame to numpy array ---
+    # This removes the warnings because the internal trees expect only numbers, not names.
     X_input = X.values if hasattr(X, 'values') else X
     
-    # model.estimators_ contiene todos los árboles de decisión
+    # model.estimators_ contains all the decision trees
     preds = np.array([tree.predict(X_input) for tree in model.estimators_])
     
     mean_pred = np.mean(preds)
@@ -66,7 +66,7 @@ def calculate_confidence(model, X):
         
     cov = std_dev / mean_pred
     
-    # Si la desviación es baja, la confianza es alta.
+    # If the deviation is low, the confidence is high.
     confidence = max(0, (1 - (cov * 2))) * 100
     return round(confidence, 2)
 
@@ -76,7 +76,7 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
     report_list = []
 
     for _, row in df_wayakit.iterrows():
-        # Tu lógica de predicción y regla de negocio (intacta)
+        # Your prediction logic and business rule (intact)
         is_volumetric = pd.notna(row['Volume_Liters']) and row['Volume_Liters'] > 0
         is_unit = pd.notna(row['Pack_quantity_Units']) and row['Pack_quantity_Units'] > 0
         confidence_score = 0.0
@@ -123,8 +123,8 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
                 competitor_count = int(stat_row.iloc[0]['competitor_count'])
                 volume_outside_market = not (stat_row.iloc[0]['vol_min'] <= row['Pack_quantity_Units'] <= stat_row.iloc[0]['vol_max'])
 
-        # Clamp al rango de mercado observado en competidores; el piso de rentabilidad siempre gana.
-        # Se exigen >=3 competidores: con 1-2 filas el rango colapsa a un punto y fuerza precios absurdos.
+        # Clamp to the market range observed in competitors; the profitability floor always wins.
+        # >=3 competitors are required: with 1-2 rows the range collapses to a point and forces absurd prices.
         clamped_to_market = False
         if competitor_count >= 3 and model_predicted_price > 0:
             clamped_price = min(max(model_predicted_price, market_min), market_max)

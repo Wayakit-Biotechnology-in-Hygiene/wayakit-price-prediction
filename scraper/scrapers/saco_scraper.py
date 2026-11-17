@@ -49,8 +49,8 @@ class SacoScraper:
             'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
         }
 
-        # El sitio nuevo de SACO (Next.js/Tailwind) no tiene clases CSS estables;
-        # el dato confiable es el JSON-LD (schema.org/Product) con nombre y precio.
+        # The new SACO site (Next.js/Tailwind) has no stable CSS classes;
+        # the reliable data is the JSON-LD (schema.org/Product) with name and price.
         product_data = None
         for tag in soup.select("script[type='application/ld+json']"):
             try:
@@ -134,10 +134,10 @@ class SacoScraper:
 
         time.sleep(3)
 
-        # El sitio nuevo repite el mismo href en varios <a> por card (imagen y
-        # titulo): recolectamos hrefs unicos y los visitamos directo, sin el
-        # flujo viejo de click-y-regresar. Con el limite tan bajo de productos
-        # la primera pagina de resultados siempre alcanza (sin paginacion).
+        # The new site repeats the same href in several <a> per card (image and
+        # title): we collect unique hrefs and visit them directly, without the
+        # old click-and-go-back flow. With such a low product limit the first
+        # results page is always enough (no pagination).
         product_hrefs = []
         for link in driver.find_elements(By.CSS_SELECTOR, "a[href*='/en/product/']"):
             href = link.get_attribute('href')
