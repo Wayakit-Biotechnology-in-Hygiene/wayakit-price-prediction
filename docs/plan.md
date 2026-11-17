@@ -1,507 +1,507 @@
-# Plan de mejoras — Price Intelligence (nov–dic 2026)
+# Improvement plan — Price Intelligence (Nov–Dec 2026)
 
-Estado: **borrador para revisar con Mafer**, en la rama `pi-mejoras`, que sale de `main`. **Corrección (F1, 2026-11-17): la instancia corre `server-improvement` (e25e2c9), no `main`.** Cambios en AWS hasta hoy: calibración de Apify y prueba de modelos (EULA de Qwen y DeepSeek aceptados, 2026-11-16); en F1 (2026-11-17) un snapshot del disco y la política `AmazonSSMManagedInstanceCore` en el rol de la instancia. Nada en Odoo.
+Status: **draft to review with Mafer**, on branch `pi-improvements`, which branches from `server-improvement` (the history up to PR #1 was on `pi-mejoras`). **Correction (F1, 2026-11-17): the instance runs `server-improvement` (e25e2c9), not `main`.** Changes in AWS so far: Apify calibration and model test (Qwen and DeepSeek EULAs accepted, 2026-11-16); in F1 (2026-11-17) a disk snapshot and the `AmazonSSMManagedInstanceCore` policy on the instance role. Nothing in Odoo.
 
-Decidido por Mafer (2026-11-16):
-- Amazon KSA y Noon KSA se sacan **con Apify, con los mismos actores que VdC**: `junglee/amazon-crawler` y `saswave/noon-product-scraper`.
-- Mumzworld y SACO se quedan igual.
-- El CI/CD propuesto (pull-on-boot más encendido en modo "solo deploy") está aprobado.
-- **Gemini se reemplaza por Bedrock: DeepSeek V3.2 como principal y Haiku 4.5 como respaldo** (prueba comparativa del 2026-11-16, sección 5).
-- No se pide a nadie que defina qué cuenta como "local".
-- **Corrida mensual el último jueves de cada mes.** No choca con la de VdC, que corre el primer domingo.
-- Apify va en la cuenta de VdC. El plan Starter se sube de nivel para cubrir el gasto.
-- Corrida de calibración de Apify aprobada (2026-11-16).
+Decided by Mafer (2026-11-16):
+- Amazon KSA and Noon KSA are scraped **with Apify, using the same actors as VdC**: `junglee/amazon-crawler` and `saswave/noon-product-scraper`.
+- Mumzworld and SACO stay as they are.
+- The proposed CI/CD (pull-on-boot plus start-up in "deploy only" mode) is approved.
+- **Gemini is replaced by Bedrock: DeepSeek V3.2 as primary and Haiku 4.5 as fallback** (benchmark of 2026-11-16, section 5).
+- Nobody is asked to define what counts as "local".
+- **Monthly run on the last Thursday of each month.** It does not clash with VdC's, which runs on the first Sunday.
+- Apify goes on the VdC account. The Starter plan is upgraded to cover the spend.
+- Apify calibration run approved (2026-11-16).
 
 Tickets:
-- **A**: [corregir mascotas y migrar B2C a Apify](https://app.notion.com/p/41abe65f8c1381ffb1dad8a51e4eb87a). Estimación 8, vence el 2026-11-30.
-- **B**: [infraestructura como código y CI/CD a EC2](https://app.notion.com/p/41abe65f8c1381e88806e23603e434b3). Estimación 5, vence el 2026-12-03.
+- **A**: [fix Pets and migrate B2C to Apify](https://app.notion.com/p/41abe65f8c1381ffb1dad8a51e4eb87a). Estimate 8, due 2026-11-30.
+- **B**: [infrastructure as code and CI/CD to EC2](https://app.notion.com/p/41abe65f8c1381e88806e23603e434b3). Estimate 5, due 2026-12-03.
 
-Referencia: repo `voz-del-cliente` (VdC). De ahí se copian las convenciones de `infra/` y de `docs/`.
+Reference: the `voz-del-cliente` (VdC) repo. The `infra/` and `docs/` conventions are copied from it.
 
 ---
 
-## 1. Cómo funciona hoy (lo verificado)
+## 1. How it works today (verified)
 
-**Flujo de datos:** `scraper/` (Selenium + Gemini para decidir relevancia) → `competitors_complete.csv` → `ml_model/` (precio por litro o por pieza, recorte p10–p90, RandomForest) → `product.price.suggestion` en Odoo.
+**Data flow:** `scraper/` (Selenium + Gemini to decide relevance) → `competitors_complete.csv` → `ml_model/` (price per liter or per piece, p10–p90 trimming, RandomForest) → `product.price.suggestion` in Odoo.
 
-**Ejecución:**
-- Instancia EC2 `wayakit-app-server` (t3.medium, AL2023, eu-north-1). Casi siempre está apagada.
-- La encienden dos schedules de EventBridge Scheduler del grupo `default`: jueves y viernes a las 21:50.
-- Dentro de la instancia, el crontab de `ec2-user` lanza `run_pipeline.sh` el viernes 04:00 UTC y `--stage 2` el sábado 04:00 UTC (jueves y viernes 22:00 CDMX):
-  - la **etapa 1** prepara la lista de búsqueda;
-  - entre etapas se hace una revisión manual por git;
-  - la **etapa 2** hace `git pull`, scrapea, entrena y sube a Odoo.
-- Al terminar, la instancia se apaga sola con `trap EXIT`.
+**Execution:**
+- EC2 instance `wayakit-app-server` (t3.medium, AL2023, eu-north-1). It is almost always stopped.
+- Two EventBridge Scheduler schedules in the `default` group start it: Thursday and Friday at 21:50.
+- Inside the instance, the `ec2-user` crontab launches `run_pipeline.sh` on Friday 04:00 UTC and `--stage 2` on Saturday 04:00 UTC (Thursday and Friday 22:00 CDMX):
+  - **stage 1** prepares the search list;
+  - between stages there is a manual review through git;
+  - **stage 2** runs `git pull`, scrapes, trains and uploads to Odoo.
+- When it finishes, the instance shuts itself down with `trap EXIT`.
 
-**Hallazgos que condicionan el plan:**
+**Findings that shape the plan:**
 
-| # | Hallazgo | Dónde |
+| # | Finding | Where |
 |---|---|---|
-| 1 | **No existe un scraper de Noon.** En B2C hoy solo hay Amazon (amazon.sa, Selenium), Mumzworld y SACO. Para Pets **solo se usa Amazon** | `scraper/config.py:9-24` |
-| 2 | El modelo **no usa** la fuente; desde e25e2c9 sí usa `company` (la marca en Amazon, Mumzworld y SACO). No se captura el vendedor ni el país de origen. Hoy no hay forma de separar importado de local | `ml_model/2_train_models.py:160-169` |
-| 3 | En la foto de 2024, la mediana de Pets era de unos 262 SAR/L, contra unos 50 en Home. El 39 % de los tamaños venían en fl oz (indicio de importado). Con n ≤ 2 por tipo, el recorte p10–p90 no hace nada. **Corrección (2026-11-17):** eso vale con 1 precio o con 2 iguales; con **2 precios distintos el recorte deja el grupo vacío** (hallazgo 12, bug 6) | `2_train_models.py:46-60` |
-| 4 | Las ventas de Odoo están **fijas a 2025** | `ml_model/odoo_api_cotizations.py:75-76` |
-| 5 | El estado (CSV, `last_full_run.txt`, modelos y logs) vive solo en el disco de la EC2. Hay un snapshot manual del 2026-11-17 (F1) | `run_pipeline.sh:7-24` |
-| 6 | La etapa 2 hace `git pull` sin verificar el resultado. Muchos errores terminan con código 0 (`exit()`, `except` que se tragan el error) | `run_pipeline.sh:133`, `odoo_api_price_suggestion.py:52-109` |
-| 7 | Hay 6 copias de `get_secret()`. Todas leen `prod/wayakit-app` | `ml_model/odoo_api_*.py`, `scraper/...` |
-| 8 | La instancia no tiene IP fija ni userData. Desde F1 (2026-11-17) está registrada en SSM. No existe un proveedor OIDC de GitHub en IAM | AWS |
-| 9 | La consulta a Odoo **no filtra por compañía (KSA/MX)** | `ml_model/odoo_api_*.py` |
-| 10 | **La instancia corre `server-improvement`** (e25e2c9, "model improvement"), que cambia el entrenamiento, la predicción y `run_pipeline.sh` (modo parcial deshabilitado). `pi-mejoras` se adelantó a e25e2c9 el 2026-11-17 | F1 (instancia) |
-| 11 | **La última corrida completa (13–15 nov 2026) falló en el scraping y aun así subió a Odoo.** El scraping llegó al timeout de 30 h; `competitors_complete.csv` quedó con 53 filas (SACO Automotive 36, AeroSense 14, Fine Airports 3; nada de Amazon, Home ni Pets). El pipeline entrenó, subió en modo full (borró las sugerencias anteriores) y terminó con código 0. Las sugerencias actuales de Odoo salen casi solo de `competitor.product`. GoGreen falló muchas veces con "Could not set language to English" | F1, `logs/pipeline_execution.log` |
-| 12 | **Las pruebas de propiedades (2026-11-17) encontraron 11 bugs** en los parsers de tamaño y en el preprocesado y entrenamiento. Cada uno tiene una prueba `xfail(strict=True)` con su contraejemplo. Detalle y fase en [Bugs de las pruebas de propiedades](#bugs-de-las-pruebas-de-propiedades-2026-11-17) | `tests/unit/`, `tests/property/` |
-| 13 | **La corrida local no reproduce el reporte de producción.** Con los datos congelados de F1 y el mismo código (e25e2c9), cambian 520 de 738 `predicted_price`, hasta 51.86 SAR; los procesados salen iguales y `to_predict` solo difiere en ruido de flotantes (~1e-14). Causa en investigación: CPU/BLAS, versiones de scikit-learn o numpy en la instancia, o que esa corrida no fuera e25e2c9. Por eso las pruebas diferenciales comparan **base contra versión nueva en la misma máquina**, nunca contra salidas de producción | `data/f1_antes_2026-11-15/`, `tests/differential/` |
+| 1 | **There is no Noon scraper.** In B2C today there are only Amazon (amazon.sa, Selenium), Mumzworld and SACO. For Pets **only Amazon is used** | `scraper/config.py:9-24` |
+| 2 | The model **does not use** the source; since e25e2c9 it does use `company` (the brand on Amazon, Mumzworld and SACO). Neither the seller nor the country of origin is captured. Today there is no way to separate imported from local | `ml_model/2_train_models.py:160-169` |
+| 3 | In the 2024 snapshot, the Pets median was about 262 SAR/L, versus about 50 in Home. 39 % of sizes came in fl oz (a sign of imported). With n ≤ 2 per type, the p10–p90 trimming does nothing. **Correction (2026-11-17):** that holds with 1 price or with 2 equal ones; with **2 different prices the trimming leaves the group empty** (finding 12, bug 6) | `2_train_models.py:46-60` |
+| 4 | Odoo sales are **fixed to 2025** | `ml_model/odoo_api_cotizations.py:75-76` |
+| 5 | The state (CSV, `last_full_run.txt`, models and logs) lives only on the EC2 disk. There is a manual snapshot from 2026-11-17 (F1) | `run_pipeline.sh:7-24` |
+| 6 | Stage 2 runs `git pull` without checking the result. Many errors end with exit code 0 (`exit()`, `except` blocks that swallow the error) | `run_pipeline.sh:133`, `odoo_api_price_suggestion.py:52-109` |
+| 7 | There are 6 copies of `get_secret()`. All of them read `prod/wayakit-app` | `ml_model/odoo_api_*.py`, `scraper/...` |
+| 8 | The instance has no fixed IP and no userData. Since F1 (2026-11-17) it is registered in SSM. There is no GitHub OIDC provider in IAM | AWS |
+| 9 | The Odoo query **does not filter by company (KSA/MX)** | `ml_model/odoo_api_*.py` |
+| 10 | **The instance runs `server-improvement`** (e25e2c9, "model improvement"), which changes training, prediction and `run_pipeline.sh` (partial mode disabled). `pi-mejoras` was fast-forwarded to e25e2c9 on 2026-11-17 | F1 (instance) |
+| 11 | **The last full run (Nov 13–15, 2026) failed in scraping and still uploaded to Odoo.** Scraping hit the 30 h timeout; `competitors_complete.csv` ended up with 53 rows (SACO Automotive 36, AeroSense 14, Fine Airports 3; nothing from Amazon, Home or Pets). The pipeline trained, uploaded in full mode (deleted the previous suggestions) and finished with exit code 0. The current Odoo suggestions come almost entirely from `competitor.product`. GoGreen failed many times with "Could not set language to English" | F1, `logs/pipeline_execution.log` |
+| 12 | **The property tests (2026-11-17) found 11 bugs** in the size parsers and in preprocessing and training. Each one has an `xfail(strict=True)` test with its counterexample. Details and phase in [Bugs from the property tests](#bugs-from-the-property-tests-2026-11-17) | `tests/unit/`, `tests/property/` |
+| 13 | **The local run does not reproduce the production report.** With the frozen F1 data and the same code (e25e2c9), 520 of 738 `predicted_price` values change, by up to 51.86 SAR; the processed files come out identical and `to_predict` differs only in floating-point noise (~1e-14). Cause under investigation: CPU/BLAS, scikit-learn or numpy versions on the instance, or that run not being e25e2c9. That is why the differential tests compare **base against new version on the same machine**, never against production outputs | `data/f1_before_2026-11-15/`, `tests/differential/` |
 
-### Bugs de las pruebas de propiedades (2026-11-17)
+### Bugs from the property tests (2026-11-17)
 
-Encontrados por `pi-tester` al escribir las pruebas unitarias y de propiedades del código actual (e25e2c9). No se arreglaron: cada uno queda como `xfail(strict=True)` con el contraejemplo mínimo; cuando se arregle, la prueba pasa y hay que quitar el `xfail`. Los parsers de `scraper/utils.py` los usan Amazon, Mumzworld, SACO, Fine, GoGreen y OfficeSupply: arreglarlos cambia filas de Mumzworld y SACO, así que necesita la prueba de regresión de F6 y una decisión de Mafer (pregunta 13).
+Found by `pi-tester` while writing the unit and property tests for the current code (e25e2c9). They were not fixed: each one remains as `xfail(strict=True)` with the minimal counterexample; when it is fixed, the test passes and the `xfail` must be removed. The parsers in `scraper/utils.py` are used by Amazon, Mumzworld, SACO, Fine, GoGreen and OfficeSupply: fixing them changes Mumzworld and SACO rows, so it needs the F6 regression test and a decision from Mafer (question 13).
 
-| # | Bug | Contraejemplo | Dónde | Fase |
+| # | Bug | Counterexample | Where | Phase |
 |---|---|---|---|---|
-| 1 | `litre` no se reconoce como litro (la rama busca "liter") | `'1 litre'` → unit `litre`, normalized 1.0 (debe ser L y 1000); `'6 x 1 litre'` → normalized 6 | `scraper/utils.py:3` (`parse_volume_string`), `:64` (`parse_volume_with_multiplier`) | F7 (regresión F6) |
-| 2 | `kilograms` se lee como gramos ("gram" está dentro de "kilograms" y esa rama va antes) | `'2 kilograms'` → unit `g`, normalized 2.0 (debe ser kg y 2000) | `scraper/utils.py:3` | F7 (regresión F6) |
-| 3 | Separador de miles | `'Shampoo 1,000 ml'` → quantity 0.0 (la regex toma solo "000") | `scraper/utils.py:3` | F7 (regresión F6) |
-| 4 | Decimal sin cero inicial | `'Bleach .5 L'` → quantity 5.0 (5 L en lugar de 0.5 L) | `scraper/utils.py:3` | F7 (regresión F6) |
-| 5 | `1a` manda `kg` y `litre` al modelo por pieza: solo reconoce `ml`, `l`, `fl oz` y `g` como volumen | `'Powder 2 kg'` de 30 SAR → `competitor_unit_processed.csv` con total_quantity 2 y price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7 (correcciones chicas) |
-| 6 | **El recorte p10–p90 vacía los grupos con 2 precios distintos** (límites 1.1 y 1.9 para [1.0, 2.0]; el filtro es inclusivo y no queda nada) | En los datos de F1, **14 de 151 tipos volumétricos y 1 de 15 unitarios se quedan sin ningún competidor** en el entrenamiento | `ml_model/2_train_models.py:46-60` | **F7, directo para Pets** (n chico por tipo; "recorte robusto cuando n es pequeño") y F5 (contar cuántos tipos de Pets lo sufren) |
-| 7 | Los SKU repetidos duplican cotizaciones (el `merge` por `Product_ID`) | Una cotización de `P1` con `P1` dos veces en productos → 2 filas. En F1: 4 SKU repetidos, 162 cotizaciones → 163 filas | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7 (y la limpieza de SKU de la sección 7.3) |
-| 8 | `process_volumetric_data` no descarta cantidades ≤ 0 (el unitario sí) | `ml`, total_quantity −500, precio 1 → volume_liters −0.5 y price_per_liter −2.0, que entran al entrenamiento | `ml_model/1a_preprocess_data.py:39-59` | F7 (correcciones chicas, C18) |
-| 9 | **Posible bug (confirmar con Mafer):** el "3X" de concentración se toma como 3 piezas | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | F7, según la pregunta 12 |
-| 10 | Menor: notación científica en el multiplicador (solo con totales < 1e-4 o ≥ 1e16, poco realista) | `'(2 Bottles x 0.00001 ml)'` → quantity 2e-05 pero normalized 5.0 | `scraper/utils.py:64` | Sin fase (anotado) |
-| 11 | Menor: números gigantes en los parsers de conteo lanzan `ValueError` (límite de dígitos de `int()` en Python ≥ 3.10.7); irreal en títulos | `'9'*4301 + ' wipes'` | `scraper/utils.py:31` (`parse_count_string`) | Sin fase (anotado) |
+| 1 | `litre` is not recognized as liter (the branch looks for "liter") | `'1 litre'` → unit `litre`, normalized 1.0 (should be L and 1000); `'6 x 1 litre'` → normalized 6 | `scraper/utils.py:3` (`parse_volume_string`), `:64` (`parse_volume_with_multiplier`) | F7 (F6 regression) |
+| 2 | `kilograms` is read as grams ("gram" is inside "kilograms" and that branch comes first) | `'2 kilograms'` → unit `g`, normalized 2.0 (should be kg and 2000) | `scraper/utils.py:3` | F7 (F6 regression) |
+| 3 | Thousands separator | `'Shampoo 1,000 ml'` → quantity 0.0 (the regex takes only "000") | `scraper/utils.py:3` | F7 (F6 regression) |
+| 4 | Decimal without leading zero | `'Bleach .5 L'` → quantity 5.0 (5 L instead of 0.5 L) | `scraper/utils.py:3` | F7 (F6 regression) |
+| 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7 (small fixes) |
+| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7, directly for Pets** (small n per type; "robust trimming when n is small") and F5 (count how many Pets types are affected) |
+| 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7 (and the SKU cleanup in section 7.3) |
+| 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7 (small fixes, C18) |
+| 9 | **Possible bug (confirm with Mafer):** the concentration "3X" is taken as 3 pieces | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | F7, depending on question 12 |
+| 10 | Minor: scientific notation in the multiplier (only with totals < 1e-4 or ≥ 1e16, unrealistic) | `'(2 Bottles x 0.00001 ml)'` → quantity 2e-05 but normalized 5.0 | `scraper/utils.py:64` | No phase (noted) |
+| 11 | Minor: huge numbers in the count parsers raise `ValueError` (`int()` digit limit in Python ≥ 3.10.7); unrealistic in titles | `'9'*4301 + ' wipes'` | `scraper/utils.py:31` (`parse_count_string`) | No phase (noted) |
 
-### Seguridad: avisar a IT
+### Security: notify IT
 
-- **Confirmado en F1:** la key de Gemini está en texto plano en `logs/cron.log` (72 líneas) y `logs/pipeline_execution.log` (87 líneas) de la instancia, por los errores HTTP de `requests` con la URL (`scraper/services/ai_service.py:54-55`). En `~/logs/wayakit_app.log*` no aparece. Acción: **revocar o rotar la key en Google ya**, depurar o borrar esos logs y, al migrar a Bedrock, quitarla de `prod/wayakit-app`.
-- El rol de la instancia tiene `SecretsManagerReadWrite`: puede leer y escribir **todos** los secretos de la cuenta, incluido `voz-del-cliente/api-keys`.
-- ~~Credenciales de push en el servidor~~: verificado en F1, no hay `credential.helper` ni `~/.git-credentials`, y el remoto https no lleva credenciales.
+- **Confirmed in F1:** the Gemini key is in plain text in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance, because of the `requests` HTTP errors that include the URL (`scraper/services/ai_service.py:54-55`). It does not appear in `~/logs/wayakit_app.log*`. Action: **revoke or rotate the key in Google now**, scrub or delete those logs and, when migrating to Bedrock, remove it from `prod/wayakit-app`.
+- The instance role has `SecretsManagerReadWrite`: it can read and write **all** secrets in the account, including `voz-del-cliente/api-keys`.
+- ~~Push credentials on the server~~: verified in F1, there is no `credential.helper` or `~/.git-credentials`, and the https remote carries no credentials.
 
 ---
 
-## 2. Decisiones de diseño (propuestas)
+## 2. Design decisions (proposed)
 
-| Tema | Propuesta | Por qué |
+| Topic | Proposal | Why |
 |---|---|---|
-| Etapas | **Una sola corrida mensual y siempre completa.** Sin etapa 2, sin modo parcial y sin `git pull`. La lista de búsqueda sale de `modifiers_mapping.csv` versionado, y cada cambio va por PR | El ticket A pide corrida mensual. Así desaparecen el conflicto de git, la mezcla de versiones entre etapas y un schedule. `server-improvement` ya va en esa dirección |
-| IaC | Igual que VdC: **un script boto3 por recurso** en `infra/`, que se puede correr varias veces, con `--dry-run`, docstring en español, `config.py` compartido y etiqueta `project=price-intelligence` | Misma herramienta que VdC, como pide el ticket B |
-| CI/CD | **Pull-on-boot.** GitHub Actions (OIDC, sin llaves) corre las pruebas, publica `releases/<sha>.tar.gz` en S3 y actualiza el puntero `current`. Después **enciende la instancia en modo "solo deploy"**: la instancia instala el release, verifica, cambia el symlink de forma atómica y se apaga | Funciona con la instancia apagada. Un push llega sin pasos manuales. Si el deploy falla, el symlink no se toca y la versión anterior sigue funcionando |
-| Rollback | `workflow_dispatch` con un `sha`, que mueve el puntero y vuelve a correr el deploy. En la instancia se guardan los últimos 5 releases | Mismo patrón que `--rollback` de VdC |
-| Estado | S3 `price-intelligence-<cuenta>`, con los prefijos `data/`, `models/`, `state/`, `logs/` y `releases/` | Para recrear la instancia sin perder nada (criterio de B) |
-| Secretos | **Mantener `prod/wayakit-app`**, agregar la llave de Apify, centralizar en un solo módulo (`pi_secrets.py`) y limitar el rol al ARN de ese secreto | Es lo mínimo. Aplica si nadie más usa ese secreto (pregunta 4) |
-| Subida a Odoo | Primero `create` del lote nuevo y, solo si sale bien, `unlink` del anterior (IDs guardados, se puede reintentar). Agregar `--dry-run`. Filtrar por la compañía KSA | Si algo falla, la tabla nunca queda vacía |
-| Pets | Ver F7. Las correcciones salen de los datos (estadística robusta y, si el actor lo trae, el país de origen). No se usan listas que tenga que mantener una persona | Decisión de Mafer |
-| IA de relevancia | **Bedrock: DeepSeek V3.2 como principal y Haiku 4.5 como respaldo**, con la API Converse, JSON schema y **siempre por lotes**. Se mantiene la interfaz de `RelevanceAgent` para que los scrapers no cambien | Decisión de Mafer y prueba comparativa del 2026-11-16 (sección 5) |
+| Stages | **A single monthly run, always full.** No stage 2, no partial mode and no `git pull`. The search list comes from the versioned `modifiers_mapping.csv`, and every change goes through a PR | Ticket A asks for a monthly run. This removes the git conflict, the mix of versions between stages and one schedule. `server-improvement` already goes in that direction |
+| IaC | Same as VdC: **one boto3 script per resource** in `infra/`, re-runnable, with `--dry-run`, docstring in English, shared `config.py` and the `project=price-intelligence` tag | Same tooling as VdC, as ticket B asks |
+| CI/CD | **Pull-on-boot.** GitHub Actions (OIDC, no keys) runs the tests, publishes `releases/<sha>.tar.gz` to S3 and updates the `current` pointer. Then it **starts the instance in "deploy only" mode**: the instance installs the release, verifies, switches the symlink atomically and shuts down | Works with the instance stopped. A push arrives with no manual steps. If the deploy fails, the symlink is not touched and the previous version keeps working |
+| Rollback | `workflow_dispatch` with a `sha`, which moves the pointer and re-runs the deploy. The instance keeps the last 5 releases | Same pattern as VdC's `--rollback` |
+| State | S3 `price-intelligence-<account>`, with the prefixes `data/`, `models/`, `state/`, `logs/` and `releases/` | To recreate the instance without losing anything (criterion of B) |
+| Secrets | **Keep `prod/wayakit-app`**, add the Apify key, centralize in a single module (`pi_secrets.py`) and restrict the role to that secret's ARN | It is the minimum. Applies if nobody else uses that secret (question 4) |
+| Upload to Odoo | First `create` the new batch and, only if it succeeds, `unlink` the previous one (IDs saved, retryable). Add `--dry-run`. Filter by the KSA company | If something fails, the table is never left empty |
+| Pets | See F7. The corrections come from the data (robust statistics and, if the actor provides it, the country of origin). No lists that a person has to maintain | Mafer's decision |
+| Relevance AI | **Bedrock: DeepSeek V3.2 as primary and Haiku 4.5 as fallback**, with the Converse API, JSON schema and **always in batches**. The `RelevanceAgent` interface is kept so the scrapers do not change | Mafer's decision and the benchmark of 2026-11-16 (section 5) |
 
 ---
 
-## 3. Fases
+## 3. Phases
 
-Fecha de referencia: 2026-11-16. Quedan unas 2 semanas para los dos tickets, así que el alcance ya viene recortado.
+Reference date: 2026-11-16. About 2 weeks remain for the two tickets, so the scope is already trimmed.
 
-### F0 · Documentación base (1–1.5 días) — primero
+### F0 · Base documentation (1–1.5 days) — first
 
-Se usa la misma estructura de VdC. La regla: **cada cambio de pipeline o de infraestructura actualiza los docs en el mismo commit.**
+The same structure as VdC is used. The rule: **every pipeline or infrastructure change updates the docs in the same commit.**
 
-- `CLAUDE.md`, para Claude:
-  - qué es el proyecto;
-  - reglas que no se rompen: credenciales, compañía de Odoo, OK de Mafer, Mumzworld y SACO no se tocan, ningún CSV en git;
-  - mapa del código y contrato de un scraper;
-  - esquema del CSV;
-  - trampas conocidas;
-  - convenciones de `infra/`.
-- `README.md`, para personas: qué hace, arquitectura, cómo correrlo y enlaces.
-- `docs/runbook.md`: operar, correr a mano, desplegar, rollback, revisar alertas, volver a subir a Odoo y una tabla de problemas conocidos (`Síntoma | Causa | Solución`).
-- `docs/recursos.md`: tabla de qué existe en AWS (`Recurso | Nombre | Script | Costo`).
-- `docs/decisiones.md`: tabla `Fecha | Decisión | Motivo` a la que solo se agregan filas, y una sección `## Pendiente`.
-- `environment.yml` con versiones fijas, sacadas de `pip freeze` en la instancia.
+- `CLAUDE.md`, for Claude:
+  - what the project is;
+  - rules that are never broken: credentials, Odoo company, Mafer's OK, Mumzworld and SACO are not touched, no CSV in git;
+  - code map and scraper contract;
+  - CSV schema;
+  - known pitfalls;
+  - `infra/` conventions.
+- `README.md`, for people: what it does, architecture, how to run it and links.
+- `docs/runbook.md`: operating, running by hand, deploying, rollback, reviewing alerts, re-uploading to Odoo and a known-issues table (`Symptom | Cause | Fix`).
+- `docs/resources.md`: table of what exists in AWS (`Resource | Name | Script | Cost`).
+- `docs/decisions.md`: an append-only `Date | Decision | Reason` table, and a `## Pending` section.
+- `environment.yml` with pinned versions, taken from `pip freeze` on the instance.
 
-### F1 · Inventario de la instancia — **hecho el 2026-11-17**
+### F1 · Instance inventory — **done on 2026-11-17**
 
-Resultado: crontab de `ec2-user` (vie y sáb 04:00 UTC), rama `server-improvement`, Python 3.10.20 (fijado en `environment.yml`), sin credenciales de git guardadas, key de Gemini en los logs, última corrida fallida (hallazgo 11). Datos "antes" en `data/f1_antes_2026-11-15/` (ignorada por git): `last_full_run` 2026-11-13 04:00:09, `run_mode` full. Los schedules se pausaron durante el inventario y se reactivaron.
+Result: `ec2-user` crontab (Fri and Sat 04:00 UTC), branch `server-improvement`, Python 3.10.20 (pinned in `environment.yml`), no stored git credentials, Gemini key in the logs, last run failed (finding 11). "Before" data in `data/f1_before_2026-11-15/` (ignored by git): `last_full_run` 2026-11-13 04:00:09, `run_mode` full. The schedules were paused during the inventory and re-enabled.
 
-Plan original:
+Original plan:
 
-1. Tomar un **snapshot del volumen**.
-2. Deshabilitar los schedules.
-3. Encender la instancia.
-4. Revisar el cron (si tiene `@reboot`, apagarlo antes de que dispare), la rama en checkout, los cambios locales, el entorno de conda, las credenciales de git y el log de Gemini.
-5. Copiar los CSV y los modelos actuales a S3. Esa es la **foto "antes"** para el ticket A.
+1. Take a **snapshot of the volume**.
+2. Disable the schedules.
+3. Start the instance.
+4. Review the cron (if it has `@reboot`, turn it off before it fires), the checked-out branch, local changes, the conda environment, the git credentials and the Gemini log.
+5. Copy the current CSVs and models to S3. That is the **"before" snapshot** for ticket A.
 
-### F2 · Endurecer el pipeline (2 días)
+### F2 · Harden the pipeline (2 days)
 
-- `|| exit 1` en cada paso (no usar `set -u`, porque rompe conda) y `sys.exit(1)` en los scripts de Odoo.
-- No borrar `competitors_complete.csv` antes de tener el nuevo: escribir en un archivo temporal y renombrarlo.
-- Una sola etapa mensual. Quitar `git pull`.
+- `|| exit 1` on every step (do not use `set -u`, because it breaks conda) and `sys.exit(1)` in the Odoo scripts.
+- Do not delete `competitors_complete.csv` before the new one exists: write to a temporary file and rename it.
+- A single monthly stage. Remove `git pull`.
 - `pi_secrets.py`.
-- `ai_service.py` pasa de Gemini a Bedrock, por lotes y con la misma interfaz. Necesita `infra/bedrock_profile.py` y el permiso `bedrock:InvokeModel` en el rol de la instancia.
-- Subida segura a Odoo con `--dry-run` y filtro por compañía.
-- Ventas de Odoo de los últimos 12 meses móviles, en lugar de 2025 fijo.
-- **Antes de empezar F2:** subir a la base, en un PR aparte que revisa Mafer, el setup de verificación (`REVIEW.md`, `.claude/`, `scripts/`, `tests/`, `pytest.ini`, `docs/checklist-confiabilidad.md`), sin código de producción. Sin eso, "las reglas se leen de la base" no funciona (skill `equipo`).
-- **Paridad del entorno (hallazgo 13):** comparar las versiones de la instancia (numpy, scikit-learn, threadpoolctl/BLAS, CPU) con `environment.yml` y confirmar qué código hizo la corrida del 13–15 nov, hasta explicar por qué la corrida local da otros 520 precios. Mientras tanto, ninguna prueba compara contra salidas de producción.
-- Los bugs del hallazgo 12 no se arreglan en F2 (no son de endurecimiento); sus pruebas `xfail` estrictas quedan como recordatorio.
+- `ai_service.py` moves from Gemini to Bedrock, in batches and with the same interface. Needs `infra/bedrock_profile.py` and the `bedrock:InvokeModel` permission on the instance role.
+- Safe upload to Odoo with `--dry-run` and a company filter.
+- Odoo sales from the last rolling 12 months, instead of fixed 2025.
+- **Before starting F2:** push the verification setup (`REVIEW.md`, `.claude/`, `scripts/`, `tests/`, `pytest.ini`, `docs/reliability-checklist.md`) to the base, in a separate PR that Mafer reviews, with no production code. Without it, "the rules are read from the base" does not work (`team` skill).
+- **Environment parity (finding 13):** compare the instance versions (numpy, scikit-learn, threadpoolctl/BLAS, CPU) with `environment.yml` and confirm which code produced the Nov 13–15 run, until it is explained why the local run gives 520 different prices. Meanwhile, no test compares against production outputs.
+- The bugs from finding 12 are not fixed in F2 (they are not hardening); their strict `xfail` tests stay as a reminder.
 
-### F3 · `infra/` (3 días) — cada script se corre con OK de Mafer
+### F3 · `infra/` (3 days) — each script is run with Mafer's OK
 
-| Script | Qué deja |
+| Script | What it sets up |
 |---|---|
-| `config.py` | Perfil, región, etiqueta, nombres y cron |
-| `bucket.py` | Bucket de estado y releases: cifrado, sin acceso público, ciclo de vida |
-| `instance_role.py` | Mínimo privilegio: el secreto de PI, el bucket, `AmazonSSMManagedInstanceCore` y `PutMetricData`. Reemplaza `SecretsManagerReadWrite` |
-| `ec2_instance.py` | **Adopta** la instancia actual o **la crea** (`--create`) desde AL2023 con un userData que corre `bootstrap.sh` (conda, Chrome, systemd, agente SSM). Exige IMDSv2 |
-| `bootstrap.sh` | `pi-deploy.service` (instala el release) y `pi-pipeline.service` (corre el pipeline, salvo en modo "solo deploy") |
-| `schedule.py` | Grupo `price-intelligence` y schedule mensual. Los dos schedules de `default` se retiran por medio de la lista `RETIRED` |
-| `scheduler_role.py` | Solo `ec2:StartInstances` sobre esta instancia |
-| `deploy_role.py` | Proveedor OIDC de GitHub y un rol limitado a `repo:<org>/wayakit-price-prediction:ref:refs/heads/main` |
-| `check_pi.py` | Revisión de solo lectura: `[OK]`, `[FALLA]` o `[AVISO]`. Cubre el test del ticket "cambiar un schedule desde código y verlo en AWS" |
+| `config.py` | Profile, region, tag, names and cron |
+| `bucket.py` | State and releases bucket: encryption, no public access, lifecycle |
+| `instance_role.py` | Least privilege: the PI secret, the bucket, `AmazonSSMManagedInstanceCore` and `PutMetricData`. Replaces `SecretsManagerReadWrite` |
+| `ec2_instance.py` | **Adopts** the current instance or **creates it** (`--create`) from AL2023 with a userData that runs `bootstrap.sh` (conda, Chrome, systemd, SSM agent). Requires IMDSv2 |
+| `bootstrap.sh` | `pi-deploy.service` (installs the release) and `pi-pipeline.service` (runs the pipeline, except in "deploy only" mode) |
+| `schedule.py` | `price-intelligence` group and monthly schedule. The two `default` schedules are retired through the `RETIRED` list |
+| `scheduler_role.py` | Only `ec2:StartInstances` on this instance |
+| `deploy_role.py` | GitHub OIDC provider and a role limited to `repo:<org>/wayakit-price-prediction:ref:refs/heads/main` |
+| `check_pi.py` | Read-only check: `[OK]`, `[FAIL]` or `[WARN]`. Covers the ticket test "change a schedule from code and see it in AWS" |
 
-Para después, fuera del plazo: `alarms.py` y `budget.py`. Mientras tanto se usa un aviso por SNS desde el trap de salida.
+For later, outside the deadline: `alarms.py` and `budget.py`. In the meantime an SNS notification from the exit trap is used.
 
-### F4 · CI/CD (2 días)
+### F4 · CI/CD (2 days)
 
 - `ci.yml`:
   - lint;
-  - `scripts/verify.sh rapido` (pytest con los marcadores `unit` y `property`: convertidores de Apify, contrato de scrapers, infra con MagicMock como hace VdC);
-  - smoke del ML con datos sintéticos;
+  - `scripts/verify.sh quick` (pytest with the `unit` and `property` markers: Apify converters, scraper contract, infra with MagicMock as VdC does);
+  - ML smoke test with synthetic data;
   - gitleaks.
-- `deploy.yml` (solo en main y con CI en verde): empaqueta → S3 → puntero → enciende la instancia en "solo deploy" → espera la señal de OK → listo.
-- Pruebas del ticket:
-  - un cambio menor llega a EC2;
-  - un deploy roto a propósito no cambia `current`;
-  - el rollback a un SHA anterior funciona.
+- `deploy.yml` (only on main and with CI green): package → S3 → pointer → start the instance in "deploy only" → wait for the OK signal → done.
+- Ticket tests:
+  - a minor change reaches EC2;
+  - a deliberately broken deploy does not change `current`;
+  - rollback to a previous SHA works.
 
-### F5 · Diagnóstico de Pets (1 día), en paralelo a F3/F4
+### F5 · Pets diagnosis (1 day), in parallel with F3/F4
 
-Con la foto de F1 (`data/f1_antes_2026-11-15/`; ojo: esa corrida no trajo filas de Pets del scraping, así que Pets se explica casi solo con `competitor_products_from_odoo.csv`), para cada tipo de producto de Pets:
-- n antes y después del recorte;
-- mediana, p75 y máximo de SAR/L;
-- % de tamaños en fl oz;
-- número de marcas;
-- % de multipacks;
-- filas con precio 0 o con 5 mL o menos;
-- volumen de los SKU de Wayakit frente al rango de la competencia;
-- razón entre el precio sugerido y el costo y el precio actual en Odoo **KSA**.
+With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pets rows from scraping, so Pets is explained almost entirely by `competitor_products_from_odoo.csv`), for each Pets product type:
+- n before and after trimming;
+- median, p75 and maximum SAR/L;
+- % of sizes in fl oz;
+- number of brands;
+- % of multipacks;
+- rows with price 0 or with 5 mL or less;
+- volume of Wayakit SKUs versus the competition's range;
+- ratio between the suggested price and the cost, and the current price in Odoo **KSA**.
 
-### F6 · Apify para Amazon y Noon (3 días)
+### F6 · Apify for Amazon and Noon (3 days)
 
-1. **Elegir el actor** de Amazon KSA y el de Noon KSA (investigación del 2026-11-16; resultado en la sección 5).
-2. **Corrida de calibración** (con OK por el gasto): 1 término de Pets, unos 20 resultados y tope de USD 0.50 por actor. Sirve para fijar el mapeo de campos (precio, tamaño, marca, vendedor, origen) y el costo real.
-3. Copiar de VdC (`pipeline/apify.py`) el cliente con reintentos, paginación y tope de gasto. Escribir `amazon_apify.py` y `noon_apify.py` con la firma actual `scrape(keyword, search_mode) -> list[dict]`. Filtros: precio > 0, multiplicador de pack, `is_relevant`.
-4. Columnas nuevas `seller` y `origin` en `CSV_COLUMNS` y `row_data`.
-5. **Prueba de regresión:** Mumzworld y SACO con las mismas keywords, antes y después. Deben salir iguales.
+1. **Choose the actor** for Amazon KSA and for Noon KSA (research of 2026-11-16; result in section 5).
+2. **Calibration run** (with OK for the spend): 1 Pets term, about 20 results and a cap of USD 0.50 per actor. It serves to fix the field mapping (price, size, brand, seller, origin) and the real cost.
+3. Copy from VdC (`pipeline/apify.py`) the client with retries, pagination and spend cap. Write `amazon_apify.py` and `noon_apify.py` with the current signature `scrape(keyword, search_mode) -> list[dict]`. Filters: price > 0, pack multiplier, `is_relevant`.
+4. New `seller` and `origin` columns in `CSV_COLUMNS` and `row_data`.
+5. **Regression test:** Mumzworld and SACO with the same keywords, before and after. They must come out identical.
 
-### F7 · Ajuste de Pets y ML (2 días)
+### F7 · Pets and ML tuning (2 days)
 
-- `origin` = `local`, `imported` o `unknown`, **solo con lo que trae el dato**: país de origen o fabricante en las especificaciones del actor, o el texto "Made in KSA" / "صنع في السعودية". Si no viene, queda `unknown`. No hay listas de marcas mantenidas a mano.
-- **Solo en Pets:**
-  - si hay al menos N filas locales por tipo, se usan esas filas;
-  - si no, se usa la estadística robusta del mercado (mediana, sin valores extremos, sin multipacks ni tamaños de 5 mL o menos) con un techo de `p75 × volumen`;
-  - el precio nunca baja del piso de margen de 1.30.
-- Correcciones chicas: precio 0, `kg` tratado como volumétrico, recorte robusto cuando n es pequeño. Las cubren los bugs 5, 6, 7 y 8 del hallazgo 12 (con sus pruebas `xfail` estrictas). **El bug 6 es directo para Pets:** con 2 precios distintos por tipo, el recorte p10–p90 deja el tipo sin competidores (14 de 151 tipos volumétricos en F1). Los bugs de parsers (1–4 y 9) entran aquí solo si Mafer decide cambiar el parser compartido (pregunta 13), con la regresión de F6.
-- **Decisión documentada sobre el modelo** (lo pide el ticket): las demás mejoras (target en log, GroupKFold) quedan para una fase 2. Mueven los precios de todas las líneas. La fuga de `approved_quote_price` como feature ya se quitó en e25e2c9 (`2_train_models.py:160`), junto con el recorte al rango de mercado con 3 competidores o más (`3_predicted_prices.py:126-132`).
-- Comparación antes/después por subindustria: mediana de la razón nuevo/viejo y % de sugerencias por encima del p75 local.
+- `origin` = `local`, `imported` or `unknown`, **only with what the data provides**: country of origin or manufacturer in the actor's specifications, or the text "Made in KSA" / "صنع في السعودية". If it is not there, it stays `unknown`. No hand-maintained brand lists.
+- **Only in Pets:**
+  - if there are at least N local rows per type, those rows are used;
+  - if not, the robust market statistic is used (median, without extreme values, without multipacks or sizes of 5 mL or less) with a ceiling of `p75 × volume`;
+  - the price never goes below the 1.30 margin floor.
+- Small fixes: price 0, `kg` treated as volumetric, robust trimming when n is small. They are covered by bugs 5, 6, 7 and 8 of finding 12 (with their strict `xfail` tests). **Bug 6 applies directly to Pets:** with 2 different prices per type, the p10–p90 trimming leaves the type without competitors (14 of 151 volumetric types in F1). The parser bugs (1–4 and 9) go in here only if Mafer decides to change the shared parser (question 13), with the F6 regression.
+- **Documented decision about the model** (the ticket asks for it): the other improvements (log target, GroupKFold) are left for a phase 2. They move the prices of all lines. The `approved_quote_price` leakage as a feature was already removed in e25e2c9 (`2_train_models.py:160`), together with the clipping to the market range with 3 or more competitors (`3_predicted_prices.py:126-132`).
+- Before/after comparison by subindustry: median of the new/old ratio and % of suggestions above the local p75.
 
-### F8 · Corrida final y Odoo KSA (1 día + revisión)
+### F8 · Final run and Odoo KSA (1 day + review)
 
-1. Corrida completa con `--dry-run`.
-2. Puya y Luisa revisan la lista de Pets: precio anterior, nuevo, p75 local y costo.
-3. Con su visto bueno, y con la compañía KSA confirmada, se sube con el esquema seguro.
+1. Full run with `--dry-run`.
+2. Puya and Luisa review the Pets list: previous price, new price, local p75 and cost.
+3. With their approval, and with the KSA company confirmed, it is uploaded with the safe scheme.
 
-**Orden:** F0 → F1 → F2 → (F3 → F4) en paralelo con (F5 → F6 → F7) → F8.
-
----
-
-## 4. Preguntas abiertas (para Mafer)
-
-1. ~~¿Qué rama corre la instancia?~~ **Corrección (F1):** corre `server-improvement` (e25e2c9), no `main`. Ver la pregunta 11.
-2. ~~¿Eliminar las 2 etapas?~~ Mafer quiere una corrida mensual, pero **la revisión de keywords sí hace falta**: los sitios no encuentran el producto con el nombre genérico (ej. en SACO hay que buscar "car cleaner" en lugar de "car disinfectant"). Pendiente: elegir el diseño de la revisión (propuesta en la sección 6).
-3. ~~¿Qué día?~~ El último jueves de cada mes: `cron(50 21 ? * 5L *)` en EventBridge Scheduler. Hora 21:50 en horario de CDMX (`America/Mexico_City`), confirmado por Mafer el 2026-11-17.
-4. ~~¿Secreto y compañía?~~ Solo PI usa `prod/wayakit-app`. La base de Odoo que usa PI es solo de KSA (Mafer, 2026-11-17).
-5. ~~¿Cuenta de Apify?~~ La de VdC, con un plan de mayor nivel. Pendiente: tope de USD por corrida (propuesta: USD 20).
-6. ¿Alcance de Apify: Amazon solo para Pets, o también para Home y Automotive? ¿Noon en qué subindustrias?
-7. ~~¿Qué cuenta como "local"?~~ No se define a mano (ver F7).
-8. ~~¿Admin de GitHub?~~ Mafer es admin de la organización. El repo ya está en la organización (`Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction`). Pendiente: ¿El deploy necesita aprobación manual?
-9. ~~¿Snapshot y encendido?~~ Hecho el 2026-11-17 (F1): snapshot, acceso por SSM, inventario y datos copiados a `data/f1_antes_2026-11-15/`. La instancia corre `server-improvement`, no `main`.
-11. ¿Se rebasa `pi-mejoras` sobre `server-improvement` (lo que corre en producción) o se descarta e25e2c9?
-10. ¿Qué hacemos con los restos en me-south-1 (2 roles y el secreto `wayakit/test/credentials`)? No se pudieron inventariar desde aquí.
-12. ¿Un "3X" de concentración en el título ("Detergent 3X concentrate 500 ml") debe multiplicar el volumen? Hoy da 1500 ml (hallazgo 12, bug 9). Es un supuesto de las pruebas, no una regla confirmada.
-13. Los bugs de parsers del hallazgo 12 (1–4) están en `scraper/utils.py`, que también usan Mumzworld y SACO. ¿Se arreglan (cambian filas de Mumzworld y SACO, con la regresión de F6 y las diferencias aprobadas) o se dejan y se corrigen solo en los adaptadores nuevos de Apify?
+**Order:** F0 → F1 → F2 → (F3 → F4) in parallel with (F5 → F6 → F7) → F8.
 
 ---
 
-## 5. Actores de Apify y cambio a Bedrock (investigación del 2026-11-16)
+## 4. Open questions (for Mafer)
 
-La información sale de la Store pública de Apify y de la API pública de cada actor. No se corrió ningún actor ni se usó ningún token. Cada recomendación la revisó por separado un segundo agente.
+1. ~~Which branch does the instance run?~~ **Correction (F1):** it runs `server-improvement` (e25e2c9), not `main`. See question 11.
+2. ~~Remove the 2 stages?~~ Mafer wants a monthly run, but **the keyword review is needed**: the sites do not find the product by its generic name (e.g. on SACO you have to search "car cleaner" instead of "car disinfectant"). Pending: choose the design of the review (proposal in section 6).
+3. ~~Which day?~~ The last Thursday of each month: `cron(50 21 ? * 5L *)` in EventBridge Scheduler. Time 21:50 in CDMX time (`America/Mexico_City`), confirmed by Mafer on 2026-11-17.
+4. ~~Secret and company?~~ Only PI uses `prod/wayakit-app`. The Odoo database PI uses is KSA only (Mafer, 2026-11-17).
+5. ~~Apify account?~~ VdC's, with a higher-tier plan. Pending: USD cap per run (proposal: USD 20).
+6. Apify scope: Amazon only for Pets, or also for Home and Automotive? Noon in which subindustries?
+7. ~~What counts as "local"?~~ It is not defined by hand (see F7).
+8. ~~GitHub admin?~~ Mafer is an admin of the organization. The repo is already in the organization (`Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction`). Pending: does the deploy need manual approval?
+9. ~~Snapshot and start-up?~~ Done on 2026-11-17 (F1): snapshot, SSM access, inventory and data copied to `data/f1_before_2026-11-15/`. The instance runs `server-improvement`, not `main`.
+11. ~~Rebase onto `server-improvement` or discard e25e2c9?~~ Resolved 2026-11-17: PR #1 merged `pi-mejoras` into `server-improvement`, and `pi-improvements` branches from it, so e25e2c9 is kept.
+10. What do we do with the leftovers in me-south-1 (2 roles and the `wayakit/test/credentials` secret)? They could not be inventoried from here.
+12. Should a concentration "3X" in the title ("Detergent 3X concentrate 500 ml") multiply the volume? Today it gives 1500 ml (finding 12, bug 9). It is an assumption of the tests, not a confirmed rule.
+13. The parser bugs of finding 12 (1–4) are in `scraper/utils.py`, which Mumzworld and SACO also use. Are they fixed (Mumzworld and SACO rows change, with the F6 regression and the approved differences) or left as they are and corrected only in the new Apify adapters?
 
-### Amazon KSA: `junglee/amazon-crawler` (confirmado)
+---
 
-- **Por qué este actor:**
-  - Es el mismo actor que VdC usa para Amazon MX y lo mantiene Apify.
-  - En 30 días tuvo un 99.5 % de corridas exitosas, unos 3,600 usuarios y LIMITED_PERMISSIONS.
-  - Para amazon.sa basta con pasar la URL `https://www.amazon.sa/s?k=…`. El changelog tiene un arreglo explícito para `.sa`.
-- **Campos que trae:**
-  - `price{value,currency}`, que es el precio actual, y `listPrice` por separado;
-  - `brand`, `seller.name`, `asin` y `url`;
-  - `attributes` / `attributesMapped`: Manufacturer, Volume, Unit Count y Country of Origin cuando Amazon los muestra;
-  - `categoryPageData.isSponsored` y `loadedCountryCode`.
+## 5. Apify actors and switch to Bedrock (research of 2026-11-16)
+
+The information comes from the public Apify Store and from each actor's public API. No actor was run and no token was used. Each recommendation was reviewed separately by a second agent.
+
+### Amazon KSA: `junglee/amazon-crawler` (confirmed)
+
+- **Why this actor:**
+  - It is the same actor VdC uses for Amazon MX, and Apify maintains it.
+  - In 30 days it had 99.5 % successful runs, about 3,600 users and LIMITED_PERMISSIONS.
+  - For amazon.sa it is enough to pass the URL `https://www.amazon.sa/s?k=…`. The changelog has an explicit fix for `.sa`.
+- **Fields it returns:**
+  - `price{value,currency}`, which is the current price, and `listPrice` separately;
+  - `brand`, `seller.name`, `asin` and `url`;
+  - `attributes` / `attributesMapped`: Manufacturer, Volume, Unit Count and Country of Origin when Amazon shows them;
+  - `categoryPageData.isSponsored` and `loadedCountryCode`.
 - **Input:**
-  - `categoryOrProductUrls`: una URL de búsqueda por keyword;
+  - `categoryOrProductUrls`: one search URL per keyword;
   - `maxItemsPerStartUrl: 50`, `scrapeProductDetails: true`, `language: "en"`;
   - `maxOffers: 0`, `scrapeSellers: false`.
-  - **No pasar `countryCode` ni `zipCode`**: suman USD 0.05 por resultado, unos USD 137 al mes.
-- **Costo:**
-  - USD 0.004 por resultado en el plan Starter (BRONZE). Con o sin detalle cuesta lo mismo.
-  - 55 keywords × 50 resultados ≈ **USD 11 por corrida mensual**.
-- **En el convertidor:**
-  - descartar los patrocinados (`categoryPageData.isSponsored`);
-  - validar `loadedCountryCode == "SA"`;
-  - normalizar la moneda, que puede llegar como "SAR", "ر.س" o un símbolo.
+  - **Do not pass `countryCode` or `zipCode`**: they add USD 0.05 per result, about USD 137 per month.
+- **Cost:**
+  - USD 0.004 per result on the Starter (BRONZE) plan. With or without details it costs the same.
+  - 55 keywords × 50 results ≈ **USD 11 per monthly run**.
+- **In the converter:**
+  - drop sponsored results (`categoryPageData.isSponsored`);
+  - validate `loadedCountryCode == "SA"`;
+  - normalize the currency, which can arrive as "SAR", "ر.س" or a symbol.
 
-### Noon KSA: `saswave/noon-product-scraper` (decisión de Mafer: el mismo de VdC, que ya funciona)
+### Noon KSA: `saswave/noon-product-scraper` (Mafer's decision: the same one as VdC, which already works)
 
-- Busca con `search_urls` (`https://www.noon.com/saudi-en/search/?q=…`) y saca el detalle con `product_urls`, igual que VdC.
-- No trae la keyword ni la moneda. Por eso se corre **una vez por keyword**, y la moneda se toma como SAR por el dominio `/saudi-en/`.
-- Costo: unos USD 0.0009 por resultado, unos USD 2.5 al mes solo con la búsqueda.
-- Lo que trae cada fila se confirma con la corrida de calibración.
+- It searches with `search_urls` (`https://www.noon.com/saudi-en/search/?q=…`) and gets the details with `product_urls`, just like VdC.
+- It does not return the keyword or the currency. That is why it is run **once per keyword**, and the currency is taken as SAR from the `/saudi-en/` domain.
+- Cost: about USD 0.0009 per result, about USD 2.5 per month with search alone.
+- What each row contains is confirmed with the calibration run.
 
-Alternativa que se evaluó y **no se usa**: `memo23/noon-scraper`.
+Alternative that was evaluated and **is not used**: `memo23/noon-scraper`.
 
-- **Lo que tenía a favor:**
-  - Busca por keyword con `country: "saudi"`. El valor por defecto es UAE, así que hay que pasarlo siempre.
-  - Trae `currency`, `salePrice` y `price`; el precio actual es `salePrice ?? price`.
-  - También trae `brand`, `storeName` (vendedor), `sku`, `productUrl` y `sourceQuery`, la keyword que produjo cada fila. El actor de VdC no trae ese último dato.
-  - Con `scrapeDetails: true` agrega `specifications`.
-  - En 30 días tuvo un 99.8 % de corridas exitosas.
-  - Riesgo: es un actor nuevo (de septiembre de 2026) y sin reseñas.
-- **Input:** `{"searchQueries": ["<keyword>"], "country": "saudi", "maxItems": 50, "scrapeDetails": true}`, con **una corrida por keyword**, porque `maxItems` es un tope para toda la corrida.
-- **Costo:** USD 0.0008 por fila más USD 0.005 por arranque, unos **USD 2.5 por corrida mensual**.
-- **País de origen:** no hay un campo propio. Solo puede venir dentro de `specifications`.
+- **What it had going for it:**
+  - It searches by keyword with `country: "saudi"`. The default value is UAE, so it must always be passed.
+  - It returns `currency`, `salePrice` and `price`; the current price is `salePrice ?? price`.
+  - It also returns `brand`, `storeName` (seller), `sku`, `productUrl` and `sourceQuery`, the keyword that produced each row. The VdC actor does not return that last field.
+  - With `scrapeDetails: true` it adds `specifications`.
+  - In 30 days it had 99.8 % successful runs.
+  - Risk: it is a new actor (from September 2026) with no reviews.
+- **Input:** `{"searchQueries": ["<keyword>"], "country": "saudi", "maxItems": 50, "scrapeDetails": true}`, with **one run per keyword**, because `maxItems` is a cap for the whole run.
+- **Cost:** USD 0.0008 per row plus USD 0.005 per start, about **USD 2.5 per monthly run**.
+- **Country of origin:** there is no dedicated field. It can only come inside `specifications`.
 
-### Corrida de calibración (2026-11-16, keyword "pet urine odor remover")
+### Calibration run (2026-11-16, keyword "pet urine odor remover")
 
-Los datos crudos quedaron fuera del repo, en el scratchpad de la sesión. Costo: unos USD 0.08.
+The raw data stayed outside the repo, in the session scratchpad. Cost: about USD 0.08.
 
-**Amazon (`junglee`, 20 resultados, USD 0.08):**
+**Amazon (`junglee`, 20 results, USD 0.08):**
 
-| Qué se revisó | Resultado |
+| What was checked | Result |
 |---|---|
-| País del sitio | 20/20 con `loadedCountryCode = SA` |
-| Moneda | 18/20 en `SAR`. Las otras 2 venían sin precio y se descartan |
-| Patrocinados | 0 |
-| Marca y vendedor | Marca 20/20, vendedor 18/20 |
-| Tamaño | Viene en `Item Volume`, `Unit Count` y `Size`, pero **muchas veces no coinciden entre sí** (ej. "5 Liters" contra "907 Grams"). Hay que conservar la regla actual de que 2 de 3 fuentes coincidan, o resolverlo con el modelo de IA |
-| `Country of Origin` | **Solo 3 de 20** (Saudi Arabia, China, Germany) |
+| Site country | 20/20 with `loadedCountryCode = SA` |
+| Currency | 18/20 in `SAR`. The other 2 came without a price and are dropped |
+| Sponsored | 0 |
+| Brand and seller | Brand 20/20, seller 18/20 |
+| Size | Comes in `Item Volume`, `Unit Count` and `Size`, but **they often disagree with each other** (e.g. "5 Liters" versus "907 Grams"). The current rule that 2 of 3 sources must agree has to be kept, or it must be resolved with the AI model |
+| `Country of Origin` | **Only 3 of 20** (Saudi Arabia, China, Germany) |
 
-**Lo más útil para el diagnóstico de Pets:**
-- Los resultados están dominados por marcas de EE. UU. (Simple Solution, Rocco & Roxie, Nature's Miracle). Se venden por revendedores de importación como **Desertcart SA** y MigaStore, a precios de **140 a 720 SAR por 0.9–5 L**.
-- El producto de Wayakit sale a 48.83 SAR por 700 mL.
-- El vendedor es mejor señal de importado que el país de origen, porque casi siempre viene lleno.
-- **El propio producto de Wayakit sale en los resultados**: hay que excluir marca y vendedor Wayakit, como ya hace VdC.
+**Most useful for the Pets diagnosis:**
+- The results are dominated by US brands (Simple Solution, Rocco & Roxie, Nature's Miracle). They are sold by import resellers such as **Desertcart SA** and MigaStore, at prices of **140 to 720 SAR for 0.9–5 L**.
+- The Wayakit product shows up at 48.83 SAR for 700 mL.
+- The seller is a better signal of imported than the country of origin, because it is almost always filled in.
+- **Wayakit's own product shows up in the results**: Wayakit brand and seller must be excluded, as VdC already does.
 
-**Noon (`saswave`, búsqueda más 5 detalles):**
+**Noon (`saswave`, search plus 5 details):**
 
-| Qué se revisó | Resultado |
+| What was checked | Result |
 |---|---|
-| Filas | Devolvió 50 filas aunque el tope era 20: el actor entrega la página completa |
-| Campos de la búsqueda | `price` y `sale_price` (precio actual = `sale_price` o, si no hay, `price`), `brand` (41/50), `store_name` y `sku`/`url` |
-| Detalle | `specifications` vacío en 3 de 5. No trae país de origen |
-| Importado | En el detalle aparece `shipping_banner_details.global` (envío "global", es decir, importado). Hay que confirmar si sirve como bandera de importado |
-| Relevancia | Hay resultados fuera de tema (purificadores de aire, corrales para perro), así que el filtro de IA es indispensable |
-| Otros vendedores | Wayakit y SACO también venden en Noon |
+| Rows | It returned 50 rows even though the cap was 20: the actor delivers the full page |
+| Search fields | `price` and `sale_price` (current price = `sale_price` or, if missing, `price`), `brand` (41/50), `store_name` and `sku`/`url` |
+| Details | `specifications` empty in 3 of 5. No country of origin |
+| Imported | The details include `shipping_banner_details.global` ("global" shipping, i.e. imported). It must be confirmed whether it works as an imported flag |
+| Relevance | There are off-topic results (air purifiers, dog pens), so the AI filter is essential |
+| Other sellers | Wayakit and SACO also sell on Noon |
 
-**Conclusión para F7:** el país de origen casi nunca viene. Para separar importado de local se usan señales que sí vienen siempre: el vendedor (revendedores de importación conocidos, sacados de los datos), el envío "global" de Noon, las unidades en fl oz y el país de origen cuando aparece. Todo sale de los datos, sin listas a mano.
+**Conclusion for F7:** the country of origin almost never comes. To separate imported from local, signals that always come are used: the seller (known import resellers, derived from the data), Noon's "global" shipping, fl oz units and the country of origin when it appears. Everything comes from the data, with no hand-made lists.
 
-**Gasto en Apify:** unos **USD 14 al mes** (Amazon unos USD 11 y Noon unos USD 2.5). Va en la cuenta de VdC, con un plan de mayor nivel.
+**Apify spend:** about **USD 14 per month** (Amazon about USD 11 and Noon about USD 2.5). It goes on the VdC account, with a higher-tier plan.
 
-### Bedrock en lugar de Gemini
+### Bedrock instead of Gemini
 
-- **Interfaz:** `RelevanceAgent` conserva `is_relevant()` y `extract_wipes_units()`, así que los scrapers de Selenium (Mumzworld, SACO, B2B) no cambian. Se agregan `filter_relevant(titles, query)` y `extract_wipes_units_batch(titles)`, que solo usan los adaptadores de Apify.
-- **Llamada a Bedrock:**
-  - Converse en eu-north-1, con `temperature=0`;
-  - salida JSON forzada con `outputConfig` (JSON schema). DeepSeek no admite `toolConfig` en Converse; se probó en la prueba comparativa;
-  - **25 títulos por llamada**;
-  - caché por (keyword, título).
-- **Modelos (investigación del 2026-11-16, solo lectura en la cuenta).** Mafer prefiere uno barato que no sea de Claude.
+- **Interface:** `RelevanceAgent` keeps `is_relevant()` and `extract_wipes_units()`, so the Selenium scrapers (Mumzworld, SACO, B2B) do not change. `filter_relevant(titles, query)` and `extract_wipes_units_batch(titles)` are added, used only by the Apify adapters.
+- **Bedrock call:**
+  - Converse in eu-north-1, with `temperature=0`;
+  - JSON output forced with `outputConfig` (JSON schema). DeepSeek does not support `toolConfig` in Converse; this was tested in the benchmark;
+  - **25 titles per call**;
+  - cache by (keyword, title).
+- **Models (research of 2026-11-16, read-only on the account).** Mafer prefers a cheap one that is not Claude.
 
-  | Modelo | Dónde corre | USD por millón de tokens (entrada / salida) | Al mes | JSON schema en Converse | Nota |
+  | Model | Where it runs | USD per million tokens (input / output) | Per month | JSON schema in Converse | Note |
   |---|---|---|---|---|---|
-  | **DeepSeek V3.2** (`deepseek.v3.2`) | eu-north-1, on-demand | 0.74 / 2.22 | ~USD 3.9 | Sí | **Elegido como principal** (prueba del 2026-11-16) |
-  | Qwen3 235B A22B 2507 (`qwen.qwen3-235b-a22b-2507-v1:0`) | eu-north-1, on-demand | 0.22 / 0.88 | ~USD 1.2 | Sí | No pasó la regla: 3 puntos debajo de Haiku y falló en casos claros |
-  | gpt-oss-20b (`openai.gpt-oss-20b-1:0`) | eu-north-1 | 0.07 / 0.30 | ~USD 0.5 | Sí | Opción de costo mínimo. Razona y cobra esos tokens |
-  | Gemma 3 | **No está en eu-north-1** por Converse; solo en eu-west-1 | — | — | 12B sí | Descartado por ahora |
-  | Nova Micro/Lite | Perfil `eu.*` | 0.04–0.07 / 0.15–0.26 | ~USD 0.3 | No | Muy barato; reglas finas dudosas |
-  | Claude Haiku 4.5 (referencia) | Perfil `eu.*` | 1.10 / 5.50 | ~USD 6.3 | Sí | — |
+  | **DeepSeek V3.2** (`deepseek.v3.2`) | eu-north-1, on-demand | 0.74 / 2.22 | ~USD 3.9 | Yes | **Chosen as primary** (test of 2026-11-16) |
+  | Qwen3 235B A22B 2507 (`qwen.qwen3-235b-a22b-2507-v1:0`) | eu-north-1, on-demand | 0.22 / 0.88 | ~USD 1.2 | Yes | Did not pass the rule: 3 points below Haiku and failed on clear cases |
+  | gpt-oss-20b (`openai.gpt-oss-20b-1:0`) | eu-north-1 | 0.07 / 0.30 | ~USD 0.5 | Yes | Lowest-cost option. It reasons and charges for those tokens |
+  | Gemma 3 | **Not in eu-north-1** via Converse; only in eu-west-1 | — | — | 12B yes | Discarded for now |
+  | Nova Micro/Lite | `eu.*` profile | 0.04–0.07 / 0.15–0.26 | ~USD 0.3 | No | Very cheap; fine-grained rules doubtful |
+  | Claude Haiku 4.5 (reference) | `eu.*` profile | 1.10 / 5.50 | ~USD 6.3 | Yes | — |
 
-  - Qwen y DeepSeek corren solo en Estocolmo, no necesitan Marketplace y ya aparecen como `AVAILABLE/AUTHORIZED`. **La primera invocación acepta el EULA del proveedor.**
-  - Cada uno tiene cuota propia: 10,000 RPM.
-  - Corrección: en eu-north-1, Haiku 4.5 también tiene 10,000 RPM. Los 10 RPM que menciona VdC son de eu-west-1.
-  - **Prueba comparativa (2026-11-16, aprobada por Mafer; con ella se aceptaron los EULA de Qwen y DeepSeek).**
-    - Datos: 66 títulos únicos de la calibración (keyword "pet urine odor remover", Amazon y Noon). Claude los etiquetó con las reglas del prompt actual y marcó 7 casos dudosos.
-    - Modos: lotes de 22, un título por llamada (20 títulos) y 10 títulos de wipes armados a mano con conteo conocido.
-    - Regla de decisión: se queda el más barato que quede a 2 puntos o menos de exactitud de Haiku, con 100 % de JSON válido.
+  - Qwen and DeepSeek run only in Stockholm, do not need Marketplace and already show as `AVAILABLE/AUTHORIZED`. **The first invocation accepts the provider's EULA.**
+  - Each has its own quota: 10,000 RPM.
+  - Correction: in eu-north-1, Haiku 4.5 also has 10,000 RPM. The 10 RPM that VdC mentions are for eu-west-1.
+  - **Benchmark (2026-11-16, approved by Mafer; it accepted the Qwen and DeepSeek EULAs).**
+    - Data: 66 unique titles from the calibration (keyword "pet urine odor remover", Amazon and Noon). Claude labeled them with the rules of the current prompt and flagged 7 doubtful cases.
+    - Modes: batches of 22, one title per call (20 titles) and 10 hand-built wipes titles with a known count.
+    - Decision rule: keep the cheapest one within 2 points or less of Haiku's accuracy, with 100 % valid JSON.
 
-    | Modelo | Exactitud | Precisión | Recall | JSON válido | Wipes exactos | Lote = un título | Latencia del lote (p50) | Costo de la prueba |
+    | Model | Accuracy | Precision | Recall | Valid JSON | Exact wipes | Batch = single title | Batch latency (p50) | Test cost |
     |---|---|---|---|---|---|---|---|---|
     | Haiku 4.5 | 98.5 % | 96.9 % | 100 % | 24/24 | 10/10 | 100 % | 1.3 s | USD 0.024 |
     | **DeepSeek V3.2** | **97.0 %** | **100 %** | 93.5 % | 24/24 | 10/10 | 85 % | 5.2 s | USD 0.010 |
     | Qwen3 235B | 95.5 % | 96.7 % | 93.5 % | 24/24 | 10/10 | 85 % | 4.6 s | USD 0.004 |
 
-    - DeepSeek **pasa la regla** (1.5 puntos debajo de Haiku). Sus 2 errores son casos dudosos: un removedor para patio y otro para piso duro, que rechazó por la regla de superficie especializada. **Nunca aceptó un producto irrelevante.** Eso es lo que más importa, porque un falso positivo contamina el precio de referencia.
-    - Qwen rechazó 2 productos que claramente sí eran relevantes y aceptó un limpiador de tapicería genérico.
-    - DeepSeek y Qwen no siempre dan la misma respuesta en lote que título por título (85 %). Por eso conviene usar **siempre el modo lote**, también en B2B (lotes de 1 a N).
-    - **Decisión:** DeepSeek V3.2 como principal. Haiku 4.5 como respaldo, solo si DeepSeek falla o devuelve JSON inválido; ya está habilitado en la cuenta para VdC.
-    - Limitaciones: 1 keyword, solo títulos en inglés, etiquetas hechas por Claude y wipes armados a mano. En la primera corrida real hay que revisar una muestra.
-    - Scripts y resultados crudos: `scratchpad/calib/bakeoff.py` y `bakeoff_results.json` (temporales). El script se pasa al repo como `tests/bakeoff_relevance.py` en F2.
-  - La primera llamada con un schema nuevo puede tardar hasta unos 90 s, porque compila la gramática: hay que poner un timeout de 120 s.
-- **Cuota:**
-  - Ya no es una restricción: los modelos candidatos tienen 10,000 RPM en eu-north-1. Aun así se usan lotes de 25 títulos para ahorrar tiempo y tokens.
-  - Con lotes, Apify baja de unas 5,500 llamadas a unas 220. B2B también va por lotes: los títulos de cada búsqueda se juntan, porque el modelo responde distinto en lote y título por título.
-  - La mensual de PI (último jueves) no coincide con la de VdC (primer domingo).
-- **Infraestructura:**
-  - `infra/bedrock_profile.py`: perfiles de aplicación con la etiqueta `project=price-intelligence` para DeepSeek V3.2 y Haiku 4.5, si Bedrock lo permite para DeepSeek (se verifica en F2). Si no lo permite, el costo se separa por modelId en Cost Explorer;
-  - en `instance_role.py`: `bedrock:InvokeModel` solo sobre `deepseek.v3.2`, el perfil de Haiku y sus modelos.
-- **Errores:**
-  - reintentos con backoff ante `ThrottlingException`;
-  - **fallar en voz alta**: hoy, si falta la key, todo sale "no relevante" y el pipeline sigue. Si los fallos de la IA pasan del 5 %, el pipeline debe salir con código 1.
-- **Costo:** unos USD 4 al mes con DeepSeek V3.2.
-- **Después del corte:** quitar `GEMINI_API_KEY` de `prod/wayakit-app` y revocar la key.
+    - DeepSeek **passes the rule** (1.5 points below Haiku). Its 2 errors are doubtful cases: a patio remover and a hard-floor one, which it rejected under the specialized-surface rule. **It never accepted an irrelevant product.** That is what matters most, because a false positive contaminates the reference price.
+    - Qwen rejected 2 products that were clearly relevant and accepted a generic upholstery cleaner.
+    - DeepSeek and Qwen do not always give the same answer in batch as title by title (85 %). That is why it is better to **always use batch mode**, also in B2B (batches of 1 to N).
+    - **Decision:** DeepSeek V3.2 as primary. Haiku 4.5 as fallback, only if DeepSeek fails or returns invalid JSON; it is already enabled on the account for VdC.
+    - Limitations: 1 keyword, English titles only, labels made by Claude and hand-built wipes. In the first real run a sample must be reviewed.
+    - Scripts and raw results: `scratchpad/calib/bakeoff.py` and `bakeoff_results.json` (temporary). The script moves into the repo as `tests/bakeoff_relevance.py` in F2.
+  - The first call with a new schema can take up to about 90 s, because it compiles the grammar: a 120 s timeout must be set.
+- **Quota:**
+  - It is no longer a constraint: the candidate models have 10,000 RPM in eu-north-1. Even so, batches of 25 titles are used to save time and tokens.
+  - With batches, Apify drops from about 5,500 calls to about 220. B2B also goes in batches: the titles of each search are grouped, because the model answers differently in batch and title by title.
+  - PI's monthly run (last Thursday) does not coincide with VdC's (first Sunday).
+- **Infrastructure:**
+  - `infra/bedrock_profile.py`: application profiles with the `project=price-intelligence` tag for DeepSeek V3.2 and Haiku 4.5, if Bedrock allows it for DeepSeek (verified in F2). If it does not, the cost is separated by modelId in Cost Explorer;
+  - in `instance_role.py`: `bedrock:InvokeModel` only on `deepseek.v3.2`, the Haiku profile and its models.
+- **Errors:**
+  - retries with backoff on `ThrottlingException`;
+  - **fail loudly**: today, if the key is missing, everything comes out "not relevant" and the pipeline continues. If AI failures exceed 5 %, the pipeline must exit with code 1.
+- **Cost:** about USD 4 per month with DeepSeek V3.2.
+- **After the cutover:** remove `GEMINI_API_KEY` from `prod/wayakit-app` and revoke the key.
 
 ---
 
-## 6. Revisión de keywords sin frenar la corrida (propuesta del 2026-11-17)
+## 6. Keyword review without blocking the run (proposal of 2026-11-17)
 
-**Estado: en revisión.** Respuesta de Mafer (2026-11-17): no le funciona "una sola fuente de verdad", porque se agregan productos nuevos todo el tiempo (baby, home, etc.) y hay que revisar cómo buscar cada uno en cada sitio activo. El problema es de recall: el producto sí existe en el sitio (ej. SACO), pero con el nombre de nuestro producto no sale y hay que buscarlo de otra forma. Le gustó el reporte de cobertura y pidió una propuesta mejor que el PR automático: es la v2 de abajo.
+**Status: under review.** Mafer's answer (2026-11-17): "a single source of truth" does not work for her, because new products are added all the time (baby, home, etc.) and how to search for each one on each active site has to be reviewed. The problem is recall: the product does exist on the site (e.g. SACO), but it does not show up with our product's name and has to be searched for another way. She liked the coverage report and asked for a better proposal than the automatic PR: that is v2 below.
 
-**El problema:**
-- Cada sitio encuentra el producto con palabras distintas. Por ejemplo, en SACO "car disinfectant" no sale y "car cleaner" sí.
-- Hoy eso se resuelve así:
-  - `scraper/modifiers_mapping.csv` guarda la keyword por sitio (`sitio:keyword`, 149 filas; hoy solo para fine, gogreen, officesupply y aerosense);
-  - además, alguien edita `analysis-odoo.csv` entre la etapa 1 y la 2, lo que frena la corrida hasta que esa revisión termine.
-- Las ediciones hechas en `analysis-odoo.csv` se pierden en la siguiente corrida completa si no se copian a `modifiers_mapping.csv`.
+**The problem:**
+- Each site finds the product with different words. For example, on SACO "car disinfectant" returns nothing and "car cleaner" does.
+- Today this is handled like this:
+  - `scraper/modifiers_mapping.csv` stores the keyword per site (`site:keyword`, 149 rows; today only for fine, gogreen, officesupply and aerosense);
+  - in addition, someone edits `analysis-odoo.csv` between stage 1 and stage 2, which blocks the run until that review is done.
+- Edits made in `analysis-odoo.csv` are lost in the next full run if they are not copied to `modifiers_mapping.csv`.
 
-**Propuesta v1 (descartada el 2026-11-17):** keywords en un solo CSV, reintento durante la corrida y un PR con lo que funcionó. Mafer la rechazó porque reacciona tarde: los productos nuevos se buscan mal en la primera corrida y la revisión llega después.
+**Proposal v1 (discarded on 2026-11-17):** keywords in a single CSV, retry during the run and a PR with what worked. Mafer rejected it because it reacts late: new products are searched badly in the first run and the review comes afterwards.
 
-**Propuesta v2: descubrir cómo buscar cada producto *antes* de la corrida mensual.**
+**Proposal v2: discover how to search for each product *before* the monthly run.**
 
-1. **Una semana antes (el jueves anterior al último jueves), chequeo automático.** La instancia se enciende en modo "descubrimiento" y arma la lista de pendientes:
-   - **solo los tipos de producto nuevos en Odoo** desde la corrida anterior (baby, home, etc.). Así el costo mensual se queda bajo (decisión de Mafer, 2026-11-17);
-   - los producto × sitio que dieron 0 a 2 resultados relevantes **no** se revisan cada mes: solo se marcan en el reporte de cobertura.
-   - **Revisión completa cada 6 meses:** todos los productos del mapping, en todos los sitios activos, con el mismo proceso. Cubre los cambios de vocabulario de los sitios y los casos marcados en el reporte.
-2. **Candidatos de búsqueda de tres fuentes,** por cada producto × sitio activo:
-   - **el vocabulario del propio sitio:** sugerencias del buscador (autocompletar) y nombres de categoría de productos parecidos que ya se encontraron. Es cómo el sitio llama a las cosas; ej. SACO dice "car cleaner";
-   - **DeepSeek:** sinónimos en inglés y árabe, a partir del nombre y la descripción del producto en Odoo;
-   - **lo que ya funcionó** en ese sitio para productos parecidos (memoria de meses anteriores).
-3. **Se prueban de verdad.** Cada candidato se busca en el sitio (solo la primera página, que es barato) y se cuentan los resultados que DeepSeek juzga equivalentes a nuestro producto. Gana el que trae más.
-4. **Hoja de revisión** (solo con los pendientes; se esperan pocos al mes). Por cada producto × sitio muestra la keyword actual, la ganadora, cuántos relevantes trajo y 3 ejemplos con liga. Quien revisa aprueba, cambia la keyword o marca "no existe en este sitio".
-5. **El día de la corrida:**
-   - se usa lo aprobado;
-   - si nadie revisó, la ganadora automática si trajo 3 o más relevantes; si no, la keyword de siempre;
-   - todo queda marcado en el reporte de cobertura, que alimenta el chequeo del mes siguiente.
-6. **Las keywords se guardan por producto × sitio,** con historial y quién aprobó. Hoy eso es `modifiers_mapping.csv`, pero ya nadie lo edita a mano: se llena desde la hoja de revisión.
+1. **One week before (the Thursday before the last Thursday), automatic check.** The instance starts in "discovery" mode and builds the pending list:
+   - **only the product types that are new in Odoo** since the previous run (baby, home, etc.). This keeps the monthly cost low (Mafer's decision, 2026-11-17);
+   - the product × site pairs that gave 0 to 2 relevant results are **not** reviewed every month: they are only flagged in the coverage report.
+   - **Full review every 6 months:** all products in the mapping, on all active sites, with the same process. It covers changes in the sites' vocabulary and the cases flagged in the report.
+2. **Search candidates from three sources,** for each product × active site:
+   - **the site's own vocabulary:** search-box suggestions (autocomplete) and category names of similar products already found. It is how the site names things; e.g. SACO says "car cleaner";
+   - **DeepSeek:** synonyms in English and Arabic, based on the product name and description in Odoo;
+   - **what already worked** on that site for similar products (memory from previous months).
+3. **They are actually tested.** Each candidate is searched on the site (first page only, which is cheap) and the results that DeepSeek judges equivalent to our product are counted. The one that brings the most wins.
+4. **Review sheet** (only with the pending items; few are expected per month). For each product × site it shows the current keyword, the winner, how many relevant results it brought and 3 examples with links. The reviewer approves, changes the keyword or marks "not on this site".
+5. **On the day of the run:**
+   - what was approved is used;
+   - if nobody reviewed, the automatic winner if it brought 3 or more relevant results; otherwise, the usual keyword;
+   - everything is flagged in the coverage report, which feeds the following month's check.
+6. **Keywords are stored per product × site,** with history and who approved. Today that is `modifiers_mapping.csv`, but nobody edits it by hand any more: it is filled from the review sheet.
 
-**Dónde revisar (por decidir con Mafer):**
-- **(a) GitHub:** la hoja como PR o como CSV. Gratis e inmediato, pero solo es cómodo para IT.
-- **(b) Hoja compartida:** Google Sheets o similar. Cómoda para Ventas; necesita una cuenta de servicio y un secreto.
-- **(c) Odoo:** un campo "keywords por sitio" en el tipo de producto, donde ya trabaja quien crea los productos. Es lo mejor a largo plazo, pero requiere desarrollo de un módulo.
+**Where to review (to decide with Mafer):**
+- **(a) GitHub:** the sheet as a PR or as a CSV. Free and immediate, but only convenient for IT.
+- **(b) Shared sheet:** Google Sheets or similar. Convenient for Sales; needs a service account and a secret.
+- **(c) Odoo:** a "keywords per site" field on the product type, where the people who create products already work. It is the best long-term option, but requires developing a module.
 
-Mafer prefiere Odoo (2026-11-17). Antes de diseñarlo se estudia el módulo `price_intelligence` de Odoo (repo `wayakit/wayakit`).
+Mafer prefers Odoo (2026-11-17). Before designing it, the Odoo `price_intelligence` module (repo `wayakit/wayakit`) is studied.
 
-**Fases:** reporte de cobertura (paso 1) en F2 · descubrimiento y prueba de candidatos (2–3) en F6, junto con Apify · hoja de revisión y modo "descubrimiento" (4–5) en F4. Esfuerzo adicional estimado: unos 3–4 días. Parte de esto queda fuera del alcance del ticket A, así que conviene un ticket aparte.
+**Phases:** coverage report (step 1) in F2 · discovery and candidate testing (2–3) in F6, together with Apify · review sheet and "discovery" mode (4–5) in F4. Estimated additional effort: about 3–4 days. Part of this is outside the scope of ticket A, so a separate ticket is advisable.
 
 ---
 
-## 7. Odoo: keywords de búsqueda y enlace con los productos (propuesta del 2026-11-17)
+## 7. Odoo: search keywords and link with products (proposal of 2026-11-17)
 
-Sale del estudio del módulo `price_intelligence` (repo `wayakit/wayakit`, rama `mainTest`; abajo, `PIM/`), con un diseño revisado por un segundo agente contra el código. Hasta que Mafer lo apruebe es solo propuesta: no se tocó Odoo.
+It comes from the study of the `price_intelligence` module (repo `wayakit/wayakit`, branch `mainTest`; below, `PIM/`), with a design reviewed by a second agent against the code. Until Mafer approves it, it is only a proposal: Odoo was not touched.
 
-### 7.1 Cómo está hoy
+### 7.1 How it is today
 
-**Taxonomía**
+**Taxonomy**
 - Industry → Sub-industry → **Type of product** (`product.classification`).
-- El nombre del tipo es la única llave única (`PIM/models/product_classification.py:49-51`).
-- Las columnas Sub industry, Industry y Generic product type que lee PI se derivan del tipo. Generic product type es texto libre (`:21`).
+- The type name is the only unique key (`PIM/models/product_classification.py:49-51`).
+- The Sub industry, Industry and Generic product type columns that PI reads are derived from the type. Generic product type is free text (`:21`).
 
-**`product.master`, el SKU de PI.** Vive aparte de los productos de Odoo y se enlaza de tres formas distintas:
+**`product.master`, the PI SKU.** It lives separately from the Odoo products and is linked in three different ways:
 
-| Enlace | Dónde se usa | Problema |
+| Link | Where it is used | Problem |
 |---|---|---|
-| `product_id` (Char) = SKU = `default_code` | PI, pestaña Financials (`wayakit_customization/models/sale_order_financials.py:38-56`), `product.price.suggestion.product_id_str` | **No es único**: hay 6 SKU repetidos (12 de 1,927 masters, según los datos de F1). Al ser texto, si el SKU cambia en un lado, se rompe |
-| `external_id` (Char, xml-id de `product.template`) | Solo el precio del e-commerce y la búsqueda por nombre (`PIM/models/product_master.py:151-191`, `:255-360`, `:802`) | Se resuelve a mano; si el xml-id cambia, falla en silencio |
-| `uploaded_in_odoo` (Bool manual) | Informativo | Nadie lo mantiene; se puede calcular |
+| `product_id` (Char) = SKU = `default_code` | PI, Financials tab (`wayakit_customization/models/sale_order_financials.py:38-56`), `product.price.suggestion.product_id_str` | **It is not unique**: there are 6 repeated SKUs (12 of 1,927 masters, according to the F1 data). Since it is text, if the SKU changes on one side, it breaks |
+| `external_id` (Char, xml-id of `product.template`) | Only the e-commerce price and the name search (`PIM/models/product_master.py:151-191`, `:255-360`, `:802`) | Resolved by hand; if the xml-id changes, it fails silently |
+| `uploaded_in_odoo` (manual Bool) | Informational | Nobody maintains it; it can be computed |
 
-- `product.price.suggestion` tampoco tiene relación: todo es texto (`PIM/models/product_price_suggestion.py:5-56`).
-- Solo `competitor.product` tiene `company_id`.
+- `product.price.suggestion` has no relation either: everything is text (`PIM/models/product_price_suggestion.py:5-56`).
+- Only `competitor.product` has `company_id`.
 
-**Granularidad de las keywords:** **por tipo de producto × sitio**, no por SKU.
-- Hay 1,921 SKU en 410 tipos (mediana: 4 SKU por tipo).
-- Dar de alta un SKU de un tipo que ya existe no pide keywords nuevas. Solo un **tipo nuevo** las necesita.
+**Keyword granularity:** **per product type × site**, not per SKU.
+- There are 1,921 SKUs in 410 types (median: 4 SKUs per type).
+- Adding a SKU of a type that already exists does not require new keywords. Only a **new type** needs them.
 
-### 7.2 Propuesta A: keywords en Odoo
+### 7.2 Proposal A: keywords in Odoo
 
-**Modelos nuevos en `PIM/`**
-- **`pi.search.site`:** reemplaza `TARGET_MAP`. Campos: `code` (amazon, saco…), `name`, `active` y una relación M2M con `product.subindustry`.
-  - Como enlaza por id, desaparece el error de mayúsculas de "Land Transportation".
-  - Los 7 sitios iniciales se cargan como datos `noupdate`.
-- **`pi.search.keyword`:** una fila por tipo × sitio × keyword.
-  - **Estado:** `proposed`, `approved`, `rejected`, `not_on_site` o `legacy_base`.
-  - **Origen:** `manual`, `discovery` o `csv_import`.
-  - **Medición:** `relevant_count`, ejemplos como texto ("título — URL") y `last_discovery`, que **es lo que decide el barrido semestral**.
-  - La keyword se guarda **tal cual** (sin pasarla a minúsculas, porque eso cambia las búsquedas de hoy) y se deduplica sin distinguir mayúsculas.
+**New models in `PIM/`**
+- **`pi.search.site`:** replaces `TARGET_MAP`. Fields: `code` (amazon, saco…), `name`, `active` and an M2M relation with `product.subindustry`.
+  - Since it links by id, the "Land Transportation" case bug disappears.
+  - The 7 initial sites are loaded as `noupdate` data.
+- **`pi.search.keyword`:** one row per type × site × keyword.
+  - **Status:** `proposed`, `approved`, `rejected`, `not_on_site` or `legacy_base`.
+  - **Origin:** `manual`, `discovery` or `csv_import`.
+  - **Measurement:** `relevant_count`, examples as text ("title — URL") and `last_discovery`, which **is what drives the six-monthly sweep**.
+  - The keyword is stored **as is** (without lowercasing it, because that changes today's searches) and is deduplicated case-insensitively.
 
-**En el tipo de producto**
-- Una pestaña **"Search Keywords"** en el formulario.
-- Un badge **pendiente / completo** en la lista, con un filtro "Keywords pendientes".
+**On the product type**
+- A **"Search Keywords"** tab on the form.
+- A **pending / complete** badge in the list, with a "Pending keywords" filter.
 
-**Menú "Price Intelligence > Keywords por revisar"**
-- Es una lista editable de propuestas: se corrige la keyword en la misma fila y se aprueba, rechaza o marca "No existe en el sitio" con un clic.
-- El descubrimiento deja **una actividad por tipo** al revisor configurado.
+**"Price Intelligence > Keywords to review" menu**
+- It is an editable list of proposals: the keyword is corrected in the same row and approved, rejected or marked "Not on site" with one click.
+- Discovery leaves **one activity per type** for the configured reviewer.
 
-**No es obligatorio llenarla al dar de alta.** Quien crea un tipo puede escribir keywords si ya sabe cómo se busca. Si no, el descubrimiento las propone. Así no se frena a Ventas.
+**Filling it in at creation is not mandatory.** Whoever creates a type can write keywords if they already know how it is searched. If not, discovery proposes them. That way Sales is not blocked.
 
-**Qué es "nuevo" en el descubrimiento mensual**
-- Un tipo sin ninguna keyword.
-- Un sitio recién activado.
+**What is "new" in the monthly discovery**
+- A type with no keyword at all.
+- A newly activated site.
 
-Para que la migración no dispare un barrido completo el primer mes, se crea una fila base por cada par activo: `approved` con el nombre base en retail, y `legacy_base` en B2B sin keyword.
+So that the migration does not trigger a full sweep in the first month, a base row is created for each active pair: `approved` with the base name in retail, and `legacy_base` in B2B without a keyword.
 
-**Integración con PI**
-- **Lectura:** PI lee sitios, tipos y keywords por XML-RPC y arma el mismo `analysis-odoo.csv`. Así `modifiers_mapping.csv` y la edición manual se retiran.
-- **Escritura:** PI solo escribe propuestas, con un método del servidor que nunca aprueba ni borra.
-- **Si Odoo no responde, PI sale con código 1.**
+**Integration with PI**
+- **Read:** PI reads sites, types and keywords over XML-RPC and builds the same `analysis-odoo.csv`. That retires `modifiers_mapping.csv` and the manual editing.
+- **Write:** PI only writes proposals, through a server method that never approves or deletes.
+- **If Odoo does not respond, PI exits with code 1.**
 
-**Migración:** un script exporta las 213 keywords actuales del CSV como archivo de importación. Mafer lo importa primero en staging y luego en producción.
+**Migration:** a script exports the 213 current keywords from the CSV as an import file. Mafer imports it first in staging and then in production.
 
-**Esfuerzo:** unos 3–4 días (módulo 1.5–2 días, migración 0.5, PI lee de Odoo 1). El descubrimiento ya está contado en la sección 6.
+**Effort:** about 3–4 days (module 1.5–2 days, migration 0.5, PI reads from Odoo 1). Discovery is already counted in section 6.
 
-### 7.3 Propuesta B: enlace limpio entre `product.master` y los productos de Odoo
+### 7.3 Proposal B: clean link between `product.master` and the Odoo products
 
-- **Campo nuevo `product_tmpl_id`** (M2O a `product.template`) en `product.master`:
-  - se llena automáticamente por SKU (`default_code`) con un backfill;
-  - también se llena cuando el producto se crea en Odoo después que el master, que hoy es lo normal (`uploaded_in_odoo`).
-  - Los masters que no encuentren su producto quedan en un filtro "Sin enlazar".
-- **`uploaded_in_odoo` pasa a calcularse** (`bool(product_tmpl_id)`).
-- **`external_id` se retira:** el precio del e-commerce y la búsqueda se hacen por el M2O. Antes se valida que el backfill cubra a todos los que hoy tienen `external_id`.
-- **SKU único:**
-  - primero un reporte de los 6 SKU repetidos para que Mafer decida cuál queda;
-  - luego `unique(product_id)`.
-- **`product.price.suggestion` gana `master_id`** (M2O). PI lo escribe y se conserva `product_id_str` por compatibilidad. La pestaña Financials puede seguir por SKU o pasar al M2O.
-- **No se fusiona `product.master` con `product.template`.** El master tiene costos, tiers y productos que todavía no existen en Odoo. Lo correcto es enlazarlos, no mezclarlos.
+- **New field `product_tmpl_id`** (M2O to `product.template`) on `product.master`:
+  - filled automatically by SKU (`default_code`) with a backfill;
+  - also filled when the product is created in Odoo after the master, which is the norm today (`uploaded_in_odoo`).
+  - Masters that do not find their product end up in an "Unlinked" filter.
+- **`uploaded_in_odoo` becomes computed** (`bool(product_tmpl_id)`).
+- **`external_id` is retired:** the e-commerce price and the search go through the M2O. Before that, it is validated that the backfill covers everyone who has an `external_id` today.
+- **Unique SKU:**
+  - first a report of the 6 repeated SKUs so that Mafer decides which one stays;
+  - then `unique(product_id)`.
+- **`product.price.suggestion` gains `master_id`** (M2O). PI writes it and `product_id_str` is kept for compatibility. The Financials tab can keep using the SKU or move to the M2O.
+- **`product.master` is not merged with `product.template`.** The master has costs, tiers and products that do not exist in Odoo yet. The right thing is to link them, not mix them.
 
-**Esfuerzo:** unos 2 días, más la limpieza de los duplicados por parte de Mafer.
+**Effort:** about 2 days, plus the cleanup of duplicates by Mafer.
 
-### 7.4 Dónde vive cada pieza y riesgos
+### 7.4 Where each piece lives, and risks
 
-- **Código del módulo:** `wayakit/wayakit`, rama `mainTest` → staging en odoo.sh → `main`.
-- **Datos** (revisor, grupos, importación, limpieza de SKU): en producción, a mano por Mafer.
-- **Cambios de PI:** esta rama.
+- **Module code:** `wayakit/wayakit`, branch `mainTest` → staging on odoo.sh → `main`.
+- **Data** (reviewer, groups, import, SKU cleanup): in production, by hand by Mafer.
+- **PI changes:** this branch.
 
-**Riesgos**
-- Subir la versión del módulo y probar el upgrade en staging antes de producción, en una ventana sin corrida de PI.
-- El Viewer necesita lectura en los modelos nuevos.
-- Los permisos del usuario de la API siguen sin verificar.
-- Mumzworld y SACO cambian de dónde leen su configuración, así que hace falta la prueba de regresión de F6.
-- Al activar Noon, se descubren de golpe unos 120 pares (costo de Apify).
+**Risks**
+- Bump the module version and test the upgrade in staging before production, in a window with no PI run.
+- The Viewer needs read access on the new models.
+- The API user's permissions are still unverified.
+- Mumzworld and SACO change where they read their configuration from, so the F6 regression test is needed.
+- When Noon is activated, about 120 pairs are discovered at once (Apify cost).
 
-**Tickets abiertos el 2026-11-17** (aprobados por Mafer):
-- [Price Intelligence en Odoo: keywords de búsqueda por sitio](https://app.notion.com/p/41bbe65f8c1381dd8f54c3b0077953c3) (propuesta A): estimación 8, vence el 2026-12-10.
-- [Price Intelligence en Odoo: enlazar product.master con productos](https://app.notion.com/p/41bbe65f8c1381248fd3fbb2a177d536) (propuesta B): estimación 5, vence el 2026-12-15.
+**Tickets opened on 2026-11-17** (approved by Mafer):
+- [Price Intelligence in Odoo: search keywords per site](https://app.notion.com/p/41bbe65f8c1381dd8f54c3b0077953c3) (proposal A): estimate 8, due 2026-12-10.
+- [Price Intelligence in Odoo: link product.master with products](https://app.notion.com/p/41bbe65f8c1381248fd3fbb2a177d536) (proposal B): estimate 5, due 2026-12-15.
 
-Las fechas quedan después de los tickets A y B, porque las semanas de noviembre ya están cargadas.
+The dates fall after tickets A and B, because the November weeks are already full.

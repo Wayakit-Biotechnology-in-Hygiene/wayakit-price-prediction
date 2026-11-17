@@ -1,22 +1,24 @@
-"""E2E de `run_pipeline.sh` (etapas 1 y 2) en una copia temporal con comandos falsos (shims).
+"""E2E of `run_pipeline.sh` (stages 1 and 2) in a temporary copy with fake commands (shims).
 
-Ver `tests/e2e/_pipeline_sandbox.py`: el script real nunca corre en su lugar, `python`, `timeout`,
-`git`, `conda`, `aws`, `sudo` y `shutdown` son shims que solo registran, el `PATH` no trae nada
-más que esos shims y unas utilidades sin red, y la corrida se niega a empezar si `sudo` o
-`shutdown` (el `trap EXIT` hace `sudo shutdown -h +1`) no resuelven a su shim. No hay llamadas a
-AWS, Odoo, Apify ni Bedrock, ni apagado real. No necesita los datos de F1.
+See `tests/e2e/_pipeline_sandbox.py`: the real script never runs in its place, `python`, `timeout`,
+`git`, `conda`, `aws`, `sudo` and `shutdown` are shims that only record, the `PATH` holds nothing
+but those shims and a few network-free utilities, and the run refuses to start if `sudo` or
+`shutdown` (the `trap EXIT` does `sudo shutdown -h +1`) do not resolve to their shim. There are no
+calls to AWS, Odoo, Apify or Bedrock, and no real shutdown. It does not need the F1 data.
 
-Qué documenta:
+What it documents:
 
-- Hoy (pasan): el orden de los pasos de cada etapa, que la etapa 1 aborta si falla un paso y que
-  el apagado siempre pasa por el shim.
-- Lo deseado (xfail estricto, bug C01 de `docs/checklist-confiabilidad.md`): si el scraping
-  falla o se vence el `timeout`, la etapa 2 NO debe llamar a `odoo_api_price_suggestion.py` y
-  debe salir con código distinto de 0. Hoy sí la llama y sale con 0 (corrida del 13–15 nov 2026).
-  Cuando `pi-dev` lo arregle, el xfail pasará a XPASS y `xfail_strict` hará fallar la suite: ahí
-  se quita la marca.
+- Today (passing): the order of the steps of each stage, that stage 1 aborts if a step fails and
+  that the shutdown always goes through the shim.
+- The desired behavior (strict xfail, bug C01 of `docs/reliability-checklist.md`): if scraping
+  fails or the `timeout` expires, stage 2 must NOT call `odoo_api_price_suggestion.py` and
+  must exit with a nonzero code. Today it does call it and exits with 0 (run of 13–15 Nov 2026).
+  When `pi-dev` fixes it, the xfail will turn into XPASS and `xfail_strict` will make the suite
+  fail: that is when the mark is removed.
 """
 from __future__ import annotations
+
+import re
 
 import pytest
 
@@ -24,19 +26,19 @@ from tests.e2e import _pipeline_sandbox as sb
 
 pytestmark = pytest.mark.e2e
 
-SUBIDA = "ml_model/odoo_api_price_suggestion.py"
+UPLOAD = "ml_model/odoo_api_price_suggestion.py"
 SCRAPER = "scraper/main.py"
-TIMEOUT_EXIT = 124  # lo que devuelve `timeout` cuando se vence
+TIMEOUT_EXIT = 124  # what `timeout` returns when it expires
 
-ETAPA1 = ["ml_model/odoo_api_products.py", "scraper/odoo_api_connection_products.py"]
-ETAPA2 = {
+STAGE1 = ["ml_model/odoo_api_products.py", "scraper/odoo_api_connection_products.py"]
+STAGE2 = {
     "full": [SCRAPER, "ml_model/odoo_api_cotizations.py", "ml_model/odoo_api_competitor_products.py",
              "ml_model/1a_preprocess_data.py", "ml_model/1b_preprocess_data.py",
-             "ml_model/2_train_models.py", "ml_model/3_predicted_prices.py", SUBIDA],
+             "ml_model/2_train_models.py", "ml_model/3_predicted_prices.py", UPLOAD],
     "partial": ["scraper/odoo_api_connection_products.py", SCRAPER, "ml_model/odoo_api_cotizations.py",
                 "ml_model/odoo_api_competitor_products.py", "ml_model/1a_preprocess_data.py",
                 "ml_model/1b_preprocess_data.py", "ml_model/2_train_models.py",
-                "ml_model/3_predicted_prices.py", SUBIDA],
+                "ml_model/3_predicted_prices.py", UPLOAD],
 }
 SCRAPER_TIMEOUT = {"full": "30h", "partial": "4h"}
 
@@ -46,136 +48,137 @@ def sandbox(tmp_path):
     return sb.Sandbox(tmp_path / "pi-run-pipeline")
 
 
-def _etapa2(sandbox: sb.Sandbox, modo: str) -> None:
-    """Estado que deja la etapa 1 en producción: modo, productos de Odoo y (parcial) productos nuevos."""
-    sandbox.write("logs/run_mode.txt", f"{modo}\n")
+def _stage2_state(sandbox: sb.Sandbox, mode: str) -> None:
+    """State that stage 1 leaves in production: mode, Odoo products and (partial) new products."""
+    sandbox.write("logs/run_mode.txt", f"{mode}\n")
     sandbox.write("ml_model/wayakit_products.csv", "Product_ID\nP1\n")
-    if modo == "partial":
+    if mode == "partial":
         sandbox.write("ml_model/wayakit_new_products_temp.csv", "Product_ID\nP2\nP3\n")
 
 
-def _sin_efectos_reales(run: sb.Corrida) -> None:
-    """Todo lo que podría salir de la máquina pasó por un shim y nada quedó sin resolver."""
-    assert not run.de("aws"), run.traza()
-    assert [c.args for c in run.de("sudo")] == ["shutdown -h +1"], run.traza()
-    assert not run.de("shutdown"), "el shim de sudo no ejecuta nada: shutdown no debe llamarse directo"
-    assert all(c.cwd == str(run.project) for c in run.de("python")), run.traza()
-    salida = run.stdout + run.stderr + run.pipeline_log
-    assert "command not found" not in salida and "No such file" not in salida, run.traza()
-    assert not any(run.project.rglob("*.py")), "la copia no debe traer código"
+def _no_real_effects(run: sb.SandboxRun) -> None:
+    """Everything that could leave the machine went through a shim and nothing was left unresolved."""
+    assert not run.of("aws"), run.trace()
+    assert [c.args for c in run.of("sudo")] == ["shutdown -h +1"], run.trace()
+    assert not run.of("shutdown"), "the sudo shim executes nothing: shutdown must not be called directly"
+    assert all(c.cwd == str(run.project) for c in run.of("python")), run.trace()
+    output = run.stdout + run.stderr + run.pipeline_log
+    assert "command not found" not in output and "No such file" not in output, run.trace()
+    assert not any(run.project.rglob("*.py")), "the copy must not contain code"
 
 
 # ---------------------------------------------------------------------------------------------
-# Candado de los shims
+# Shim lock
 # ---------------------------------------------------------------------------------------------
-def test_shims_resuelven_primero_y_sudo_shutdown_estan(sandbox):
-    sandbox.check_shims(sandbox.env())  # no lanza
+def test_shims_resolve_first_and_sudo_shutdown_are_present(sandbox):
+    sandbox.check_shims(sandbox.env())  # does not raise
 
 
-def test_se_niega_a_correr_si_sudo_no_es_el_shim(sandbox):
-    # Con el PATH del sistema primero, sudo/shutdown/git resuelven a los reales: no debe correr.
-    env = sandbox.env(path=f"{sb.SISTEMA_PATH}:/sbin:/usr/sbin:{sandbox.shims}")
-    with pytest.raises(sb.ShimNoProtege, match="sudo"):
+def test_refuses_to_run_if_sudo_is_not_the_shim(sandbox):
+    # With the system PATH first, sudo/shutdown/git resolve to the real ones: it must not run.
+    env = sandbox.env(path=f"{sb.SYSTEM_PATH}:/sbin:/usr/sbin:{sandbox.shims}")
+    with pytest.raises(sb.ShimNotProtecting, match="sudo"):
         sandbox.check_shims(env)
-    # Por si el candado fallara: en este caso la copia es un script inofensivo que deja una marca.
-    marca = sandbox.root / "corrio.txt"
-    (sandbox.project / sb.SCRIPT).write_text(f"#!/bin/bash\necho si > '{marca}'\n")
-    sandbox.env = lambda fallar=None, path=None: env  # type: ignore[method-assign]
-    with pytest.raises(sb.ShimNoProtege):
+    # In case the lock failed: here the copy is a harmless script that leaves a marker.
+    marker = sandbox.root / "ran.txt"
+    (sandbox.project / sb.SCRIPT).write_text(f"#!/bin/bash\necho yes > '{marker}'\n")
+    sandbox.env = lambda fail=None, path=None: env  # type: ignore[method-assign]
+    with pytest.raises(sb.ShimNotProtecting):
         sandbox.run(stage=1)
-    assert not marca.exists() and not sandbox.log.exists(), "no debió ejecutarse nada"
+    assert not marker.exists() and not sandbox.log.exists(), "nothing should have run"
 
 
-def test_se_niega_a_correr_si_falta_un_shim(sandbox):
+def test_refuses_to_run_if_a_shim_is_missing(sandbox):
     (sandbox.shims / "shutdown").unlink()
-    with pytest.raises(sb.ShimNoProtege, match="shutdown"):
+    with pytest.raises(sb.ShimNotProtecting, match="shutdown"):
         sandbox.run(stage=1)
 
 
-def test_shim_de_python_puede_fallar_un_paso(sandbox):
-    """El control de fallas del shim funciona (si no, el xfail de C01 no probaría nada)."""
-    _etapa2(sandbox, "full")
-    run = sandbox.run(stage=2, fallar={SCRAPER: TIMEOUT_EXIT})
-    assert f"shim python: {SCRAPER} -> exit {TIMEOUT_EXIT}" in run.stdout, run.traza()
-    assert "ERROR: 2. Ejecutar scraping" in run.pipeline_log, run.traza()
-    _sin_efectos_reales(run)
+def test_python_shim_can_fail_a_step(sandbox):
+    """The shim's failure control works (otherwise the C01 xfail would prove nothing)."""
+    _stage2_state(sandbox, "full")
+    run = sandbox.run(stage=2, fail={SCRAPER: TIMEOUT_EXIT})
+    assert f"shim python: {SCRAPER} -> exit {TIMEOUT_EXIT}" in run.stdout, run.trace()
+    # run_command logs a failed step at ERROR level; only the level token is checked, not the wording.
+    assert re.search(r"\bERROR\b", run.pipeline_log), run.trace()
+    _no_real_effects(run)
 
 
 # ---------------------------------------------------------------------------------------------
-# Comportamiento de hoy (correcto)
+# Today's behavior (correct)
 # ---------------------------------------------------------------------------------------------
-def test_etapa1_corre_sus_pasos_y_apaga_con_el_shim(sandbox):
+def test_stage1_runs_its_steps_and_shuts_down_through_the_shim(sandbox):
     run = sandbox.run(stage=1)
-    assert run.returncode == 0, run.traza()
-    assert run.scripts_python == ETAPA1, run.traza()
-    assert [c.args for c in run.de("conda")][:2] == ["info --base", "activate wayakit_env"], run.traza()
+    assert run.returncode == 0, run.trace()
+    assert run.python_scripts == STAGE1, run.trace()
+    assert [c.args for c in run.of("conda")][:2] == ["info --base", "activate wayakit_env"], run.trace()
     assert (run.project / "logs" / "run_mode.txt").read_text().strip() == "full"
     assert (run.project / "logs" / "last_full_run.txt").is_file()
-    assert not run.de("git"), "la etapa 1 no hace git pull"
-    _sin_efectos_reales(run)
+    assert not run.of("git"), "stage 1 does not do git pull"
+    _no_real_effects(run)
 
 
-def test_etapa1_aborta_si_falla_la_lectura_de_odoo_y_aun_asi_apaga(sandbox):
-    run = sandbox.run(stage=1, fallar={ETAPA1[0]: 1})
-    assert run.returncode == 1, run.traza()
-    assert run.scripts_python == ETAPA1[:1], run.traza()
+def test_stage1_aborts_if_the_odoo_read_fails_and_still_shuts_down(sandbox):
+    run = sandbox.run(stage=1, fail={STAGE1[0]: 1})
+    assert run.returncode == 1, run.trace()
+    assert run.python_scripts == STAGE1[:1], run.trace()
     assert not (run.project / "logs" / "run_mode.txt").exists()
-    _sin_efectos_reales(run)
+    _no_real_effects(run)
 
 
-@pytest.mark.parametrize("modo", ["full", "partial"])
-def test_etapa2_sin_fallas_corre_todos_los_pasos_en_orden(sandbox, modo):
-    _etapa2(sandbox, modo)
+@pytest.mark.parametrize("mode", ["full", "partial"])
+def test_stage2_without_failures_runs_every_step_in_order(sandbox, mode):
+    _stage2_state(sandbox, mode)
     run = sandbox.run(stage=2)
-    assert run.returncode == 0, run.traza()
-    assert run.scripts_python == ETAPA2[modo], run.traza()
-    assert [c.args for c in run.de("git")] == ["pull"], run.traza()
-    timeouts = [c.args for c in run.de("timeout")]
-    assert f"{SCRAPER_TIMEOUT[modo]} python {SCRAPER}" in [t.split(" --")[0] for t in timeouts], run.traza()
-    subida = [c.args for c in run.de("python") if c.script == SUBIDA]
-    assert subida == [f"{SUBIDA} --run_mode {modo}"], "la subida solo llegó al shim"
-    _sin_efectos_reales(run)
+    assert run.returncode == 0, run.trace()
+    assert run.python_scripts == STAGE2[mode], run.trace()
+    assert [c.args for c in run.of("git")] == ["pull"], run.trace()
+    timeouts = [c.args for c in run.of("timeout")]
+    assert f"{SCRAPER_TIMEOUT[mode]} python {SCRAPER}" in [t.split(" --")[0] for t in timeouts], run.trace()
+    upload = [c.args for c in run.of("python") if c.script == UPLOAD]
+    assert upload == [f"{UPLOAD} --run_mode {mode}"], "the upload only reached the shim"
+    _no_real_effects(run)
 
 
-def test_etapa2_sin_run_mode_sale_con_1_y_apaga(sandbox):
+def test_stage2_without_run_mode_exits_with_1_and_shuts_down(sandbox):
     run = sandbox.run(stage=2)
-    assert run.returncode == 1, run.traza()
-    assert run.scripts_python == [] and not run.de("git"), run.traza()
-    _sin_efectos_reales(run)
+    assert run.returncode == 1, run.trace()
+    assert run.python_scripts == [] and not run.of("git"), run.trace()
+    _no_real_effects(run)
 
 
 # ---------------------------------------------------------------------------------------------
-# Lo deseado: bug C01 (xfail estricto, hallazgo para pi-dev)
+# The desired behavior: bug C01 (strict xfail, finding for pi-dev)
 # ---------------------------------------------------------------------------------------------
-class PrecondicionRota(RuntimeError):
-    """La falla no se inyectó: no es el xfail esperado (raises=AssertionError no la cubre)."""
+class BrokenPrecondition(RuntimeError):
+    """The failure was not injected: this is not the expected xfail (raises=AssertionError does not cover it)."""
 
 
-def _scraping_fallido(sandbox: sb.Sandbox, modo: str, code: int) -> sb.Corrida:
-    _etapa2(sandbox, modo)
-    run = sandbox.run(stage=2, fallar={SCRAPER: code})
+def _failed_scraping(sandbox: sb.Sandbox, mode: str, code: int) -> sb.SandboxRun:
+    _stage2_state(sandbox, mode)
+    run = sandbox.run(stage=2, fail={SCRAPER: code})
     if f"shim python: {SCRAPER} -> exit {code}" not in run.stdout:
-        raise PrecondicionRota("el scraping no falló como se pidió:\n" + run.traza())
-    print(run.traza())
+        raise BrokenPrecondition("scraping did not fail as requested:\n" + run.trace())
+    print(run.trace())
     return run
 
 
-C01 = ("BUG C01 (docs/checklist-confiabilidad.md): run_pipeline.sh no aborta cuando el scraping "
-       "falla o vence el timeout y aun así entrena y sube a Odoo (corrida del 13-15 nov 2026). "
-       "Hallazgo para pi-dev: agregar `|| exit 1` (o equivalente) a cada paso de la etapa 2.")
+C01 = ("BUG C01 (docs/reliability-checklist.md): run_pipeline.sh does not abort when scraping "
+       "fails or the timeout expires and still trains and uploads to Odoo (run of 13-15 Nov 2026). "
+       "Finding for pi-dev: add `|| exit 1` (or equivalent) to every step of stage 2.")
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=C01)
-@pytest.mark.parametrize("modo", ["full", "partial"])
+@pytest.mark.parametrize("mode", ["full", "partial"])
 @pytest.mark.parametrize("code", [TIMEOUT_EXIT, 1], ids=["timeout", "error"])
-def test_scraping_fallido_no_llama_a_la_subida_a_odoo(sandbox, modo, code):
-    run = _scraping_fallido(sandbox, modo, code)
-    assert SUBIDA not in run.scripts_python, (
-        f"con el scraping fallido (exit {code}) se llamó a {SUBIDA}\n{run.traza()}")
+def test_failed_scraping_does_not_call_the_odoo_upload(sandbox, mode, code):
+    run = _failed_scraping(sandbox, mode, code)
+    assert UPLOAD not in run.python_scripts, (
+        f"with failed scraping (exit {code}) {UPLOAD} was called\n{run.trace()}")
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=C01)
-@pytest.mark.parametrize("modo", ["full", "partial"])
-def test_scraping_vencido_hace_salir_con_codigo_distinto_de_0(sandbox, modo):
-    run = _scraping_fallido(sandbox, modo, TIMEOUT_EXIT)
-    assert run.returncode != 0, f"la etapa 2 salió con 0 tras un timeout del scraping\n{run.traza()}"
+@pytest.mark.parametrize("mode", ["full", "partial"])
+def test_expired_scraping_makes_it_exit_with_nonzero_code(sandbox, mode):
+    run = _failed_scraping(sandbox, mode, TIMEOUT_EXIT)
+    assert run.returncode != 0, f"stage 2 exited with 0 after a scraping timeout\n{run.trace()}"

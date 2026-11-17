@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# Hook TaskCompleted (Agent Teams): una tarea solo se cierra si pasa la verificación rápida.
+# TaskCompleted hook (Agent Teams): a task only closes if it passes the quick verification.
 #
-# Qué hace:
-#   1. Lee el JSON de stdin sin suponer su forma (el esquema de TaskCompleted no está
-#      documentado). La primera vez guarda solo los NOMBRES de las llaves, nunca los
-#      valores, en .claude/state/hook_inputs.log para conocer el esquema.
-#   1b. Separación checks / código: compara el árbol de trabajo (incluidos archivos sin
-#      seguimiento) contra merge-base(PI_CHECKS_BASE, HEAD). Si en ese mismo diff cambian
-#      archivos de verificación (scripts/hooks/rutas_protegidas.txt) Y código de producción
-#      (scraper/, ml_model/, run_pipeline.sh), falla con exit 2: un cambio no puede modificar
-#      los checks que lo juzgan. Van en cambios separados. Si la versión base no existe, falla.
-#   2. Corre `scripts/verify.sh rapido`. Si el script no existe, falla (no deja pasar).
-#   3. Si falla, suma 1 al contador .claude/state/fallas_<tarea>.count (la tarea sale del id
-#      o del asunto si vienen en el JSON; si no, 'global') y sale con 2: la tarea sigue
-#      abierta y stderr llega al agente como retroalimentación.
-#      A partir de la tercera ronda fallida le pide detenerse y escalar a Mafer, y lo anota
-#      en .claude/state/escalaciones.log.
-#   4. Si pasa, borra el contador y sale con 0.
-#   El mensaje de falla incluye las pruebas que fallaron (líneas FAILED/ERROR de pytest), el resumen
-#   de verify.sh y `git status --short`: el árbol es compartido y la falla puede ser de otro compañero.
+# What it does:
+#   1. Reads the JSON from stdin without assuming its shape (the TaskCompleted schema is not
+#      documented). The first time it stores only the key NAMES, never the
+#      values, in .claude/state/hook_inputs.log to learn the schema.
+#   1b. Checks / code separation: compares the working tree (including untracked files)
+#      against merge-base(PI_CHECKS_BASE, HEAD). If that same diff changes
+#      verification files (scripts/hooks/protected_paths.txt) AND production code
+#      (scraper/, ml_model/, run_pipeline.sh), it fails with exit 2: a change cannot modify
+#      the checks that judge it. They go in separate changes. If the base version does not exist, it fails.
+#   2. Runs `scripts/verify.sh quick`. If the script does not exist, it fails (does not let it through).
+#   3. If it fails, adds 1 to the counter .claude/state/failures_<task>.count (the task comes from the id
+#      or the subject if they are in the JSON; otherwise 'global') and exits with 2: the task stays
+#      open and stderr reaches the agent as feedback.
+#      From the third failed round on it asks the agent to stop and escalate to Mafer, and logs it
+#      in .claude/state/escalations.log.
+#   4. If it passes, deletes the counter and exits with 0.
+#   The failure message includes the failed tests (pytest FAILED/ERROR lines), the verify.sh
+#   summary and `git status --short`: the tree is shared and the failure may belong to another teammate.
 #
 # Variables:
-#   PI_CHECKS_BASE         versión contra la que se mide "el cambio" en el paso 1b. Por defecto
-#                          PI_BASE_REF o origin/server-improvement. Mientras el setup de checks no
-#                          esté en la base, la líder puede apuntarla a un commit que ya lo tenga.
-#   PI_GATE_FORCE_FAIL=1   simula una falla sin correr las pruebas (para probar el hook).
-#   CLAUDE_PROJECT_DIR     raíz del repo (la pone Claude Code); si falta, se usa git.
+#   PI_CHECKS_BASE         version against which "the change" is measured in step 1b. Defaults to
+#                          PI_BASE_REF or origin/server-improvement. While the checks setup is not
+#                          in the base, the lead can point it to a commit that already has it.
+#   PI_GATE_FORCE_FAIL=1   simulates a failure without running the tests (to test the hook).
+#   CLAUDE_PROJECT_DIR     repo root (set by Claude Code); if missing, git is used.
 #
-# Prueba manual:
+# Manual test:
 #   echo '{"task_id":"7","task_subject":"x"}' | PI_GATE_FORCE_FAIL=1 scripts/hooks/gate_task_completed.sh; echo $?
 
 set -u
@@ -35,23 +35,23 @@ set -u
 ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 STATE="$ROOT/.claude/state"
 mkdir -p "$STATE"
-LIMITE=3
+LIMIT=3
 
 INPUT="$(cat || true)"
 
-# Lee el JSON con jq si existe; si no, con python3. Nunca falla: devuelve vacío.
+# Reads the JSON with jq if it exists; otherwise with python3. Never fails: returns empty.
 json_eval() {
-  local filtro_jq="$1" codigo_py="$2"
+  local jq_filter="$1" py_code="$2"
   if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$INPUT" | jq -r "$filtro_jq" 2>/dev/null || true
+    printf '%s' "$INPUT" | jq -r "$jq_filter" 2>/dev/null || true
   elif command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$INPUT" | python3 -c "$codigo_py" 2>/dev/null || true
+    printf '%s' "$INPUT" | python3 -c "$py_code" 2>/dev/null || true
   fi
 }
 
-# 1. Esquema: solo nombres de llaves, una vez.
+# 1. Schema: key names only, once.
 if ! grep -q 'TaskCompleted' "$STATE/hook_inputs.log" 2>/dev/null; then
-  LLAVES="$(json_eval \
+  KEYS="$(json_eval \
     '[paths(scalars) | map(tostring) | join(".")] | unique | join(", ")' \
     'import json,sys
 d=json.load(sys.stdin)
@@ -62,125 +62,125 @@ def p(o,pre=""):
         for i,v in enumerate(o): yield from p(v,pre+str(i)+".")
     else: yield pre[:-1]
 print(", ".join(sorted(set(p(d)))))')"
-  printf '%s TaskCompleted llaves: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${LLAVES:-<no se pudo leer el JSON>}" \
+  printf '%s TaskCompleted keys: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${KEYS:-<could not read the JSON>}" \
     >> "$STATE/hook_inputs.log"
 fi
 
-# Clave de la tarea: id o asunto si vienen; si no, 'global'. Solo [A-Za-z0-9_-], máx. 60.
-TAREA="$(json_eval \
+# Task key: id or subject if present; otherwise 'global'. Only [A-Za-z0-9_-], max. 60.
+TASK="$(json_eval \
   '[.task_id, .taskId, (.task|objects|.id), .task_subject, (.task|objects|.subject), .subject]
    | map(select(. != null and . != "")) | (.[0] // "") | tostring' \
   'import json,sys
 d=json.load(sys.stdin); t=d.get("task") if isinstance(d.get("task"),dict) else {}
 for v in (d.get("task_id"),d.get("taskId"),t.get("id"),d.get("task_subject"),t.get("subject"),d.get("subject")):
     if v not in (None,""): print(v); break')"
-TAREA="$(printf '%s' "$TAREA" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-60)"
-[ -n "$TAREA" ] || TAREA="global"
-CONTADOR="$STATE/fallas_${TAREA}.count"
+TASK="$(printf '%s' "$TASK" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-60)"
+[ -n "$TASK" ] || TASK="global"
+COUNTER="$STATE/failures_${TASK}.count"
 
-# Cuenta una ronda fallida; en la tercera pide escalar. No sale.
-contar_ronda() {
-  N=$(( $(cat "$CONTADOR" 2>/dev/null || echo 0) + 1 ))
-  echo "$N" > "$CONTADOR"
+# Counts a failed round; on the third one asks to escalate. Does not exit.
+count_round() {
+  N=$(( $(cat "$COUNTER" 2>/dev/null || echo 0) + 1 ))
+  echo "$N" > "$COUNTER"
 }
-escalar_si_toca() {
-  if [ "$N" -ge "$LIMITE" ]; then
-    echo "Tercera ronda fallida: detente y escala a Mafer con lo que intentaste." >&2
-    printf '%s tarea=%s rondas=%s motivo=%s\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "$TAREA" "$N" "$1" >> "$STATE/escalaciones.log"
+escalate_if_due() {
+  if [ "$N" -ge "$LIMIT" ]; then
+    echo "Third failed round: stop and escalate to Mafer with what you tried." >&2
+    printf '%s task=%s rounds=%s reason=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$TASK" "$N" "$1" >> "$STATE/escalations.log"
   fi
 }
-estado_arbol() {
-  echo "Estado del árbol compartido (git status --short):"
+tree_status() {
+  echo "State of the shared tree (git status --short):"
   git -C "$ROOT" status --short 2>/dev/null | head -n 40
-  echo "Ojo: el árbol es compartido. Si la falla está en archivos que no son de tu tarea, puede ser"
-  echo "trabajo a medias de otro compañero: no lo toques; avisa y cierra la tarea en un punto de"
-  echo "sincronía (cuando pi-dev avise \"árbol estable\")."
+  echo "Note: the tree is shared. If the failure is in files that are not part of your task, it may be"
+  echo "another teammate's work in progress: do not touch it; report it and close the task at a sync"
+  echo "point (when pi-dev announces \"stable tree\")."
 }
 
-# 1b. Checks y código de producción no van en el mismo cambio.
+# 1b. Checks and production code do not go in the same change.
 CHECKS_BASE="${PI_CHECKS_BASE:-${PI_BASE_REF:-origin/server-improvement}}"
 if ! BASE_SHA="$(git -C "$ROOT" rev-parse --verify --quiet "${CHECKS_BASE}^{commit}")"; then
-  contar_ronda
+  count_round
   {
-    echo "No existe la versión base '$CHECKS_BASE' para revisar la separación entre checks y código."
-    echo "Correr 'git fetch origin' o pedir a la líder que defina PI_CHECKS_BASE. La tarea sigue abierta (ronda $N)."
+    echo "Base version '$CHECKS_BASE' does not exist, so the separation between checks and code cannot be checked."
+    echo "Run 'git fetch origin' or ask the lead to set PI_CHECKS_BASE. The task stays open (round $N)."
   } >&2
-  escalar_si_toca "sin_base"
+  escalate_if_due "no_base"
   exit 2
 fi
 MB="$(git -C "$ROOT" merge-base "$BASE_SHA" HEAD 2>/dev/null || echo "$BASE_SHA")"
-CAMBIADOS="$( { git -C "$ROOT" diff --name-only "$MB" -- 2>/dev/null; git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null; } | sort -u)"
-LISTA_PROT="$ROOT/scripts/hooks/rutas_protegidas.txt"
-PROT_PATRONES="$( { grep -Ev '^[[:space:]]*(#|$)' "$LISTA_PROT" 2>/dev/null; echo 'scripts/hooks/rutas_protegidas.txt'; } | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-[ -f "$LISTA_PROT" ] || PROT_PATRONES="$(printf '%s\n' REVIEW.md pytest.ini docs/checklist-confiabilidad.md \
+CHANGED="$( { git -C "$ROOT" diff --name-only "$MB" -- 2>/dev/null; git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null; } | sort -u)"
+PROT_LIST="$ROOT/scripts/hooks/protected_paths.txt"
+PROT_PATTERNS="$( { grep -Ev '^[[:space:]]*(#|$)' "$PROT_LIST" 2>/dev/null; echo 'scripts/hooks/protected_paths.txt'; } | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+[ -f "$PROT_LIST" ] || PROT_PATTERNS="$(printf '%s\n' REVIEW.md pytest.ini docs/reliability-checklist.md \
   .claude/settings.json '.claude/agents/**' '.claude/skills/**' 'scripts/**' \
   tests/conftest.py tests/e2e/_helpers.py tests/e2e/_pipeline_sandbox.py tests/differential/_harness.py)"
-CHECKS_TOCADOS=""
-PROD_TOCADO=""
+CHECKS_TOUCHED=""
+PROD_TOUCHED=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  case "$f" in scraper/*|ml_model/*|run_pipeline.sh) PROD_TOCADO="${PROD_TOCADO}  $f\n"; continue ;; esac
+  case "$f" in scraper/*|ml_model/*|run_pipeline.sh) PROD_TOUCHED="${PROD_TOUCHED}  $f\n"; continue ;; esac
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     case "$p" in
-      */\*\*) [ "${f#"${p%/\*\*}"/}" != "$f" ] && { CHECKS_TOCADOS="${CHECKS_TOCADOS}  $f\n"; break; } ;;
-      *) [ "$f" = "$p" ] && { CHECKS_TOCADOS="${CHECKS_TOCADOS}  $f\n"; break; } ;;
+      */\*\*) [ "${f#"${p%/\*\*}"/}" != "$f" ] && { CHECKS_TOUCHED="${CHECKS_TOUCHED}  $f\n"; break; } ;;
+      *) [ "$f" = "$p" ] && { CHECKS_TOUCHED="${CHECKS_TOUCHED}  $f\n"; break; } ;;
     esac
-  done <<< "$PROT_PATRONES"
-done <<< "$CAMBIADOS"
-if [ -n "$CHECKS_TOCADOS" ] && [ -n "$PROD_TOCADO" ]; then
-  contar_ronda
+  done <<< "$PROT_PATTERNS"
+done <<< "$CHANGED"
+if [ -n "$CHECKS_TOUCHED" ] && [ -n "$PROD_TOUCHED" ]; then
+  count_round
   {
-    echo "Gate: este cambio toca a la vez archivos de verificación y código de producción (base: $CHECKS_BASE @ ${MB:0:7})."
-    echo "Un cambio no puede modificar los checks que lo juzgan. Sepáralos: primero los checks, en un"
-    echo "cambio aparte que hace la líder con PI_EDITAR_CHECKS=1; luego el código. La tarea sigue abierta (ronda $N)."
-    echo "Checks modificados:"; printf '%b' "$CHECKS_TOCADOS" | head -n 20
-    echo "Código de producción modificado:"; printf '%b' "$PROD_TOCADO" | head -n 20
-    estado_arbol
+    echo "Gate: this change touches both verification files and production code (base: $CHECKS_BASE @ ${MB:0:7})."
+    echo "A change cannot modify the checks that judge it. Split them: first the checks, in a"
+    echo "separate change made by the lead with PI_EDIT_CHECKS=1; then the code. The task stays open (round $N)."
+    echo "Modified checks:"; printf '%b' "$CHECKS_TOUCHED" | head -n 20
+    echo "Modified production code:"; printf '%b' "$PROD_TOUCHED" | head -n 20
+    tree_status
   } >&2
-  escalar_si_toca "checks_y_codigo"
+  escalate_if_due "checks_and_code"
   exit 2
 fi
 
-# 2. Verificación rápida.
-SALIDA="$STATE/ultima_verificacion_${TAREA}.txt"
+# 2. Quick verification.
+OUTPUT="$STATE/last_verification_${TASK}.txt"
 if [ "${PI_GATE_FORCE_FAIL:-0}" = "1" ]; then
-  echo "Falla simulada (PI_GATE_FORCE_FAIL=1)." > "$SALIDA"
+  echo "Simulated failure (PI_GATE_FORCE_FAIL=1)." > "$OUTPUT"
   RC=1
 elif [ ! -f "$ROOT/scripts/verify.sh" ]; then
-  # Antes dejaba pasar; ahora borrar verify.sh no puede abrir el gate.
-  echo "No existe scripts/verify.sh: no se puede verificar y la tarea no se cierra." > "$SALIDA"
+  # It used to let it through; now deleting verify.sh cannot open the gate.
+  echo "scripts/verify.sh does not exist: it cannot be verified and the task does not close." > "$OUTPUT"
   RC=2
 else
-  (cd "$ROOT" && bash scripts/verify.sh rapido) > "$SALIDA" 2>&1
+  (cd "$ROOT" && bash scripts/verify.sh quick) > "$OUTPUT" 2>&1
   RC=$?
 fi
 
-# 4. Éxito: se reinicia el contador.
+# 4. Success: the counter is reset.
 if [ "$RC" -eq 0 ]; then
-  rm -f "$CONTADOR"
+  rm -f "$COUNTER"
   exit 0
 fi
 
-# 3. Falla: se cuenta la ronda.
-contar_ronda
+# 3. Failure: the round is counted.
+count_round
 
 {
-  echo "La verificación rápida (scripts/verify.sh rapido) falló: ronda $N (límite: $LIMITE) para la tarea '$TAREA'."
-  echo "La tarea sigue abierta."
-  FALLIDAS="$(grep -E '^(FAILED|ERROR) ' "$SALIDA" 2>/dev/null | head -n 20)"
-  if [ -n "$FALLIDAS" ]; then
-    echo "Pruebas que fallaron:"
-    printf '%s\n' "$FALLIDAS" | sed 's/^/  /'
+  echo "The quick verification (scripts/verify.sh quick) failed: round $N (limit: $LIMIT) for task '$TASK'."
+  echo "The task stays open."
+  FAILED_TESTS="$(grep -E '^(FAILED|ERROR) ' "$OUTPUT" 2>/dev/null | head -n 20)"
+  if [ -n "$FAILED_TESTS" ]; then
+    echo "Failed tests:"
+    printf '%s\n' "$FAILED_TESTS" | sed 's/^/  /'
   fi
-  echo "Resumen de verify.sh:"
-  sed -n '/===== Resumen/,$p' "$SALIDA" | head -n 15
-  [ "$RC" -eq 2 ] && { echo "Error de entorno o de uso (exit 2):"; tail -n 5 "$SALIDA"; }
-  estado_arbol
-  echo "Salida completa: .claude/state/$(basename "$SALIDA")"
-  echo "No se arregla con sleeps, reintentos ni skips: busca la causa raíz."
+  echo "verify.sh summary:"
+  sed -n '/===== Summary/,$p' "$OUTPUT" | head -n 15
+  [ "$RC" -eq 2 ] && { echo "Environment or usage error (exit 2):"; tail -n 5 "$OUTPUT"; }
+  tree_status
+  echo "Full output: .claude/state/$(basename "$OUTPUT")"
+  echo "It is not fixed with sleeps, retries or skips: find the root cause."
 } >&2
 
-escalar_si_toca "verify_rapido salida=.claude/state/$(basename "$SALIDA")"
+escalate_if_due "verify_quick output=.claude/state/$(basename "$OUTPUT")"
 exit 2

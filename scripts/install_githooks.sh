@@ -1,51 +1,51 @@
 #!/usr/bin/env bash
-# Instala los hooks de git versionados de PI: deja "git config core.hooksPath scripts/githooks" en
-# el .git/config de ESTE clon (no es global ni toca otros repos).
+# Installs PI's versioned git hooks: sets "git config core.hooksPath scripts/githooks" in
+# the .git/config of THIS clone (not global, does not touch other repos).
 #
-# Qué queda configurado:
-#   - scripts/githooks/commit-msg: todo commit lleva el sello "Verificado: <modo> (<detalle>)" y, si dice
-#     rapido o completo, tiene que coincidir con una corrida OK de scripts/verify.sh para el mismo índice.
-#   - Con core.hooksPath, git deja de leer .git/hooks/: si ahí había hooks propios (no *.sample), se avisa.
+# What it leaves configured:
+#   - scripts/githooks/commit-msg: every commit carries the stamp "Verified: <mode> (<detail>)" and, if it says
+#     quick or full, it must match an OK run of scripts/verify.sh for the same index.
+#   - With core.hooksPath, git stops reading .git/hooks/: if there were custom hooks there (not *.sample), it warns.
 #
-# Uso (desde cualquier carpeta del repo; se puede correr más de una vez):
-#   scripts/install_githooks.sh             # instala
-#   scripts/install_githooks.sh --dry-run   # muestra qué haría, sin cambiar nada
-#   scripts/install_githooks.sh --estado    # muestra la configuración actual
-# Para desinstalar: git config --unset core.hooksPath (lo hace la líder, a mano).
+# Usage (from any folder in the repo; can be run more than once):
+#   scripts/install_githooks.sh             # installs
+#   scripts/install_githooks.sh --dry-run   # shows what it would do, without changing anything
+#   scripts/install_githooks.sh --status    # shows the current configuration
+# To uninstall: git config --unset core.hooksPath (done by the lead, by hand).
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
-DESEADO="scripts/githooks"
-ACCION="${1:-instalar}"
-ACTUAL="$(git config --local --get core.hooksPath || true)"
+DESIRED="scripts/githooks"
+ACTION="${1:-install}"
+CURRENT="$(git config --local --get core.hooksPath || true)"
 
-case "$ACCION" in
-  --estado)
-    echo "core.hooksPath (local): ${ACTUAL:-<sin definir: git usa .git/hooks>}"
-    [ "$ACTUAL" = "$DESEADO" ] && echo "Instalado." || echo "No instalado: correr scripts/install_githooks.sh"
+case "$ACTION" in
+  --status)
+    echo "core.hooksPath (local): ${CURRENT:-<unset: git uses .git/hooks>}"
+    [ "$CURRENT" = "$DESIRED" ] && echo "Installed." || echo "Not installed: run scripts/install_githooks.sh"
     exit 0 ;;
-  --dry-run|instalar) ;;
-  *) echo "Uso: scripts/install_githooks.sh [--dry-run|--estado]" >&2; exit 2 ;;
+  --dry-run|install) ;;
+  *) echo "Usage: scripts/install_githooks.sh [--dry-run|--status]" >&2; exit 2 ;;
 esac
 
-[ -f "$DESEADO/commit-msg" ] || { echo "ERROR: falta $DESEADO/commit-msg." >&2; exit 1; }
+[ -f "$DESIRED/commit-msg" ] || { echo "ERROR: $DESIRED/commit-msg is missing." >&2; exit 1; }
 
-PROPIOS="$(find "$(git rev-parse --git-dir)/hooks" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null || true)"
-if [ -n "$PROPIOS" ]; then
-  echo "AVISO: con core.hooksPath git deja de usar estos hooks de .git/hooks/:"
-  printf '  %s\n' $PROPIOS
+CUSTOM="$(find "$(git rev-parse --git-dir)/hooks" -maxdepth 1 -type f ! -name '*.sample' 2>/dev/null || true)"
+if [ -n "$CUSTOM" ]; then
+  echo "WARNING: with core.hooksPath git stops using these hooks in .git/hooks/:"
+  printf '  %s\n' $CUSTOM
 fi
-if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$DESEADO" ]; then
-  echo "AVISO: core.hooksPath ya valía '$ACTUAL'; se cambia a '$DESEADO'."
+if [ -n "$CURRENT" ] && [ "$CURRENT" != "$DESIRED" ]; then
+  echo "WARNING: core.hooksPath was already '$CURRENT'; changing it to '$DESIRED'."
 fi
 
-if [ "$ACCION" = "--dry-run" ]; then
-  echo "[dry-run] chmod +x $DESEADO/*"
-  echo "[dry-run] git config --local core.hooksPath $DESEADO"
+if [ "$ACTION" = "--dry-run" ]; then
+  echo "[dry-run] chmod +x $DESIRED/*"
+  echo "[dry-run] git config --local core.hooksPath $DESIRED"
   exit 0
 fi
 
-chmod +x "$DESEADO"/*
-git config --local core.hooksPath "$DESEADO"
-echo "Listo: core.hooksPath = $(git config --local --get core.hooksPath)"
-echo "Desde ahora cada commit necesita su trailer \"Verificado:\" (ver scripts/githooks/commit-msg)."
+chmod +x "$DESIRED"/*
+git config --local core.hooksPath "$DESIRED"
+echo "Done: core.hooksPath = $(git config --local --get core.hooksPath)"
+echo "From now on every commit needs its \"Verified:\" trailer (see scripts/githooks/commit-msg)."

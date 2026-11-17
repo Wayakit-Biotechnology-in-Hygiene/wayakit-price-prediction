@@ -1,64 +1,64 @@
 #!/usr/bin/env bash
-# Verificación de Price Intelligence (PI). Sin red: no llama a AWS, Odoo, Apify ni Bedrock.
+# Price Intelligence (PI) verification. No network: does not call AWS, Odoo, Apify or Bedrock.
 #
-# Uso (siempre DESPUÉS de "git add": el registro vale para lo que está en el índice):
-#   scripts/verify.sh            # igual que "rapido"
-#   scripts/verify.sh rapido     # pruebas unitarias y de propiedades (Hypothesis)
-#   scripts/verify.sh completo   # rapido + E2E + diferenciales (base contra versión nueva)
+# Usage (always AFTER "git add": the record applies to what is in the index):
+#   scripts/verify.sh            # same as "quick"
+#   scripts/verify.sh quick      # unit and property tests (Hypothesis)
+#   scripts/verify.sh full       # quick + E2E + differential (base vs. new version)
 #
 # Variables:
-#   PI_PYTHON    intérprete a usar. Si no se define, se busca el env conda "wayakit-price-prediction";
-#                si no aparece, sale con 2 (nunca cae en otro python sin avisar).
-#   PI_BASE_REF  versión base para las pruebas diferenciales. Por defecto origin/server-improvement
-#                (lo que corre en producción).
+#   PI_PYTHON    interpreter to use. If unset, the conda env "wayakit-price-prediction" is searched for;
+#                if not found, exits with 2 (never falls back to another python silently).
+#   PI_BASE_REF  base version for the differential tests. Defaults to origin/server-improvement
+#                (what runs in production).
 #
-# Códigos de salida: 0 OK; 1 alguna prueba falló, no se recolectó ninguna o, en "completo", se saltó
-# alguna E2E o diferencial; 2 error de uso o de entorno (sin intérprete, sin versión base).
+# Exit codes: 0 OK; 1 a test failed, none were collected or, in "full", an E2E or differential test
+# was skipped; 2 usage or environment error (no interpreter, no base version).
 #
-# "completo" exige que corran las E2E y las diferenciales: si falta data/f1_antes_2026-11-15/ o pytest
-# reporta "skipped" en ese bloque, el resultado es FALLA. En ese caso el sello honesto es
-#   Verificado: rapido (e2e y diferenciales no corrieron: <motivo>)
+# "full" requires the E2E and differential tests to run: if data/f1_before_2026-11-15/ is missing or pytest
+# reports "skipped" in that block, the result is FAIL. In that case the honest stamp is
+#   Verified: quick (e2e and differential did not run: <reason>)
 #
-# Registro para el hook commit-msg (scripts/githooks/commit-msg): al terminar escribe
-# .claude/state/ultima_verificacion.json con {modo, resultado, tree, fecha, head, indice_igual_arbol, resumen}
-# y agrega la misma línea a .claude/state/verificaciones.jsonl (historial).
-#   tree                = "git write-tree" del índice cuando corrió verify (lo que se va a commitear).
-#   indice_igual_arbol  = false si había cambios sin "git add" o archivos sin seguimiento: entonces lo
-#                         probado (el árbol de trabajo) no es lo que se commitea y el hook no acepta el sello.
-# El hook solo acepta "Verificado: rapido|completo (...)" si hay un registro OK con el mismo tree.
+# Record for the commit-msg hook (scripts/githooks/commit-msg): at the end it writes
+# .claude/state/last_verification.json with {mode, result, tree, date, head, index_matches_tree, summary}
+# and appends the same line to .claude/state/verifications.jsonl (history).
+#   tree                = "git write-tree" of the index when verify ran (what is about to be committed).
+#   index_matches_tree  = false if there were changes without "git add" or untracked files: then what was
+#                         tested (the working tree) is not what gets committed and the hook does not accept the stamp.
+# The hook only accepts "Verified: quick|full (...)" if there is an OK record with the same tree.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO_ROOT="$(pwd)"
 
-MODO="${1:-rapido}"
-case "$MODO" in
-  rapido|completo) ;;
-  *) echo "Uso: scripts/verify.sh [rapido|completo]" >&2; exit 2 ;;
+MODE="${1:-quick}"
+case "$MODE" in
+  quick|full) ;;
+  *) echo "Usage: scripts/verify.sh [quick|full]" >&2; exit 2 ;;
 esac
 
-# Python: PI_PYTHON si se define; si no, el env conda "wayakit-price-prediction" en rutas conocidas
-# (los hooks corren sin shell interactivo, así que conda puede no estar en el PATH). Nunca otro.
-ENV_NOMBRE="wayakit-price-prediction"
+# Python: PI_PYTHON if set; otherwise the conda env "wayakit-price-prediction" in known paths
+# (hooks run without an interactive shell, so conda may not be on the PATH). Never another one.
+ENV_NAME="wayakit-price-prediction"
 PY="${PI_PYTHON:-}"
 if [[ -n "$PY" ]]; then
   if ! command -v "$PY" >/dev/null 2>&1; then
-    echo "ERROR: PI_PYTHON='$PY' no existe o no es ejecutable." >&2
+    echo "ERROR: PI_PYTHON='$PY' does not exist or is not executable." >&2
     exit 2
   fi
 else
   for base in "${CONDA_PREFIX:+${CONDA_PREFIX%/envs/*}}" "${CONDA_EXE:+$(dirname "$(dirname "$CONDA_EXE")")}" \
               "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "$HOME/mambaforge" \
               "/opt/miniconda3" "/opt/anaconda3" "/opt/homebrew/Caskroom/miniconda/base"; do
-    if [[ -n "$base" && -x "$base/envs/$ENV_NOMBRE/bin/python" ]]; then
-      PY="$base/envs/$ENV_NOMBRE/bin/python"; break
+    if [[ -n "$base" && -x "$base/envs/$ENV_NAME/bin/python" ]]; then
+      PY="$base/envs/$ENV_NAME/bin/python"; break
     fi
   done
   if [[ -z "$PY" ]]; then
     {
-      echo "ERROR: no encontré el env conda '$ENV_NOMBRE' (buscado en miniconda3, anaconda3, miniforge3, mambaforge y /opt)."
-      echo "Créalo con 'conda env create -f environment.yml' o define PI_PYTHON=/ruta/al/python."
-      echo "No se usa otro python: la comparación diferencial puede cambiar con otras versiones."
+      echo "ERROR: conda env '$ENV_NAME' not found (searched miniconda3, anaconda3, miniforge3, mambaforge and /opt)."
+      echo "Create it with 'conda env create -f environment.yml' or set PI_PYTHON=/path/to/python."
+      echo "No other python is used: the differential comparison can change with other versions."
     } >&2
     exit 2
   fi
@@ -67,7 +67,7 @@ fi
 export PI_BASE_REF="${PI_BASE_REF:-origin/server-improvement}"
 export PYTHONDONTWRITEBYTECODE=1
 
-# Candado: las pruebas no deben alcanzar AWS aunque alguien llame a boto3 por error.
+# Lock: tests must not reach AWS even if someone calls boto3 by mistake.
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true
 
@@ -77,145 +77,145 @@ trap 'rm -rf "$TMP_OUT"' EXIT
 STATE="$REPO_ROOT/.claude/state"
 mkdir -p "$STATE"
 
-# Árbol del índice al empezar (lo que se commitearía). Si cambia durante la corrida, no se registra OK.
-TREE_INICIO="$(git write-tree 2>/dev/null || echo '')"
+# Index tree at start (what would be committed). If it changes during the run, OK is not recorded.
+TREE_START="$(git write-tree 2>/dev/null || echo '')"
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo '')"
 if git diff --quiet 2>/dev/null && [[ -z "$(git ls-files --others --exclude-standard 2>/dev/null | head -n 1)" ]]; then
-  INDICE_IGUAL_ARBOL=true
+  INDEX_MATCHES_TREE=true
 else
-  INDICE_IGUAL_ARBOL=false
+  INDEX_MATCHES_TREE=false
 fi
 
-RESUMEN=()
-FALLO=0
-MOTIVO_SALTO=""
+SUMMARY=()
+FAILED=0
+SKIP_REASON=""
 
-correr_bloque() {
-  # $1 = nombre del bloque, $2 = expresión de marcadores de pytest, $3 = "sin_saltos" para exigir 0 skipped
-  local nombre="$1" marcadores="$2" exigir="${3:-}" salida="$TMP_OUT/$1.txt" rc=0
-  echo "== $nombre: pytest -m \"$marcadores\" =="
-  # -rfEs: el resumen corto lista FAILED, ERROR y SKIPPED con su nombre (lo lee el gate).
-  "$PY" -m pytest -m "$marcadores" -q -rfEs 2>&1 | tee "$salida" || rc=$?
-  cp "$salida" "$STATE/ultima_verificacion_${nombre}.txt" 2>/dev/null || true
-  local linea
-  linea="$(grep -E '(passed|failed|error|skipped|no tests ran)' "$salida" | tail -n 1 | sed -E 's/=+//g; s/^ +| +$//g' || true)"
+run_block() {
+  # $1 = block name, $2 = pytest marker expression, $3 = "no_skips" to require 0 skipped
+  local name="$1" markers="$2" require="${3:-}" output="$TMP_OUT/$1.txt" rc=0
+  echo "== $name: pytest -m \"$markers\" =="
+  # -rfEs: the short summary lists FAILED, ERROR and SKIPPED with their names (the gate reads it).
+  "$PY" -m pytest -m "$markers" -q -rfEs 2>&1 | tee "$output" || rc=$?
+  cp "$output" "$STATE/last_verification_${name}.txt" 2>/dev/null || true
+  local line
+  line="$(grep -E '(passed|failed|error|skipped|no tests ran)' "$output" | tail -n 1 | sed -E 's/=+//g; s/^ +| +$//g' || true)"
   if [[ "$rc" -eq 5 ]]; then
-    RESUMEN+=("$nombre: FALLA (no se recolectó ninguna prueba)")
-    FALLO=1
+    SUMMARY+=("$name: FAIL (no tests were collected)")
+    FAILED=1
   elif [[ "$rc" -ne 0 ]]; then
-    RESUMEN+=("$nombre: FALLA (${linea:-código $rc})")
-    FALLO=1
-  elif [[ "$exigir" == "sin_saltos" ]] && grep -Eq '[0-9]+ skipped' <<<"$linea"; then
-    RESUMEN+=("$nombre: FALLA (se saltaron pruebas: $linea)")
-    MOTIVO_SALTO="${MOTIVO_SALTO:-pytest reportó pruebas saltadas en $nombre}"
-    FALLO=1
+    SUMMARY+=("$name: FAIL (${line:-exit code $rc})")
+    FAILED=1
+  elif [[ "$require" == "no_skips" ]] && grep -Eq '[0-9]+ skipped' <<<"$line"; then
+    SUMMARY+=("$name: FAIL (tests were skipped: $line)")
+    SKIP_REASON="${SKIP_REASON:-pytest reported skipped tests in $name}"
+    FAILED=1
   else
-    RESUMEN+=("$nombre: OK (${linea:-sin resumen})")
+    SUMMARY+=("$name: OK (${line:-no summary})")
   fi
 }
 
-registrar() {
-  # $1 = resultado (OK | FALLA), $2 = modo a registrar (por defecto $MODO), $3.. = líneas de resumen
-  # (por defecto todo RESUMEN). Escribe el JSON de forma atómica; nunca guarda salidas de pruebas.
-  local resultado="$1" modo_reg="${2:-$MODO}" tree_fin tmp
+record() {
+  # $1 = result (OK | FAIL), $2 = mode to record (defaults to $MODE), $3.. = summary lines
+  # (defaults to all of SUMMARY). Writes the JSON atomically; never stores test output.
+  local result="$1" rec_mode="${2:-$MODE}" tree_end tmp
   shift; [[ $# -gt 0 ]] && shift
-  local lineas
-  if [[ $# -gt 0 ]]; then lineas="$(printf '%s\n' "$@")"; else lineas="$(printf '%s\n' "${RESUMEN[@]}")"; fi
-  tree_fin="$(git write-tree 2>/dev/null || echo '')"
-  if [[ "$resultado" == "OK" && "$tree_fin" != "$TREE_INICIO" ]]; then
-    echo "AVISO: el índice cambió durante la verificación (otro 'git add'); se registra como FALLA." >&2
-    resultado="FALLA"
-    lineas="${lineas}"$'\n'"índice: cambió durante la corrida"
+  local lines
+  if [[ $# -gt 0 ]]; then lines="$(printf '%s\n' "$@")"; else lines="$(printf '%s\n' "${SUMMARY[@]}")"; fi
+  tree_end="$(git write-tree 2>/dev/null || echo '')"
+  if [[ "$result" == "OK" && "$tree_end" != "$TREE_START" ]]; then
+    echo "WARNING: the index changed during verification (another 'git add'); recorded as FAIL." >&2
+    result="FAIL"
+    lines="${lines}"$'\n'"index: changed during the run"
   fi
-  tmp="$(mktemp "$STATE/.ultima_verificacion.XXXXXX")"
-  PI_R_MODO="$modo_reg" PI_R_RES="$resultado" PI_R_TREE="$TREE_INICIO" PI_R_HEAD="$HEAD_SHA" \
-  PI_R_LIMPIO="$INDICE_IGUAL_ARBOL" PI_R_RESUMEN="$lineas" \
+  tmp="$(mktemp "$STATE/.last_verification.XXXXXX")"
+  PI_R_MODE="$rec_mode" PI_R_RES="$result" PI_R_TREE="$TREE_START" PI_R_HEAD="$HEAD_SHA" \
+  PI_R_CLEAN="$INDEX_MATCHES_TREE" PI_R_SUMMARY="$lines" \
     "$PY" -c '
 import json, os, sys, time
 e = os.environ
 json.dump({
-    "modo": e["PI_R_MODO"],
-    "resultado": e["PI_R_RES"],
+    "mode": e["PI_R_MODE"],
+    "result": e["PI_R_RES"],
     "tree": e["PI_R_TREE"],
-    "fecha": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     "head": e["PI_R_HEAD"],
-    "indice_igual_arbol": e["PI_R_LIMPIO"] == "true",
-    "resumen": [l for l in e["PI_R_RESUMEN"].splitlines() if l],
+    "index_matches_tree": e["PI_R_CLEAN"] == "true",
+    "summary": [l for l in e["PI_R_SUMMARY"].splitlines() if l],
 }, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 ' "$tmp"
-  mv -f "$tmp" "$STATE/ultima_verificacion.json"
-  # Historial (una línea por corrida): el gate corre "rapido" a menudo y no debe borrar el registro
-  # de un "completo" del mismo índice.
+  mv -f "$tmp" "$STATE/last_verification.json"
+  # History (one line per run): the gate runs "quick" often and must not erase the record
+  # of a "full" run for the same index.
   "$PY" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), ensure_ascii=False))' \
-    "$STATE/ultima_verificacion.json" >> "$STATE/verificaciones.jsonl"
-  # Rotación: se conservan las últimas 500 corridas para que el historial no crezca sin límite.
-  if [ "$(wc -l < "$STATE/verificaciones.jsonl")" -gt 500 ]; then
-    tail -n 500 "$STATE/verificaciones.jsonl" > "$STATE/verificaciones.jsonl.tmp" \
-      && mv -f "$STATE/verificaciones.jsonl.tmp" "$STATE/verificaciones.jsonl"
+    "$STATE/last_verification.json" >> "$STATE/verifications.jsonl"
+  # Rotation: the last 500 runs are kept so the history does not grow without limit.
+  if [ "$(wc -l < "$STATE/verifications.jsonl")" -gt 500 ]; then
+    tail -n 500 "$STATE/verifications.jsonl" > "$STATE/verifications.jsonl.tmp" \
+      && mv -f "$STATE/verifications.jsonl.tmp" "$STATE/verifications.jsonl"
   fi
 }
 
-echo "PI verify — modo: $MODO"
+echo "PI verify — mode: $MODE"
 echo "Python: $PY ($("$PY" --version 2>&1))"
 echo "Repo: $REPO_ROOT ($(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') @ $(git rev-parse --short HEAD 2>/dev/null || echo '?'))"
-echo "Índice: tree ${TREE_INICIO:0:12}"
-if [[ "$INDICE_IGUAL_ARBOL" != "true" ]]; then
-  echo "AVISO: hay cambios sin 'git add' o archivos sin seguimiento. Las pruebas corren sobre el árbol de"
-  echo "       trabajo, pero el registro es del índice: el hook commit-msg no aceptará este resultado como"
-  echo "       sello rapido/completo. Haz 'git add' de todo lo que va en el commit y vuelve a correr."
+echo "Index: tree ${TREE_START:0:12}"
+if [[ "$INDEX_MATCHES_TREE" != "true" ]]; then
+  echo "WARNING: there are changes without 'git add' or untracked files. The tests run on the working"
+  echo "         tree, but the record is for the index: the commit-msg hook will not accept this result as"
+  echo "         a quick/full stamp. 'git add' everything that goes in the commit and run again."
 fi
 
-if [[ "$MODO" == "completo" ]]; then
+if [[ "$MODE" == "full" ]]; then
   if ! BASE_SHA="$(git rev-parse --verify --quiet "${PI_BASE_REF}^{commit}")"; then
-    echo "ERROR: no existe la versión base '$PI_BASE_REF'. Correr 'git fetch origin' o definir PI_BASE_REF." >&2
+    echo "ERROR: base version '$PI_BASE_REF' does not exist. Run 'git fetch origin' or set PI_BASE_REF." >&2
     exit 2
   fi
   echo "Base: $PI_BASE_REF @ ${BASE_SHA:0:7}"
-  if [[ ! -d data/f1_antes_2026-11-15 ]]; then
-    MOTIVO_SALTO="falta data/f1_antes_2026-11-15/"
-    echo "AVISO: $MOTIVO_SALTO; las E2E y diferenciales no pueden correr y el modo completo saldrá en FALLA."
+  if [[ ! -d data/f1_before_2026-11-15 ]]; then
+    SKIP_REASON="data/f1_before_2026-11-15/ is missing"
+    echo "WARNING: $SKIP_REASON; the E2E and differential tests cannot run and full mode will end in FAIL."
   fi
 fi
 echo
 
-correr_bloque rapido "unit or property"
-if [[ "$MODO" == "completo" ]]; then
+run_block quick "unit or property"
+if [[ "$MODE" == "full" ]]; then
   echo
-  # "and not unit": las autopruebas del arnés diferencial (unit + differential) ya corrieron en rapido.
-  correr_bloque e2e-diferencial "(e2e or differential) and not unit" sin_saltos
-  if [[ -n "$MOTIVO_SALTO" && "$FALLO" -eq 0 ]]; then
-    RESUMEN+=("e2e-diferencial: FALLA ($MOTIVO_SALTO)")
-    FALLO=1
+  # "and not unit": the differential harness self-tests (unit + differential) already ran in quick.
+  run_block e2e-differential "(e2e or differential) and not unit" no_skips
+  if [[ -n "$SKIP_REASON" && "$FAILED" -eq 0 ]]; then
+    SUMMARY+=("e2e-differential: FAIL ($SKIP_REASON)")
+    FAILED=1
   fi
 fi
 
 echo
-echo "===== Resumen ($MODO) ====="
-for l in "${RESUMEN[@]}"; do echo "  $l"; done
-if [[ "$FALLO" -ne 0 ]]; then
-  # En "completo", si el bloque rapido pasó, ese resultado también es cierto: se registra aparte
-  # como "rapido" (antes que el completo, que queda como última verificación).
-  RAPIDO_OK=false
-  if [[ "$MODO" == "completo" && "${RESUMEN[0]}" == "rapido: OK"* ]]; then
-    registrar OK rapido "${RESUMEN[0]}"
-    RAPIDO_OK=true
+echo "===== Summary ($MODE) ====="
+for l in "${SUMMARY[@]}"; do echo "  $l"; done
+if [[ "$FAILED" -ne 0 ]]; then
+  # In "full", if the quick block passed, that result is also true: it is recorded separately
+  # as "quick" (before the full one, which stays as the last verification).
+  QUICK_OK=false
+  if [[ "$MODE" == "full" && "${SUMMARY[0]}" == "quick: OK"* ]]; then
+    record OK quick "${SUMMARY[0]}"
+    QUICK_OK=true
   fi
-  registrar FALLA
-  echo "Resultado: FALLA"
-  if [[ -n "$MOTIVO_SALTO" ]]; then
-    echo "Las E2E o diferenciales no corrieron completas ($MOTIVO_SALTO): esto NO es una verificación completa."
-    if [[ "$RAPIDO_OK" == "true" && "$INDICE_IGUAL_ARBOL" == "true" ]]; then
-      echo "El bloque rapido pasó y quedó registrado como \"rapido\". El sello honesto es:"
-      echo "  Verificado: rapido (e2e y diferenciales no corrieron: $MOTIVO_SALTO)"
+  record FAIL
+  echo "Result: FAIL"
+  if [[ -n "$SKIP_REASON" ]]; then
+    echo "The E2E or differential tests did not run completely ($SKIP_REASON): this is NOT a full verification."
+    if [[ "$QUICK_OK" == "true" && "$INDEX_MATCHES_TREE" == "true" ]]; then
+      echo "The quick block passed and was recorded as \"quick\". The honest stamp is:"
+      echo "  Verified: quick (e2e and differential did not run: $SKIP_REASON)"
     fi
   fi
   exit 1
 fi
-registrar OK
-echo "Resultado: OK"
-UNIDO="$(printf '%s; ' "${RESUMEN[@]}")"
-if [[ "$INDICE_IGUAL_ARBOL" == "true" ]]; then
-  echo "Trailer sugerido: Verificado: $MODO (verify.sh $MODO — ${UNIDO%; })"
+record OK
+echo "Result: OK"
+JOINED="$(printf '%s; ' "${SUMMARY[@]}")"
+if [[ "$INDEX_MATCHES_TREE" == "true" ]]; then
+  echo "Suggested trailer: Verified: $MODE (verify.sh $MODE — ${JOINED%; })"
 else
-  echo "Sin trailer sugerido: el índice no coincide con el árbol de trabajo (ver AVISO arriba)."
+  echo "No suggested trailer: the index does not match the working tree (see WARNING above)."
 fi

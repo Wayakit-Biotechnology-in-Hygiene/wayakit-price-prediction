@@ -1,31 +1,31 @@
-"""Ayudantes compartidos para todas las pruebas de Price Intelligence.
+"""Shared helpers for all Price Intelligence tests.
 
-Qué deja disponible:
-- ``REPO_ROOT`` y ``DATOS_F1``: rutas de la raíz del repo y de los datos congelados de F1.
-- ``cargar_modulo("ml_model/2_train_models.py")``: importa un script por su ruta, aunque el
-  nombre empiece con número. No ejecuta ``main()`` (los scripts lo protegen con
-  ``if __name__ == "__main__"``). El módulo queda en caché: cargarlo dos veces devuelve el mismo.
-- ``en_directorio(ruta)``: context manager que cambia el cwd y lo restaura (los scripts de
-  ``ml_model/`` usan rutas relativas como ``'ml_model/...'``; correrlos siempre en un tmp).
-- Fixtures ``repo_root`` y ``datos_f1`` (esta última salta la prueba con una razón clara si
-  ``data/f1_antes_2026-11-15/`` no existe, como pasa en CI).
-- Perfiles de Hypothesis: ``pi`` (por omisión: 200 ejemplos por prueba, determinista) y
-  ``exploracion`` (2000 ejemplos, aleatorio). Se elige con la variable ``HYPOTHESIS_PROFILE``.
-  Las pruebas no fijan ``max_examples`` propio (lo pisaría el perfil); si una necesita menos
-  ejemplos por costo, se justifica en la propia prueba.
+What it provides:
+- ``REPO_ROOT`` and ``F1_DATA``: paths to the repo root and to the frozen F1 data.
+- ``load_module("ml_model/2_train_models.py")``: imports a script by its path, even if the
+  name starts with a digit. It does not run ``main()`` (the scripts guard it with
+  ``if __name__ == "__main__"``). The module is cached: loading it twice returns the same one.
+- ``in_directory(path)``: context manager that changes the cwd and restores it (the scripts in
+  ``ml_model/`` use relative paths such as ``'ml_model/...'``; always run them in a tmp dir).
+- Fixtures ``repo_root`` and ``f1_data`` (the latter skips the test with a clear reason if
+  ``data/f1_before_2026-11-15/`` does not exist, as happens in CI).
+- Hypothesis profiles: ``pi`` (default: 200 examples per test, deterministic) and
+  ``exploration`` (2000 examples, random). Selected with the ``HYPOTHESIS_PROFILE`` variable.
+  Tests do not set their own ``max_examples`` (the profile would override it); if one needs fewer
+  examples because of cost, the justification goes in the test itself.
 
-Candados que aplican a todas las pruebas:
-- Cada prueba debe llevar uno de los marcadores ``unit``, ``property``, ``e2e`` o
-  ``differential``; si falta, pytest se detiene con ``UsageError`` (una prueba sin marcador
-  nunca correría en ``scripts/verify.sh``, que selecciona por marcador).
-- Sin red: dentro del proceso de pytest, ``socket.connect`` hacia una dirección que no sea
-  local (loopback o socket Unix) lanza ``RuntimeError``. Los subprocesos (E2E) no quedan
-  cubiertos por este candado; ahí aplica el de ``scripts/verify.sh``.
+Locks that apply to all tests:
+- Every test must carry one of the markers ``unit``, ``property``, ``e2e`` or
+  ``differential``; if one is missing, pytest stops with ``UsageError`` (a test without a marker
+  would never run in ``scripts/verify.sh``, which selects by marker).
+- No network: inside the pytest process, ``socket.connect`` to a non-local address (anything
+  other than loopback or a Unix socket) raises ``RuntimeError``. Subprocesses (E2E) are not
+  covered by this lock; the one in ``scripts/verify.sh`` applies there.
 
-Reglas: ninguna prueba llama a AWS, Odoo, Apify ni Bedrock, y ninguna escribe en el repo
-(los scripts que escriben CSV se corren en ``tmp_path``).
+Rules: no test calls AWS, Odoo, Apify or Bedrock, and none writes to the repo
+(scripts that write CSVs are run in ``tmp_path``).
 
-Importar desde una prueba: ``from tests.conftest import cargar_modulo, REPO_ROOT``.
+Importing from a test: ``from tests.conftest import load_module, REPO_ROOT``.
 """
 import contextlib
 import importlib.util
@@ -41,14 +41,14 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATOS_F1 = REPO_ROOT / "data" / "f1_antes_2026-11-15"
+F1_DATA = REPO_ROOT / "data" / "f1_before_2026-11-15"
 
 # --- Hypothesis -------------------------------------------------------------------------------
-# deadline=None: el primer llamado a pandas tarda más que el límite de 200 ms por importar y
-# preparar estructuras internas; eso no es un defecto del código y volvía las pruebas inestables.
-# pi: derandomize=True, cada corrida usa los mismos ejemplos, así una falla siempre se reproduce
-# y verify.sh no cambia de color entre corridas (tampoco se escribe la base .hypothesis/).
-# El costo: "pi" nunca prueba entradas nuevas; para eso está "exploracion".
+# deadline=None: the first call into pandas takes longer than the 200 ms limit because it imports
+# and prepares internal structures; that is not a defect in the code and made the tests flaky.
+# pi: derandomize=True, every run uses the same examples, so a failure always reproduces
+# and verify.sh does not change color between runs (the .hypothesis/ database is not written either).
+# The cost: "pi" never tries new inputs; that is what "exploration" is for.
 settings.register_profile(
     "pi",
     max_examples=200,
@@ -57,10 +57,10 @@ settings.register_profile(
     print_blob=True,
     suppress_health_check=[HealthCheck.too_slow],
 )
-# Para buscar bugs nuevos (corrida aparte, no en el gate; tarda varios minutos):
-#   HYPOTHESIS_PROFILE=exploracion python -m pytest -m property -q
+# To hunt for new bugs (separate run, not in the gate; takes several minutes):
+#   HYPOTHESIS_PROFILE=exploration python -m pytest -m property -q
 settings.register_profile(
-    "exploracion",
+    "exploration",
     max_examples=2000,
     deadline=None,
     derandomize=False,
@@ -70,35 +70,35 @@ settings.register_profile(
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "pi"))
 
 
-# --- Marcadores obligatorios ------------------------------------------------------------------
-MARCADORES_DE_SUITE = {"unit", "property", "e2e", "differential"}
+# --- Mandatory markers ------------------------------------------------------------------------
+SUITE_MARKERS = {"unit", "property", "e2e", "differential"}
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Detiene la corrida si alguna prueba recolectada no tiene marcador de suite.
+    """Stops the run if any collected test has no suite marker.
 
-    Corre antes de que ``-m`` deseleccione nada, así revisa todas las pruebas recolectadas.
+    Runs before ``-m`` deselects anything, so it checks every collected test.
     """
-    sin_marcador = [
+    unmarked = [
         item.nodeid
         for item in items
-        if not MARCADORES_DE_SUITE & {marca.name for marca in item.iter_markers()}
+        if not SUITE_MARKERS & {mark.name for mark in item.iter_markers()}
     ]
-    if sin_marcador:
+    if unmarked:
         raise pytest.UsageError(
-            "Estas pruebas no tienen ninguno de los marcadores "
-            f"{sorted(MARCADORES_DE_SUITE)} y nunca correrían en scripts/verify.sh: "
-            + ", ".join(sin_marcador)
-            + ". Agrega pytestmark o @pytest.mark.<marcador>."
+            "These tests have none of the markers "
+            f"{sorted(SUITE_MARKERS)} and would never run in scripts/verify.sh: "
+            + ", ".join(unmarked)
+            + ". Add pytestmark or @pytest.mark.<marker>."
         )
 
 
-# --- Candado de red ---------------------------------------------------------------------------
-def _es_direccion_local(familia, direccion):
-    if familia == getattr(socket, "AF_UNIX", object()):
+# --- Network lock -----------------------------------------------------------------------------
+def _is_local_address(family, address):
+    if family == getattr(socket, "AF_UNIX", object()):
         return True
-    host = direccion[0] if isinstance(direccion, tuple) else direccion
+    host = address[0] if isinstance(address, tuple) else address
     if isinstance(host, bytes):
         host = host.decode(errors="replace")
     if host in ("localhost", ""):
@@ -106,87 +106,87 @@ def _es_direccion_local(familia, direccion):
     try:
         return ipaddress.ip_address(str(host).split("%")[0]).is_loopback
     except ValueError:
-        return False  # un nombre de host que no es localhost: se resolvería por red
+        return False  # a host name other than localhost: it would be resolved over the network
 
 
-def _bloquear(original):
-    def conectar(self, direccion, *args, **kwargs):
-        if not _es_direccion_local(self.family, direccion):
+def _block(original):
+    def connect(self, address, *args, **kwargs):
+        if not _is_local_address(self.family, address):
             raise RuntimeError(
-                f"Red bloqueada en pruebas: intento de conexión a {direccion!r}. Ninguna prueba "
-                "puede llamar a AWS, Odoo, Apify, Bedrock ni a otro servicio externo."
+                f"Network blocked in tests: attempted connection to {address!r}. No test "
+                "may call AWS, Odoo, Apify, Bedrock or any other external service."
             )
-        return original(self, direccion, *args, **kwargs)
+        return original(self, address, *args, **kwargs)
 
-    return conectar
+    return connect
 
 
 @pytest.fixture(scope="session", autouse=True)
-def sin_red():
-    """Bloquea conexiones a direcciones no locales durante toda la sesión de pytest.
+def no_network():
+    """Blocks connections to non-local addresses for the whole pytest session.
 
-    Es de alcance de sesión (no usa ``monkeypatch``) para que Hypothesis no lo trate como fixture
-    por función. Cubre todo lo que corre dentro de las pruebas y fixtures; no cubre la
-    recolección (los imports de módulo de los archivos de prueba, que no abren conexiones).
+    It is session-scoped (it does not use ``monkeypatch``) so Hypothesis does not treat it as a
+    function-scoped fixture. It covers everything that runs inside tests and fixtures; it does not
+    cover collection (module imports of the test files, which do not open connections).
     """
-    originales = {nombre: getattr(socket.socket, nombre) for nombre in ("connect", "connect_ex")}
-    for nombre, original in originales.items():
-        setattr(socket.socket, nombre, _bloquear(original))
+    originals = {name: getattr(socket.socket, name) for name in ("connect", "connect_ex")}
+    for name, original in originals.items():
+        setattr(socket.socket, name, _block(original))
     try:
         yield
     finally:
-        for nombre, original in originales.items():
-            setattr(socket.socket, nombre, original)
+        for name, original in originals.items():
+            setattr(socket.socket, name, original)
 
 
-# --- Logger de producción ---------------------------------------------------------------------
-def _instalar_log_config_de_prueba():
-    """Sustituye ``log_config`` por una versión que no escribe archivos.
+# --- Production logger ------------------------------------------------------------------------
+def _install_test_log_config():
+    """Replaces ``log_config`` with a version that writes no files.
 
-    El ``log_config.py`` real crea ``../logs/wayakit_app.log`` fuera del repo al importarse.
-    Las pruebas no deben escribir ahí (ese log puede mezclarse con el de producción), así que
-    los scripts cargados con ``cargar_modulo`` reciben un logger sin handlers de archivo.
+    The real ``log_config.py`` creates ``../logs/wayakit_app.log`` outside the repo when imported.
+    Tests must not write there (that log can get mixed with the production one), so
+    scripts loaded with ``load_module`` get a logger without file handlers.
     """
     if "log_config" in sys.modules:
         return
-    modulo = types.ModuleType("log_config")
-    logger = logging.getLogger("wayakit_price_prediction.pruebas")
+    module = types.ModuleType("log_config")
+    logger = logging.getLogger("wayakit_price_prediction.tests")
     logger.addHandler(logging.NullHandler())
     logger.propagate = False
-    modulo.logger = logger
-    modulo.get_logger = lambda: logger
-    modulo.setup_logging = lambda *args, **kwargs: logger
-    sys.modules["log_config"] = modulo
+    module.logger = logger
+    module.get_logger = lambda: logger
+    module.setup_logging = lambda *args, **kwargs: logger
+    sys.modules["log_config"] = module
 
 
-_CACHE_MODULOS = {}
+_MODULE_CACHE = {}
 
 
-def cargar_modulo(ruta_relativa):
-    """Importa un archivo .py del repo por su ruta relativa a la raíz y lo devuelve."""
-    if ruta_relativa in _CACHE_MODULOS:
-        return _CACHE_MODULOS[ruta_relativa]
-    _instalar_log_config_de_prueba()
-    ruta = REPO_ROOT / ruta_relativa
-    nombre = "pi_prueba_" + ruta_relativa.replace("/", "_").replace(".py", "").replace("-", "_")
-    spec = importlib.util.spec_from_file_location(nombre, ruta)
-    modulo = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(modulo)
-    _CACHE_MODULOS[ruta_relativa] = modulo
-    return modulo
+def load_module(relative_path):
+    """Imports a .py file from the repo by its path relative to the root and returns it."""
+    if relative_path in _MODULE_CACHE:
+        return _MODULE_CACHE[relative_path]
+    _install_test_log_config()
+    path = REPO_ROOT / relative_path
+    name = "pi_test_" + relative_path.replace("/", "_").replace(".py", "").replace("-", "_")
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _MODULE_CACHE[relative_path] = module
+    return module
 
 
 @contextlib.contextmanager
-def en_directorio(ruta):
-    """Cambia el directorio de trabajo y lo restaura al salir (Python 3.10 no trae
-    ``contextlib.chdir``). Sirve dentro de pruebas de Hypothesis, donde ``monkeypatch`` (de
-    alcance por función) no se puede usar."""
-    anterior = os.getcwd()
-    os.chdir(ruta)
+def in_directory(path):
+    """Changes the working directory and restores it on exit (Python 3.10 does not ship
+    ``contextlib.chdir``). Usable inside Hypothesis tests, where ``monkeypatch`` (function
+    scoped) cannot be used."""
+    previous = os.getcwd()
+    os.chdir(path)
     try:
-        yield Path(ruta)
+        yield Path(path)
     finally:
-        os.chdir(anterior)
+        os.chdir(previous)
 
 
 @pytest.fixture(scope="session")
@@ -195,12 +195,12 @@ def repo_root():
 
 
 @pytest.fixture(scope="session")
-def datos_f1():
-    """Carpeta con los datos congelados de F1; salta la prueba si no existe."""
-    if not DATOS_F1.is_dir():
+def f1_data():
+    """Folder with the frozen F1 data; skips the test if it does not exist."""
+    if not F1_DATA.is_dir():
         pytest.skip(
-            f"No existe {DATOS_F1.relative_to(REPO_ROOT)} (datos reales congelados de F1, fuera "
-            "de git). Las pruebas e2e y diferenciales los necesitan; en CI se usarán fixtures "
-            "sintéticos (F4)."
+            f"{F1_DATA.relative_to(REPO_ROOT)} does not exist (real frozen F1 data, outside "
+            "git). The e2e and differential tests need it; CI will use synthetic "
+            "fixtures (F4)."
         )
-    return DATOS_F1
+    return F1_DATA
