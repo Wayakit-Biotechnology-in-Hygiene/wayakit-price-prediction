@@ -27,7 +27,6 @@ set -u
 
 ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 INPUT="$(cat || true)"
-[ "${PI_EDITAR_CHECKS:-0}" = "1" ] && PI_EDIT_CHECKS=1  # TODO(remove-after-translation): legacy alias
 PI_EDIT_CHECKS="${PI_EDIT_CHECKS:-0}"
 
 PY="$(command -v python3 || true)"
