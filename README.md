@@ -47,12 +47,14 @@ Nada de esto existe todavía; en AWS no se ha creado ningún recurso nuevo. Deta
 | `scraper/scrapers/` | Un scraper por sitio (Selenium + BeautifulSoup) con la firma `scrape(keyword, search_mode) -> list[dict]` (AeroSense usa `scrape(search_term, mode='volume')`, mismo orden de argumentos) |
 | `scraper/services/` | `ai_service.py`: `RelevanceAgent` (Gemini hoy) |
 | `ml_model/` | Lecturas de Odoo, preprocesado (`1a`, `1b`), entrenamiento (`2`), predicción (`3`) y subida (`odoo_api_price_suggestion.py`) |
-| `docs/` | Plan, runbook, inventario de AWS y decisiones |
+| `docs/` | Plan, runbook, inventario de AWS, decisiones y checklist de confiabilidad |
 | `run_pipeline.sh` | Pipeline de 2 etapas que corre en la instancia |
 | `log_config.py` | Logging con rotación; escribe en `../logs/wayakit_app.log`, fuera del repo (`log_config.py:7`) |
 | `requirements.txt` | Dependencias, sin versiones fijas |
 | `infra/` | Planeado (F3) |
-| `tests/` | Planeado (F2, F4) |
+| `tests/` | Pruebas sin red: `unit/`, `property/` (Hypothesis), `e2e/` (etapas del ML y `run_pipeline.sh` en una copia temporal) y `differential/` (rama base contra versión nueva). Se corren con `scripts/verify.sh rapido\|completo` |
+| `scripts/` | `verify.sh`, `install_githooks.sh` (hook `commit-msg` del sello `Verificado:`) y los hooks de Claude Code (`hooks/`) |
+| `.claude/` | Agentes del equipo de desarrollo (`pi-dev`, `pi-tester`, `pi-reviewer`), skills `equipo` y `verify`, y `settings.json` con los hooks |
 | `.github/workflows/` | Planeado (F4): `ci.yml` y `deploy.yml` |
 
 ## Fuentes
@@ -74,7 +76,10 @@ Ojo: `Land Transportation` (`config.py:19`) no coincide con `Land transportation
 
 ## Cómo correrlo en local
 
-Requisitos: Python con `requirements.txt` y Chrome instalado (`webdriver-manager` descarga el driver). La instancia usa Python 3.10.20 y el entorno conda `wayakit_env`; [environment.yml](environment.yml) fija esas versiones (`conda env create -f environment.yml`). Los scripts leen el secreto `prod/wayakit-app` (eu-north-1) con la sesión por defecto de boto3, así que necesitas un perfil SSO con permiso de lectura sobre ese secreto.
+Requisitos: Python con `requirements.txt` y Chrome instalado (`webdriver-manager` descarga el driver). [environment.yml](environment.yml) fija las versiones de la instancia (Python 3.10.20):
+
+- **Local:** `conda env create -f environment.yml` crea el entorno `wayakit-price-prediction`. Para las pruebas, además `pip install -r requirements-dev.txt` y, una vez por clon, `scripts/install_githooks.sh`.
+- **Instancia:** el entorno sigue llamándose `wayakit_env` hasta F3 (`run_pipeline.sh:6`). Si hay que recrearlo allí: `conda env create -f environment.yml -n wayakit_env`; sin `-n` se crea `wayakit-price-prediction` y el pipeline no lo encuentra. Los scripts leen el secreto `prod/wayakit-app` (eu-north-1) con la sesión por defecto de boto3, así que necesitas un perfil SSO con permiso de lectura sobre ese secreto.
 
 Los CSV no están en git (salvo `scraper/analysis-odoo.csv`, `scraper/modifiers_mapping.csv` y `ml_model/wayakit_products_competition.csv`): se generan al correr. Todos los comandos van desde la raíz del repo.
 
@@ -103,4 +108,6 @@ python ml_model/3_predicted_prices.py                # → ml_model/wayakit_pred
 - [docs/recursos.md](docs/recursos.md): inventario de lo que existe en AWS
 - [docs/decisiones.md](docs/decisiones.md): por qué está así
 - [docs/plan.md](docs/plan.md): plan de mejoras nov–dic 2026 (fases F0–F8)
+- [REVIEW.md](REVIEW.md) y [docs/checklist-confiabilidad.md](docs/checklist-confiabilidad.md): qué bloquea un commit y qué chequeos correr según el diff (se leen desde la rama base)
+- Skills [`verify`](.claude/skills/verify/SKILL.md) (cómo verificar sin tocar producción) y [`equipo`](.claude/skills/equipo/SKILL.md) (cómo trabaja el equipo de agentes)
 - Tickets: [A, corregir mascotas y migrar B2C a Apify](https://app.notion.com/p/41abe65f8c1381ffb1dad8a51e4eb87a) · [B, infraestructura como código y CI/CD a EC2](https://app.notion.com/p/41abe65f8c1381e88806e23603e434b3)

@@ -39,7 +39,7 @@ Referencia: repo `voz-del-cliente` (VdC). De ahí se copian las convenciones de 
 |---|---|---|
 | 1 | **No existe un scraper de Noon.** En B2C hoy solo hay Amazon (amazon.sa, Selenium), Mumzworld y SACO. Para Pets **solo se usa Amazon** | `scraper/config.py:9-24` |
 | 2 | El modelo **no usa** la fuente; desde e25e2c9 sí usa `company` (la marca en Amazon, Mumzworld y SACO). No se captura el vendedor ni el país de origen. Hoy no hay forma de separar importado de local | `ml_model/2_train_models.py:160-169` |
-| 3 | En la foto de 2024, la mediana de Pets era de unos 262 SAR/L, contra unos 50 en Home. El 39 % de los tamaños venían en fl oz (indicio de importado). Con n ≤ 2 por tipo, el recorte p10–p90 no hace nada | `2_train_models.py:46-60` |
+| 3 | En la foto de 2024, la mediana de Pets era de unos 262 SAR/L, contra unos 50 en Home. El 39 % de los tamaños venían en fl oz (indicio de importado). Con n ≤ 2 por tipo, el recorte p10–p90 no hace nada. **Corrección (2026-11-17):** eso vale con 1 precio o con 2 iguales; con **2 precios distintos el recorte deja el grupo vacío** (hallazgo 12, bug 6) | `2_train_models.py:46-60` |
 | 4 | Las ventas de Odoo están **fijas a 2025** | `ml_model/odoo_api_cotizations.py:75-76` |
 | 5 | El estado (CSV, `last_full_run.txt`, modelos y logs) vive solo en el disco de la EC2. Hay un snapshot manual del 2026-11-17 (F1) | `run_pipeline.sh:7-24` |
 | 6 | La etapa 2 hace `git pull` sin verificar el resultado. Muchos errores terminan con código 0 (`exit()`, `except` que se tragan el error) | `run_pipeline.sh:133`, `odoo_api_price_suggestion.py:52-109` |
@@ -48,6 +48,26 @@ Referencia: repo `voz-del-cliente` (VdC). De ahí se copian las convenciones de 
 | 9 | La consulta a Odoo **no filtra por compañía (KSA/MX)** | `ml_model/odoo_api_*.py` |
 | 10 | **La instancia corre `server-improvement`** (e25e2c9, "model improvement"), que cambia el entrenamiento, la predicción y `run_pipeline.sh` (modo parcial deshabilitado). `pi-mejoras` se adelantó a e25e2c9 el 2026-11-17 | F1 (instancia) |
 | 11 | **La última corrida completa (13–15 nov 2026) falló en el scraping y aun así subió a Odoo.** El scraping llegó al timeout de 30 h; `competitors_complete.csv` quedó con 53 filas (SACO Automotive 36, AeroSense 14, Fine Airports 3; nada de Amazon, Home ni Pets). El pipeline entrenó, subió en modo full (borró las sugerencias anteriores) y terminó con código 0. Las sugerencias actuales de Odoo salen casi solo de `competitor.product`. GoGreen falló muchas veces con "Could not set language to English" | F1, `logs/pipeline_execution.log` |
+| 12 | **Las pruebas de propiedades (2026-11-17) encontraron 11 bugs** en los parsers de tamaño y en el preprocesado y entrenamiento. Cada uno tiene una prueba `xfail(strict=True)` con su contraejemplo. Detalle y fase en [Bugs de las pruebas de propiedades](#bugs-de-las-pruebas-de-propiedades-2026-11-17) | `tests/unit/`, `tests/property/` |
+| 13 | **La corrida local no reproduce el reporte de producción.** Con los datos congelados de F1 y el mismo código (e25e2c9), cambian 520 de 738 `predicted_price`, hasta 51.86 SAR; los procesados salen iguales y `to_predict` solo difiere en ruido de flotantes (~1e-14). Causa en investigación: CPU/BLAS, versiones de scikit-learn o numpy en la instancia, o que esa corrida no fuera e25e2c9. Por eso las pruebas diferenciales comparan **base contra versión nueva en la misma máquina**, nunca contra salidas de producción | `data/f1_antes_2026-11-15/`, `tests/differential/` |
+
+### Bugs de las pruebas de propiedades (2026-11-17)
+
+Encontrados por `pi-tester` al escribir las pruebas unitarias y de propiedades del código actual (e25e2c9). No se arreglaron: cada uno queda como `xfail(strict=True)` con el contraejemplo mínimo; cuando se arregle, la prueba pasa y hay que quitar el `xfail`. Los parsers de `scraper/utils.py` los usan Amazon, Mumzworld, SACO, Fine, GoGreen y OfficeSupply: arreglarlos cambia filas de Mumzworld y SACO, así que necesita la prueba de regresión de F6 y una decisión de Mafer (pregunta 13).
+
+| # | Bug | Contraejemplo | Dónde | Fase |
+|---|---|---|---|---|
+| 1 | `litre` no se reconoce como litro (la rama busca "liter") | `'1 litre'` → unit `litre`, normalized 1.0 (debe ser L y 1000); `'6 x 1 litre'` → normalized 6 | `scraper/utils.py:3` (`parse_volume_string`), `:64` (`parse_volume_with_multiplier`) | F7 (regresión F6) |
+| 2 | `kilograms` se lee como gramos ("gram" está dentro de "kilograms" y esa rama va antes) | `'2 kilograms'` → unit `g`, normalized 2.0 (debe ser kg y 2000) | `scraper/utils.py:3` | F7 (regresión F6) |
+| 3 | Separador de miles | `'Shampoo 1,000 ml'` → quantity 0.0 (la regex toma solo "000") | `scraper/utils.py:3` | F7 (regresión F6) |
+| 4 | Decimal sin cero inicial | `'Bleach .5 L'` → quantity 5.0 (5 L en lugar de 0.5 L) | `scraper/utils.py:3` | F7 (regresión F6) |
+| 5 | `1a` manda `kg` y `litre` al modelo por pieza: solo reconoce `ml`, `l`, `fl oz` y `g` como volumen | `'Powder 2 kg'` de 30 SAR → `competitor_unit_processed.csv` con total_quantity 2 y price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7 (correcciones chicas) |
+| 6 | **El recorte p10–p90 vacía los grupos con 2 precios distintos** (límites 1.1 y 1.9 para [1.0, 2.0]; el filtro es inclusivo y no queda nada) | En los datos de F1, **14 de 151 tipos volumétricos y 1 de 15 unitarios se quedan sin ningún competidor** en el entrenamiento | `ml_model/2_train_models.py:46-60` | **F7, directo para Pets** (n chico por tipo; "recorte robusto cuando n es pequeño") y F5 (contar cuántos tipos de Pets lo sufren) |
+| 7 | Los SKU repetidos duplican cotizaciones (el `merge` por `Product_ID`) | Una cotización de `P1` con `P1` dos veces en productos → 2 filas. En F1: 4 SKU repetidos, 162 cotizaciones → 163 filas | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7 (y la limpieza de SKU de la sección 7.3) |
+| 8 | `process_volumetric_data` no descarta cantidades ≤ 0 (el unitario sí) | `ml`, total_quantity −500, precio 1 → volume_liters −0.5 y price_per_liter −2.0, que entran al entrenamiento | `ml_model/1a_preprocess_data.py:39-59` | F7 (correcciones chicas, C18) |
+| 9 | **Posible bug (confirmar con Mafer):** el "3X" de concentración se toma como 3 piezas | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | F7, según la pregunta 12 |
+| 10 | Menor: notación científica en el multiplicador (solo con totales < 1e-4 o ≥ 1e16, poco realista) | `'(2 Bottles x 0.00001 ml)'` → quantity 2e-05 pero normalized 5.0 | `scraper/utils.py:64` | Sin fase (anotado) |
+| 11 | Menor: números gigantes en los parsers de conteo lanzan `ValueError` (límite de dígitos de `int()` en Python ≥ 3.10.7); irreal en títulos | `'9'*4301 + ' wipes'` | `scraper/utils.py:31` (`parse_count_string`) | Sin fase (anotado) |
 
 ### Seguridad: avisar a IT
 
@@ -115,6 +135,9 @@ Plan original:
 - `ai_service.py` pasa de Gemini a Bedrock, por lotes y con la misma interfaz. Necesita `infra/bedrock_profile.py` y el permiso `bedrock:InvokeModel` en el rol de la instancia.
 - Subida segura a Odoo con `--dry-run` y filtro por compañía.
 - Ventas de Odoo de los últimos 12 meses móviles, en lugar de 2025 fijo.
+- **Antes de empezar F2:** subir a la base, en un PR aparte que revisa Mafer, el setup de verificación (`REVIEW.md`, `.claude/`, `scripts/`, `tests/`, `pytest.ini`, `docs/checklist-confiabilidad.md`), sin código de producción. Sin eso, "las reglas se leen de la base" no funciona (skill `equipo`).
+- **Paridad del entorno (hallazgo 13):** comparar las versiones de la instancia (numpy, scikit-learn, threadpoolctl/BLAS, CPU) con `environment.yml` y confirmar qué código hizo la corrida del 13–15 nov, hasta explicar por qué la corrida local da otros 520 precios. Mientras tanto, ninguna prueba compara contra salidas de producción.
+- Los bugs del hallazgo 12 no se arreglan en F2 (no son de endurecimiento); sus pruebas `xfail` estrictas quedan como recordatorio.
 
 ### F3 · `infra/` (3 días) — cada script se corre con OK de Mafer
 
@@ -136,7 +159,7 @@ Para después, fuera del plazo: `alarms.py` y `budget.py`. Mientras tanto se usa
 
 - `ci.yml`:
   - lint;
-  - `python -m unittest` (convertidores de Apify, contrato de scrapers, infra con MagicMock como hace VdC);
+  - `scripts/verify.sh rapido` (pytest con los marcadores `unit` y `property`: convertidores de Apify, contrato de scrapers, infra con MagicMock como hace VdC);
   - smoke del ML con datos sintéticos;
   - gitleaks.
 - `deploy.yml` (solo en main y con CI en verde): empaqueta → S3 → puntero → enciende la instancia en "solo deploy" → espera la señal de OK → listo.
@@ -172,7 +195,7 @@ Con la foto de F1 (`data/f1_antes_2026-11-15/`; ojo: esa corrida no trajo filas 
   - si hay al menos N filas locales por tipo, se usan esas filas;
   - si no, se usa la estadística robusta del mercado (mediana, sin valores extremos, sin multipacks ni tamaños de 5 mL o menos) con un techo de `p75 × volumen`;
   - el precio nunca baja del piso de margen de 1.30.
-- Correcciones chicas: precio 0, `kg` tratado como volumétrico, recorte robusto cuando n es pequeño.
+- Correcciones chicas: precio 0, `kg` tratado como volumétrico, recorte robusto cuando n es pequeño. Las cubren los bugs 5, 6, 7 y 8 del hallazgo 12 (con sus pruebas `xfail` estrictas). **El bug 6 es directo para Pets:** con 2 precios distintos por tipo, el recorte p10–p90 deja el tipo sin competidores (14 de 151 tipos volumétricos en F1). Los bugs de parsers (1–4 y 9) entran aquí solo si Mafer decide cambiar el parser compartido (pregunta 13), con la regresión de F6.
 - **Decisión documentada sobre el modelo** (lo pide el ticket): las demás mejoras (target en log, GroupKFold) quedan para una fase 2. Mueven los precios de todas las líneas. La fuga de `approved_quote_price` como feature ya se quitó en e25e2c9 (`2_train_models.py:160`), junto con el recorte al rango de mercado con 3 competidores o más (`3_predicted_prices.py:126-132`).
 - Comparación antes/después por subindustria: mediana de la razón nuevo/viejo y % de sugerencias por encima del p75 local.
 
@@ -199,6 +222,8 @@ Con la foto de F1 (`data/f1_antes_2026-11-15/`; ojo: esa corrida no trajo filas 
 9. ~~¿Snapshot y encendido?~~ Hecho el 2026-11-17 (F1): snapshot, acceso por SSM, inventario y datos copiados a `data/f1_antes_2026-11-15/`. La instancia corre `server-improvement`, no `main`.
 11. ¿Se rebasa `pi-mejoras` sobre `server-improvement` (lo que corre en producción) o se descarta e25e2c9?
 10. ¿Qué hacemos con los restos en me-south-1 (2 roles y el secreto `wayakit/test/credentials`)? No se pudieron inventariar desde aquí.
+12. ¿Un "3X" de concentración en el título ("Detergent 3X concentrate 500 ml") debe multiplicar el volumen? Hoy da 1500 ml (hallazgo 12, bug 9). Es un supuesto de las pruebas, no una regla confirmada.
+13. Los bugs de parsers del hallazgo 12 (1–4) están en `scraper/utils.py`, que también usan Mumzworld y SACO. ¿Se arreglan (cambian filas de Mumzworld y SACO, con la regresión de F6 y las diferencias aprobadas) o se dejan y se corrigen solo en los adaptadores nuevos de Apify?
 
 ---
 

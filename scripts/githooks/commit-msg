@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Hook de git commit-msg: todo commit dice cómo se verificó y, si dice que corrió verify.sh, es cierto.
+# Se instala con scripts/install_githooks.sh (git config core.hooksPath scripts/githooks).
+#
+# Regla (REVIEW.md, regla 10): el mensaje final lleva UN trailer, en el último párrafo y separado del
+# cuerpo por una línea en blanco, que cumple exactamente
+#   ^Verificado: (rapido|completo|ninguna) \(.+\)$
+# Ejemplos:
+#   Verificado: completo (verify.sh completo — rapido: OK (...); e2e-diferencial: OK (...))
+#   Verificado: rapido (e2e y diferenciales no corrieron: falta data/f1_antes_2026-11-15/)
+#   Verificado: ninguna (solo docs)
+#
+# Qué se comprueba:
+#   - El trailer se lee con "git interpret-trailers --parse" sobre el mensaje sin comentarios: un
+#     "Verificado:" en el asunto o a mitad del cuerpo no cuenta. Más de uno se rechaza.
+#   - rapido / completo: debe existir un registro de scripts/verify.sh en .claude/state/verificaciones.jsonl
+#     (o .claude/state/ultima_verificacion.json) con resultado OK, el mismo tree que este commit
+#     ("git write-tree" del índice que se va a commitear) e indice_igual_arbol=true.
+#       completo: el último registro "completo" de ese tree es OK.
+#       rapido:   el último registro "rapido" de ese tree es OK, o el último "completo" lo es.
+#     Por eso verify.sh se corre DESPUÉS de "git add". Con "git commit -a" o "git commit <archivo>"
+#     el índice cambia al commitear y el registro no coincide: haz "git add", corre verify y commitea.
+#   - ninguna: siempre se acepta (no hay registro que comparar) y quedan en el log.
+#   - Durante rebase, cherry-pick o revert los commits ya traen su sello: solo se revisa el formato.
+#
+# Log: .claude/state/commit_msg.log (fecha, modo, decisión y tree corto; nunca el texto del mensaje).
+# Saltarse este hook (git commit --no-verify) está prohibido en este repo; el hook PreToolUse
+# scripts/hooks/commit_stamp.sh lo bloquea en las sesiones de Claude Code.
+#
+# Prueba manual (en un clon temporal, nunca en el repo real):
+#   printf 'x\n\nVerificado: ninguna (prueba)\n' > /tmp/m; scripts/githooks/commit-msg /tmp/m; echo $?
+
+set -u
+
+MSG_FILE="${1:?uso: commit-msg <archivo-del-mensaje>}"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+STATE="$ROOT/.claude/state"
+mkdir -p "$STATE" 2>/dev/null || true
+LOG="$STATE/commit_msg.log"
+REGEX='^Verificado: (rapido|completo|ninguna) \(.+\)$'
+
+anotar() { printf '%s modo=%s decision=%s tree=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "${3:0:12}" >> "$LOG" 2>/dev/null || true; }
+
+rechazar() {
+  {
+    echo "Commit rechazado (scripts/githooks/commit-msg): $1"
+    shift
+    for l in "$@"; do echo "  $l"; done
+    echo "Formato: una línea de trailer al final, separada del cuerpo por una línea en blanco:"
+    echo "  Verificado: <rapido|completo|ninguna> (<detalle o motivo>)"
+    echo "Si no se verificó, escribe \"Verificado: ninguna (motivo)\"; no inventes una verificación."
+  } >&2
+  exit 1
+}
+
+LIMPIO="$(git stripspace --strip-comments < "$MSG_FILE")"
+TRAILERS="$(printf '%s\n' "$LIMPIO" | git interpret-trailers --parse 2>/dev/null || true)"
+SELLOS="$(printf '%s\n' "$TRAILERS" | grep -i '^verificado:' || true)"
+N_SELLOS="$(printf '%s' "$SELLOS" | grep -c . || true)"
+
+if [ "${N_SELLOS:-0}" -eq 0 ]; then
+  if printf '%s\n' "$LIMPIO" | grep -qi 'verificado:'; then
+    anotar "?" "rechazado_fuera_de_trailer" ""
+    rechazar "hay un \"Verificado:\" pero no es un trailer." \
+      "Debe ir en el último párrafo del mensaje, en su propia línea, separado del cuerpo por una línea en blanco." \
+      "Si hay Co-Authored-By, va en ese mismo párrafo, justo arriba (sin línea en blanco entre los dos)."
+  fi
+  anotar "?" "rechazado_sin_sello" ""
+  rechazar "el mensaje no tiene la línea \"Verificado:\"."
+fi
+if [ "$N_SELLOS" -gt 1 ]; then
+  anotar "?" "rechazado_varios_sellos" ""
+  rechazar "hay $N_SELLOS trailers \"Verificado:\"; debe haber exactamente uno."
+fi
+if ! printf '%s\n' "$SELLOS" | grep -Eq "$REGEX"; then
+  anotar "?" "rechazado_formato" ""
+  rechazar "el sello no cumple el formato." "Recibido: $SELLOS"
+fi
+
+MODO="$(printf '%s\n' "$SELLOS" | sed -E 's/^Verificado: ([a-z0-9]+) .*/\1/')"
+
+case "$MODO" in
+  ninguna)
+    anotar "$MODO" "aceptado_sin_registro" ""
+    exit 0 ;;
+esac
+
+# rapido / completo: se exige un registro de verify.sh para este mismo índice.
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ] || \
+   [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$GIT_DIR/REVERT_HEAD" ]; then
+  anotar "$MODO" "aceptado_secuenciador_solo_formato" ""
+  exit 0
+fi
+
+TREE="$(git write-tree 2>/dev/null || true)"   # respeta GIT_INDEX_FILE: es el árbol de ESTE commit
+[ -n "$TREE" ] || rechazar "no se pudo calcular el árbol del índice (¿conflictos sin resolver?)."
+
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] || { [ -x /usr/bin/python3 ] && PY=/usr/bin/python3; }
+if [ -z "$PY" ]; then
+  anotar "$MODO" "rechazado_sin_python" "$TREE"
+  rechazar "no hay python3 para leer el registro de verify.sh; no se puede comprobar el sello \"$MODO\"."
+fi
+
+VEREDICTO="$("$PY" - "$MODO" "$TREE" "$STATE/verificaciones.jsonl" "$STATE/ultima_verificacion.json" <<'PYEOF'
+import json, sys
+modo, tree, historial, ultima = sys.argv[1:5]
+regs = []
+try:
+    with open(historial, encoding="utf-8") as f:
+        for linea in f:
+            linea = linea.strip()
+            if linea:
+                try:
+                    regs.append(json.loads(linea))
+                except ValueError:
+                    pass
+except OSError:
+    pass
+if not regs:
+    try:
+        with open(ultima, encoding="utf-8") as f:
+            regs.append(json.load(f))
+    except (OSError, ValueError):
+        pass
+del_tree = [r for r in regs if isinstance(r, dict) and r.get("tree") == tree]
+
+def ultimo(m):
+    c = [r for r in del_tree if r.get("modo") == m]
+    return c[-1] if c else None
+
+def valido(r):
+    return r is not None and r.get("resultado") == "OK" and r.get("indice_igual_arbol") is True
+
+if modo == "completo":
+    cand = [ultimo("completo")]
+else:
+    cand = [ultimo("rapido"), ultimo("completo")]
+for r in cand:
+    if valido(r):
+        print("OK " + str(r.get("fecha", "")))
+        sys.exit(0)
+if not del_tree:
+    print("SIN_REGISTRO")
+elif any(r is not None and r.get("resultado") == "OK" and r.get("indice_igual_arbol") is not True for r in cand):
+    print("INDICE_DISTINTO")
+elif all(r is None for r in cand):
+    print("SIN_REGISTRO_MODO")
+else:
+    print("FALLA")
+PYEOF
+)"
+
+case "$VEREDICTO" in
+  OK*)
+    anotar "$MODO" "aceptado_registro_${VEREDICTO#OK }" "$TREE"
+    exit 0 ;;
+  SIN_REGISTRO)
+    anotar "$MODO" "rechazado_sin_registro" "$TREE"
+    rechazar "el sello dice \"$MODO\" pero no hay una corrida de verify.sh para este índice (tree ${TREE:0:12})." \
+      "Haz \"git add\" de todo lo que va en el commit, corre \"scripts/verify.sh $MODO\" y vuelve a commitear." \
+      "Con \"git commit -a\" o \"git commit <archivo>\" el índice cambia al commitear: usa git add antes." ;;
+  SIN_REGISTRO_MODO)
+    anotar "$MODO" "rechazado_sin_registro_modo" "$TREE"
+    rechazar "hay corridas de verify.sh para este índice, pero ninguna en modo \"$MODO\"." \
+      "Corre \"scripts/verify.sh $MODO\" o usa el sello del modo que sí corrió." ;;
+  INDICE_DISTINTO)
+    anotar "$MODO" "rechazado_indice_distinto" "$TREE"
+    rechazar "verify.sh pasó, pero cuando corrió había cambios sin \"git add\" o archivos sin seguimiento." \
+      "Lo probado no es exactamente lo que se commitea. Agrega (o guarda aparte) esos cambios y vuelve a correr verify." ;;
+  *)
+    anotar "$MODO" "rechazado_verificacion_fallida" "$TREE"
+    rechazar "la última corrida de \"scripts/verify.sh $MODO\" para este índice terminó en FALLA." \
+      "Arregla la causa y vuelve a correr; o, si no se verificó, usa \"Verificado: ninguna (motivo)\"." ;;
+esac

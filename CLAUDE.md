@@ -66,9 +66,17 @@ No se mantiene aquí. Fases, hallazgos y preguntas abiertas: [docs/plan.md](docs
 - Noon KSA: `saswave/noon-product-scraper`, **una corrida por keyword** (no devuelve la keyword ni la moneda; se asume SAR por `/saudi-en/`).
 - Cuenta: la de VdC. Hoy el único token está en `voz-del-cliente/api-keys` (de VdC); PI no debe leer ese secreto. Dónde vive el token de PI está por decidir: el plan propone una llave nueva en `prod/wayakit-app` (pregunta 4 de `docs/plan.md`).
 
+## Cómo se desarrolla (equipo y verificación)
+
+- **Equipo:** para un ticket con varias partes, la sesión principal es la líder (única que hace commits) y dirige a `pi-dev`, `pi-tester` y `pi-reviewer` (`.claude/agents/`). Manual: skill [`equipo`](.claude/skills/equipo/SKILL.md), con la tabla de quién es dueño de cada archivo.
+- **Verificación:** skill [`verify`](.claude/skills/verify/SKILL.md) y `scripts/verify.sh rapido|completo` (unit, property, e2e, differential; sin red). `completo` antes de cada commit que toque `ml_model/`, `scraper/` o `run_pipeline.sh`.
+- **Reglas de revisión:** [REVIEW.md](REVIEW.md) y [docs/checklist-confiabilidad.md](docs/checklist-confiabilidad.md), leídos **desde la rama base** (`git show "${PI_BASE_REF:-origin/server-improvement}:REVIEW.md"`). Los checks van en PR aparte del código; `scripts/hooks/protect_checks.sh` los bloquea salvo con `PI_EDITAR_CHECKS=1` (solo la líder, en un cambio de solo checks).
+- **3 rondas:** si el mismo check sigue fallando (o el mismo hallazgo Importante sigue abierto) después de 3 intentos, se para y se escala a Mafer con el error, lo intentado y la decisión que hace falta.
+- **Sello del commit:** trailer `Verificado: <rapido|completo|ninguna> (<detalle>)`. El hook `commit-msg` (`scripts/install_githooks.sh`, una vez por clon) lo valida contra `.claude/state/ultima_verificacion.json` del mismo árbol.
+
 ## Entorno
 
-En la instancia: conda, entorno `wayakit_env` (fijo en `run_pipeline.sh:6`). `requirements.txt` no fija versiones; en la instancia: Python 3.10.20, conda en `/home/ec2-user/miniconda`, Chrome 146. [environment.yml](environment.yml) fija las versiones de la instancia (`pip freeze`, 2026-11-17); para Bedrock con `outputConfig` quizá haya que subir boto3 en F2 (local se probó con 1.43.115). Datos de la última corrida para diagnóstico: `data/f1_antes_2026-11-15/` (ignorada por git). Los scripts usan rutas relativas: correrlos desde la raíz del repo.
+Local: conda, entorno **`wayakit-price-prediction`** (`conda env create -f environment.yml`; para las pruebas, además `pip install -r requirements-dev.txt`). En la instancia: conda, entorno `wayakit_env` (fijo en `run_pipeline.sh:6`) hasta F3; si hay que recrearlo allí, `conda env create -f environment.yml -n wayakit_env` (sin `-n` se crearía `wayakit-price-prediction` y `run_pipeline.sh` no lo encontraría). `requirements.txt` no fija versiones; en la instancia: Python 3.10.20, conda en `/home/ec2-user/miniconda`, Chrome 146. [environment.yml](environment.yml) fija las versiones de la instancia (`pip freeze`, 2026-11-17); para Bedrock con `outputConfig` quizá haya que subir boto3 en F2 (local se probó con 1.43.115). Datos de la última corrida para diagnóstico: `data/f1_antes_2026-11-15/` (ignorada por git). Los scripts usan rutas relativas: correrlos desde la raíz del repo.
 
 ```bash
 python ml_model/odoo_api_products.py                     # lee Odoo → ml_model/wayakit_products.csv

@@ -3,7 +3,7 @@
 Guía práctica para operar Price Intelligence (PI). Cada sección resuelve una tarea concreta.
 Para saber *qué* existe en AWS, ver [recursos.md](recursos.md). Para saber *por qué* está así, ver [decisiones.md](decisiones.md). El plan de mejoras está en [plan.md](plan.md).
 
-Estado al 2026-11-16: la operación descrita aquí es la de **hoy** (rama `main` en la instancia). Lo que dice **Planeado (F#)** todavía no existe; el número es la fase de [plan.md](plan.md). En AWS no se ha creado ni cambiado nada para el plan.
+Estado al 2026-11-17: la operación descrita aquí es la de **hoy** (rama `server-improvement` en la instancia, inventario de F1). Lo que dice **Planeado (F#)** todavía no existe; el número es la fase de [plan.md](plan.md). En AWS no se ha creado ni cambiado nada para el plan.
 
 Los comandos de AWS se corren desde la raíz del repo, en una Mac con AWS CLI v2. Los del pipeline se corren dentro de la instancia EC2.
 
@@ -23,6 +23,14 @@ Los comandos de AWS se corren desde la raíz del repo, en una Mac con AWS CLI v2
    | Profile name | `wayakit-vdc` |
 
 3. Para entrar a la instancia se usa **SSM** (desde 2026-11-17). Instalar el [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) de la AWS CLI. Ya no hace falta la llave SSH (`wayakit-stockholm-key`).
+4. **Entorno local** (para correr pruebas y desarrollar), desde la raíz del repo:
+   ```bash
+   conda env create -f environment.yml          # crea el entorno local "wayakit-price-prediction"
+   conda activate wayakit-price-prediction
+   pip install -r requirements-dev.txt          # pytest e hypothesis
+   scripts/install_githooks.sh                  # hook commit-msg que valida el sello "Verificado:"
+   ```
+   El nombre local (`wayakit-price-prediction`) es distinto del de la instancia (`wayakit_env`, hasta F3). En la instancia nunca se usa `conda env create -f environment.yml` sin `-n wayakit_env` (ver [Correr a mano](#correr-a-mano), paso 4).
 
 ### Cada día, o cuando expire la sesión
 
@@ -175,6 +183,7 @@ Mafer confirmó que **la revisión de keywords hace falta** (los sitios no encue
    conda activate wayakit_env
    git status; git branch --show-current; git log -1 --oneline
    ```
+   Si hay que recrear el entorno en la instancia: `conda env create -f environment.yml -n wayakit_env`. Sin `-n`, `environment.yml` crea `wayakit-price-prediction` (el nombre local) y `run_pipeline.sh:6` no lo encuentra.
 5. **Correr los pasos**, siempre desde la raíz del repo (las rutas de los scripts son relativas). Es la corrida completa de `run_pipeline.sh`, paso por paso y **sin** el apagado automático:
    ```bash
    # Etapa 1
@@ -268,6 +277,28 @@ Planeado (F2): primero `create` del lote nuevo y, solo si sale bien, `unlink` de
 
 ---
 
+## Verificar un cambio antes del commit
+
+En local, con el entorno `wayakit-price-prediction` (ver [Antes de empezar](#antes-de-empezar)). Nada de esto llama a AWS, Odoo, Apify ni Bedrock. Detalle en la skill [`verify`](../.claude/skills/verify/SKILL.md); reglas en [REVIEW.md](../REVIEW.md) y [checklist-confiabilidad.md](checklist-confiabilidad.md), leídas desde la rama base.
+
+```bash
+scripts/verify.sh rapido     # unit + property, segundos
+scripts/verify.sh completo   # + e2e + differential contra origin/server-improvement, ~1.5 min
+```
+
+- `completo` necesita `data/f1_antes_2026-11-15/` (ignorada por git) y `git fetch origin`. Si faltan los datos, sale en FALLA: el commit solo puede decir `rapido`.
+- Cada corrida deja `.claude/state/ultima_verificacion.json` (modo, resultado y árbol) y una línea en `.claude/state/verificaciones.jsonl`. El hook `commit-msg` exige el trailer `Verificado: <rapido|completo|ninguna> (<detalle>)` y, para `rapido` o `completo`, un registro OK del mismo árbol. `verify.sh` registra el árbol del índice, así que el orden es `git add` de todo lo que va en el commit, luego `verify.sh` y luego `git commit`, sin tocar nada en medio. El trailer va en el último párrafo del mensaje, junto a `Co-Authored-By` si lo hay (sin línea en blanco entre los dos).
+- Los checks (`REVIEW.md`, `.claude/`, `scripts/`, `pytest.ini`, `tests/conftest.py`, los arneses de `tests/` y `docs/checklist-confiabilidad.md`) van en un PR aparte del código de producción. `scripts/hooks/protect_checks.sh` impide editarlos desde Claude Code salvo con `PI_EDITAR_CHECKS=1`, que solo pone la líder en una sesión sin equipo.
+- **Sesión de solo checks** (para cambiar checks):
+  1. Mafer crea `.claude/settings.local.json` con `{"env": {"PI_EDITAR_CHECKS": "1"}}` (archivo local, ignorado por git). Mientras exista, **no se arma equipo**, porque los compañeros heredarían el permiso.
+  2. Se cambian solo checks y docs, sin `scraper/`, `ml_model/` ni `run_pipeline.sh`. Luego `git add`, `verify.sh completo` y commit con su sello.
+  3. Mafer borra `.claude/settings.local.json` al terminar.
+- **Mientras los checks no estén en la rama base:** el gate de `TaskCompleted` compara contra `merge-base(PI_CHECKS_BASE, HEAD)`. Hasta que el PR de checks entre a `server-improvement`, todo el setup cuenta como "checks cambiados" y el gate bloquearía cualquier tarea que toque producción. Por eso, después del commit de checks y antes de arrancar un equipo, Mafer deja en `.claude/settings.local.json` solo `{"env": {"PI_CHECKS_BASE": "<sha del commit de checks>"}}` (sin `PI_EDITAR_CHECKS`). Los hooks leen el entorno de Claude Code, no el de una terminal. Cuando el PR entra a la base, se quita y vuelve el valor por defecto (`origin/server-improvement`).
+- Si `verify.sh` falla por XPASS, se arregló un bug que tenía `xfail(strict=True)`: hay que quitar ese `xfail` (lo hace `pi-tester`).
+- Si el mismo check falla 3 veces seguidas, parar y escalar a Mafer (regla de las 3 rondas).
+
+---
+
 ## Desplegar y rollback
 
 ### Hoy
@@ -330,7 +361,8 @@ Errores que ya aparecieron o que se ven en el código, y qué hacer. Las líneas
 | La etapa 1 y la etapa 2 corren a la vez (posible, no observado) | El cron de la etapa 2 es a hora fija (sábado 04:00 UTC) y no revisa si la etapa 1 sigue corriendo | Revisar `logs/pipeline_execution.log`. Planeado (F3): un solo schedule mensual |
 | **La corrida del 13–15 nov 2026 subió sugerencias a Odoo con el scraping fallido** | El scraping llegó al `timeout 30h` y salió con error, pero `competitors_complete.csv` ya tenía solo 53 filas (SACO Automotive 36, AeroSense 14, Fine Airports 3; nada de Amazon, Home ni Pets). Los pasos siguientes no revisan el error: entrenó, subió en modo full (borró las anteriores) y terminó con código 0 | Las sugerencias actuales de Odoo salen casi solo de `competitor.product`. Planeado (F2): `\|\| exit 1` por paso, mínimo de filas por fuente y subida segura |
 | `wayakit_app.log` no está en `logs/` del repo | `log_config.py:7` sube un nivel desde la raíz del repo | Buscarlo en `../logs/wayakit_app.log` |
-| Un `.joblib` no carga después de actualizar paquetes | `requirements.txt` no fija versiones de pandas, numpy ni scikit-learn | No actualizar paquetes en `wayakit_env` a mano. `environment.yml` (2026-11-17) fija las versiones de la instancia (Python 3.10.20, scikit-learn 1.7.2, pandas 2.3.3, numpy 2.2.6) |
+| Un `.joblib` no carga después de actualizar paquetes | `requirements.txt` no fija versiones de pandas, numpy ni scikit-learn | No actualizar paquetes en `wayakit_env` a mano. `environment.yml` (2026-11-17) fija las versiones de la instancia (Python 3.10.20, scikit-learn 1.7.2, pandas 2.3.3, numpy 2.2.6). Para recrearlo en la instancia: `conda env create -f environment.yml -n wayakit_env` |
+| La corrida local da otros precios que el reporte de producción | Con los datos congelados de `data/f1_antes_2026-11-15/`, la corrida local cambia 520 de 738 `predicted_price` (hasta 51.86 SAR), aunque los procesados salen iguales. Causa en investigación: CPU/BLAS, versiones de scikit-learn o numpy, o que esa corrida no fuera e25e2c9 | No comparar salidas locales contra producción. Las pruebas diferenciales comparan base contra versión nueva en la misma máquina (`scripts/verify.sh completo`). Ver `plan.md`, hallazgo 13 |
 
 ### Scraping
 

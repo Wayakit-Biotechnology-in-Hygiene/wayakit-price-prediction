@@ -187,3 +187,5 @@ chrome_profile_ml/
 
 # Datos locales (copias de la instancia para diagnóstico); nunca al repo
 data/
+.claude/state/
+.claude/settings.local.json
