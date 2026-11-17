@@ -218,7 +218,7 @@ Con la foto de F1 (`data/f1_antes_2026-11-15/`; ojo: esa corrida no trajo filas 
 5. ~~¿Cuenta de Apify?~~ La de VdC, con un plan de mayor nivel. Pendiente: tope de USD por corrida (propuesta: USD 20).
 6. ¿Alcance de Apify: Amazon solo para Pets, o también para Home y Automotive? ¿Noon en qué subindustrias?
 7. ~~¿Qué cuenta como "local"?~~ No se define a mano (ver F7).
-8. ~~¿Admin de GitHub?~~ Mafer es admin de la organización. Pendiente: el repo hoy está en una cuenta personal (`cyberialyr777/wayakit-price-prediction`), no en la organización; ¿se transfiere a la organización antes de F4? ¿El deploy necesita aprobación manual?
+8. ~~¿Admin de GitHub?~~ Mafer es admin de la organización. El repo ya está en la organización (`Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction`). Pendiente: ¿El deploy necesita aprobación manual?
 9. ~~¿Snapshot y encendido?~~ Hecho el 2026-11-17 (F1): snapshot, acceso por SSM, inventario y datos copiados a `data/f1_antes_2026-11-15/`. La instancia corre `server-improvement`, no `main`.
 11. ¿Se rebasa `pi-mejoras` sobre `server-improvement` (lo que corre en producción) o se descarta e25e2c9?
 10. ¿Qué hacemos con los restos en me-south-1 (2 roles y el secreto `wayakit/test/credentials`)? No se pudieron inventariar desde aquí.

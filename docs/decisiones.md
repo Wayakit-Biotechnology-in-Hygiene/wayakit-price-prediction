@@ -52,7 +52,7 @@ Preguntas abiertas para Mafer (numeradas como en `plan.md`, sección 4):
 2. Diseño de la revisión de keywords sin frenar la corrida mensual (propuesta en `plan.md`, sección 6).
 5. Tope de USD por corrida en Apify (propuesta: USD 20).
 6. Alcance de Apify: ¿Amazon solo para Pets, o también Home y Automotive? ¿Noon en qué subindustrias?
-8. El repo está en una cuenta personal (`cyberialyr777/...`), no en la organización de GitHub (Mafer es admin de la organización). ¿Se transfiere antes de F4? ¿El deploy necesita aprobación manual?
+8. El repo ya está en la organización de GitHub (`Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction`; el remoto local se actualizó el 2026-11-17). ¿El deploy necesita aprobación manual?
 10. ¿Qué se hace con los restos en me-south-1 (2 roles y el secreto `wayakit/test/credentials`)? No se pudieron inventariar.
 11. ¿Se rebasa `pi-mejoras` sobre `server-improvement` (lo que corre en producción) o se descarta e25e2c9?
 12. ¿Un "3X" de concentración en el título debe multiplicar el volumen? Hoy `'Detergent 3X concentrate 500 ml'` da 1500 ml (`plan.md`, hallazgo 12, bug 9).
