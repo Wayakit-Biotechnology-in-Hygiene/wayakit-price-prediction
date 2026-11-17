@@ -1,0 +1,22 @@
+# Entorno de PI tomado de `pip freeze` de la instancia el 2026-11-17 (F1). Local: conda env `wayakit-price-prediction`.
+# En la instancia el entorno todavía se llama `wayakit_env` (run_pipeline.sh:6); se renombra en el bootstrap de F3.
+# Para Bedrock con outputConfig (F2) quizá haya que subir boto3/botocore (local se probó con 1.43.115).
+name: wayakit-price-prediction
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - pandas==2.3.3
+      - numpy==2.2.6
+      - scikit-learn==1.7.2
+      - scipy==1.15.3
+      - joblib==1.5.3
+      - selenium==4.41.0
+      - webdriver-manager==4.0.2
+      - beautifulsoup4==4.14.3
+      - boto3==1.42.83
+      - botocore==1.42.83
+      - requests==2.33.1
+      - python-dotenv==1.2.2

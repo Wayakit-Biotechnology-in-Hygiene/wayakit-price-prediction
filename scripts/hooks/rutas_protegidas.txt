@@ -1,0 +1,23 @@
+# Archivos de verificación ("checks") de PI. Una ruta por línea, relativa a la raíz del repo.
+# Formatos admitidos: ruta exacta, o un directorio terminado en "/**" (todo lo que cuelga de él).
+# Las líneas vacías y las que empiezan con "#" se ignoran.
+#
+# La leen:
+#   scripts/hooks/protect_checks.sh       bloquea Edit/Write sobre estas rutas salvo con PI_EDITAR_CHECKS=1.
+#   scripts/hooks/gate_task_completed.sh  falla si un mismo cambio toca estas rutas y código de producción.
+#
+# Regla: los checks y el código se cambian en cambios separados; un cambio no puede modificar
+# las pruebas o reglas que lo juzgan. Editar este archivo también requiere PI_EDITAR_CHECKS=1.
+REVIEW.md
+pytest.ini
+docs/checklist-confiabilidad.md
+.claude/settings.json
+.claude/settings.local.json
+.claude/agents/**
+.claude/skills/**
+.claude/state/**
+scripts/**
+tests/conftest.py
+tests/e2e/_helpers.py
+tests/e2e/_pipeline_sandbox.py
+tests/differential/_harness.py
