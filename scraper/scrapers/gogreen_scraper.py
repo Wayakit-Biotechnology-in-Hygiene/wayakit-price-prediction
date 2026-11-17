@@ -29,9 +29,9 @@ class GoGreenScraper:
         return soup_element.get_text(strip=True) if soup_element else None
 
     def _set_language_to_english(self, driver):
-        # El sitio ahora corre sobre la plataforma Zid: guardar el idioma en su
-        # dialogo solo setea la cookie 'locale', asi que la ponemos directo y
-        # recargamos en vez de interactuar con la UI.
+        # The site now runs on the Zid platform: saving the language in its
+        # dialog only sets the 'locale' cookie, so we set it directly and
+        # reload instead of interacting with the UI.
         try:
             html_tag = driver.find_element(By.TAG_NAME, "html")
             if html_tag.get_attribute("lang") == "en":
@@ -64,7 +64,7 @@ class GoGreenScraper:
 
             price_tag = soup.select_one("p.product-formatted-price")
             if price_tag:
-                # el tema nuevo muestra el precio sin decimales (ej. '182')
+                # the new theme shows the price without decimals (e.g. '182')
                 price_text = re.search(r'([\d,]+(?:\.\d{1,2})?)', price_tag.get_text())
                 if price_text:
                     details['Price_SAR'] = price_text.group(1).replace(',', '')
@@ -87,7 +87,7 @@ class GoGreenScraper:
         return details
 
     def scrape(self, keyword, search_mode):
-        self._log(f"  [GoGreen Scraper] Buscando: '{keyword}' (Modo: {search_mode})")
+        self._log(f"  [GoGreen Scraper] Searching: '{keyword}' (Mode: {search_mode})")
         all_found_products = []
 
         service = ChromeService(executable_path=self.driver_path)

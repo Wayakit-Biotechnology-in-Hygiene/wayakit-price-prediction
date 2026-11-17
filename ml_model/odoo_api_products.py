@@ -22,7 +22,7 @@ def get_secret(secret_name, region_name="eu-north-1"):
             SecretId=secret_name
         )
     except ClientError as e:
-        logger.error(f"Error al obtener el secreto", exc_info=True)
+        logger.error(f"Error getting the secret", exc_info=True)
         raise e 
     else:
         if 'SecretString' in get_secret_value_response:
@@ -44,32 +44,32 @@ try:
     API_TOKEN = secrets.get('ODOO_API_TOKEN')
 
     if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, API_TOKEN]):
-        logger.error("ERROR: Faltan secretos esenciales de Odoo recuperados de AWS Secrets Manager.")
+        logger.error("ERROR: Essential Odoo secrets retrieved from AWS Secrets Manager are missing.")
         exit()
 
-    logger.info(f"Secretos cargados exitosamente desde AWS Secrets Manager para DB: {ODOO_DB}")
+    logger.info(f"Secrets loaded successfully from AWS Secrets Manager for DB: {ODOO_DB}")
 
 except Exception as e:
-    logger.error(f"ERROR CRÍTICO: No se pudieron cargar los secretos.", exc_info=True)
+    logger.error(f"CRITICAL ERROR: The secrets could not be loaded.", exc_info=True)
     exit()
 
-# Nombre del archivo de salida
+# Output file name
 OUTPUT_CSV_FILE = 'ml_model/wayakit_products.csv'
 
-# --- 2. AUTENTICACIÓN CON ODOO ---
+# --- 2. AUTHENTICATION WITH ODOO ---
 try:
     common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
     uid = common.authenticate(ODOO_DB, ODOO_USERNAME, API_TOKEN, {})
     models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
-    logger.info(f"🔑 Autenticación exitosa. User ID (uid): {uid}")
+    logger.info(f"🔑 Authentication successful. User ID (uid): {uid}")
 except Exception as e:
-    logger.error(f"🔥 ERROR de autenticación", exc_info=True)
+    logger.error(f"🔥 Authentication ERROR", exc_info=True)
     exit()
 
-# --- 3. DEFINICIÓN DE LA CONSULTA ---
+# --- 3. QUERY DEFINITION ---
 MODEL_NAME = 'product.master'
 
-# Filtros para la búsqueda (mantenidos de tu script original)
+# Search filters (kept from your original script)
 products_to_exclude = [
     'F12-Other consumables for FM',
     'P11-Other consumables for pets',
@@ -83,7 +83,7 @@ domain = [
     ['type_of_product_id.name', 'not in', products_to_exclude]
 ]
 
-# Campos a obtener del modelo 'product.master'
+# Fields to fetch from the 'product.master' model
 fields_to_get = [
     'product_id',
     'product_name',
@@ -108,9 +108,9 @@ fields_to_get = [
     'create_date',
 ]
 
-logger.info(f"\n🔎 Buscando registros en el modelo '{MODEL_NAME}'...")
+logger.info(f"\n🔎 Searching records in model '{MODEL_NAME}'...")
 
-# --- 4. EJECUCIÓN DE LA CONSULTA ---
+# --- 4. QUERY EXECUTION ---
 try:
     records = models.execute_kw(
         ODOO_DB, uid, API_TOKEN,
@@ -119,24 +119,24 @@ try:
         [domain],
         {'fields': fields_to_get}
     )
-    logger.info(f"👍 Éxito. Se encontraron {len(records)} registros.")
+    logger.info(f"👍 Success. Found {len(records)} records.")
 
 except Exception as e:
-    logger.error(f"🔥 ERROR crítico durante la consulta", exc_info=True)
+    logger.error(f"🔥 Critical ERROR during the query", exc_info=True)
     exit()
 
-# --- 5. PROCESAMIENTO DE DATOS Y EXPORTACIÓN ---
+# --- 5. DATA PROCESSING AND EXPORT ---
 if records:
-    # Convertir los registros a un DataFrame de pandas
+    # Convert the records to a pandas DataFrame
     df = pd.DataFrame(records)
     
-    # Odoo devuelve los campos Many2one como una lista [id, 'nombre'].
-    # Esta función extrae solo el nombre.
+    # Odoo returns Many2one fields as a list [id, 'name'].
+    # This function extracts only the name.
     df['type_of_product_id'] = df['type_of_product_id'].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else None)
     df['subindustry_id'] = df['subindustry_id'].apply(lambda x: x[1] if isinstance(x, list) else None)
     df['industry_id'] = df['industry_id'].apply(lambda x: x[1] if isinstance(x, list) else None)
 
-    # Mapeo de los nombres de campo de Odoo a los nombres de columna deseados en el CSV
+    # Mapping of Odoo field names to the desired column names in the CSV
     column_mapping = {
         'create_date': 'create_date',
         'product_id': 'Product_ID',
@@ -163,7 +163,7 @@ if records:
     
     df_renamed = df.rename(columns=column_mapping)
 
-    # Definir el orden final de las columnas para el archivo CSV
+    # Define the final column order for the CSV file
     final_columns_order = [
         'create_date', 'Product_ID', 'Product_Name', 'Label_Product_Name', 'Presentation', 
         'Volume_Liters', 'Pack_quantity_Units', 'Type_of_product', 'Category', 
@@ -172,17 +172,17 @@ if records:
         'Other costs', 'Unit_cost_SAR'
     ]
 
-    # Reordenar el DataFrame para que coincida con el orden solicitado
+    # Reorder the DataFrame to match the requested order
     df_final = df_renamed[final_columns_order]
     
-    # Guardar el DataFrame final en un archivo CSV
+    # Save the final DataFrame to a CSV file
     df_final.to_csv(OUTPUT_CSV_FILE, index=False, encoding='utf-8-sig')
-    logger.info(f"\n✅ ¡Éxito! El archivo '{OUTPUT_CSV_FILE}' ha sido creado con el resultado final.")
+    logger.info(f"\n✅ Success! The file '{OUTPUT_CSV_FILE}' has been created with the final result.")
 
-    logger.info("\n📊 Vista previa de las primeras 5 filas del resultado:")
+    logger.info("\n📊 Preview of the first 5 rows of the result:")
     logger.info(f"\n{df_final.head()}")
     
 else:
-    logger.warning("🤷 No se encontraron registros que coincidan con los criterios de filtrado.")
+    logger.warning("🤷 No records matching the filter criteria were found.")
 
-logger.info("\nProceso completado.")
+logger.info("\nProcess completed.")

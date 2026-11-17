@@ -4,48 +4,48 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs') # Directorio logs en la raíz del proyecto
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs') # logs directory at the project root
 LOG_FILENAME = os.path.join(LOG_DIR, 'wayakit_app.log')
 
 def setup_logging(log_level=logging.INFO):
-    """Configura el logging para la aplicación."""
+    """Configures logging for the application."""
 
-    # Crear directorio de logs si no existe
+    # Create the logs directory if it does not exist
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # Crear el logger principal
-    logger = logging.getLogger('wayakit_price_prediction') # Nombre único para tu logger
-    logger.setLevel(log_level) # Nivel mínimo de severidad a registrar
+    # Create the main logger
+    logger = logging.getLogger('wayakit_price_prediction') # Unique name for your logger
+    logger.setLevel(log_level) # Minimum severity level to log
 
-    # Evitar duplicar handlers si la función se llama múltiples veces
+    # Avoid duplicate handlers if the function is called multiple times
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # Formato de los mensajes de log
+    # Format of the log messages
     log_format = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 1. Handler para escribir en archivo (con rotación)
-    # Rotará el archivo cuando alcance 5MB, manteniendo 3 archivos de respaldo.
+    # 1. Handler to write to a file (with rotation)
+    # The file is rotated when it reaches 5MB, keeping 3 backup files.
     file_handler = RotatingFileHandler(
         LOG_FILENAME, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
     )
     file_handler.setFormatter(log_format)
     logger.addHandler(file_handler)
 
-    # 2. Handler para escribir en la consola (stdout)
+    # 2. Handler to write to the console (stdout)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_format)
     logger.addHandler(console_handler)
 
     return logger
 
-# Configurar el logger al importar el módulo
+# Configure the logger when the module is imported
 logger = setup_logging(log_level=logging.DEBUG)
 
-# Puedes añadir una función simple para obtener el logger configurado desde otros módulos
+# You can add a simple function to get the configured logger from other modules
 def get_logger():
-  """Retorna la instancia del logger configurado."""
+  """Returns the configured logger instance."""
   return logging.getLogger('wayakit_price_prediction')

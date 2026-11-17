@@ -30,9 +30,9 @@ class OfficeSupplyScraper:
         if not container:
             return None
         spans = container.select('span.ty-price-num')
-        # Filtrar spans con dígitos
+        # Filter spans with digits
         digit_spans = [s for s in spans if re.search(r'\d', s.get_text())]
-        # Caso típico: primer span icono, segundo span valor con <sup>
+        # Typical case: first span is the icon, second span is the value with <sup>
         target = None
         if len(digit_spans) >= 1:
             target = digit_spans[0]
@@ -50,7 +50,7 @@ class OfficeSupplyScraper:
         if not integer_part:
             return None
         price = f"{integer_part}.{dec}" if dec else integer_part
-        # Normalizar: asegurar 2 decimales
+        # Normalize: ensure 2 decimals
         if re.match(r'^\d+$', price):
             price = price + '.00'
         return price
@@ -110,7 +110,7 @@ class OfficeSupplyScraper:
 
 
     def scrape(self, keyword, search_mode):
-        self._log(f"  [OfficeSupply Scraper] Buscando: '{keyword}' (Modo: {search_mode})")
+        self._log(f"  [OfficeSupply Scraper] Searching: '{keyword}' (Mode: {search_mode})")
         
         search_keyword = quote(keyword)
         search_url = (

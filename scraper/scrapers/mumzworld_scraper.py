@@ -41,8 +41,8 @@ class MumzworldScraper:
         }
         try:
             driver.get(product_url)
-            # Selectores por prefijo: el hash de CSS-modules (ej. __lcVK_) cambia
-            # con cada redeploy del frontend; el prefijo de la clase no.
+            # Prefix selectors: the CSS-modules hash (e.g. __lcVK_) changes
+            # with every frontend redeploy; the class prefix does not.
             WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1[class*='ProductDetails_productName__']")))
             soup = BeautifulSoup(driver.page_source, 'html.parser')
 

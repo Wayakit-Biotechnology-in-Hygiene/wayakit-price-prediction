@@ -29,7 +29,7 @@ def get_secret(secret_name, region_name="eu-north-1"):
             SecretId=secret_name
         )
     except ClientError as e:
-        logger.error(f"Error al obtener el secreto", exc_info=True)
+        logger.error(f"Error getting the secret", exc_info=True)
         raise e 
     else:
         if 'SecretString' in get_secret_value_response:
@@ -48,33 +48,33 @@ try:
     ODOO_USERNAME = secrets.get('ODOO_USERNAME')
     API_TOKEN = secrets.get('ODOO_API_TOKEN')
     if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, API_TOKEN]):
-        logger.error("ERROR: Faltan secretos esenciales de Odoo.")
+        logger.error("ERROR: Essential Odoo secrets are missing.")
         exit()
-    logger.info(f"Secretos cargados exitosamente para DB: {ODOO_DB}")
+    logger.info(f"Secrets loaded successfully for DB: {ODOO_DB}")
 except Exception as e:
-    logger.error(f"ERROR CRÍTICO: No se pudieron cargar los secretos.", exc_info=True)
+    logger.error(f"CRITICAL ERROR: The secrets could not be loaded.", exc_info=True)
     exit()
 
 try:
     common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
     uid = common.authenticate(ODOO_DB, ODOO_USERNAME, API_TOKEN, {})
     models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
-    logger.info(f"Autenticación exitosa. User ID (uid): {uid}")
+    logger.info(f"Authentication successful. User ID (uid): {uid}")
 except Exception as e:
-    logger.error(f"ERROR de autenticación", exc_info=True)
+    logger.error(f"Authentication ERROR", exc_info=True)
     exit()
 
-parser = argparse.ArgumentParser(description="Carga sugerencias de precios a Odoo.")
+parser = argparse.ArgumentParser(description="Uploads price suggestions to Odoo.")
 parser.add_argument('--run_mode', default='partial', choices=['partial', 'full'],
-                    help="Define el modo de ejecución: 'partial' (solo añade) o 'full' (archiva, borra y añade).")
+                    help="Sets the run mode: 'partial' (only adds) or 'full' (archives, deletes and adds).")
 args = parser.parse_args()
 
 csv_file_path = 'ml_model/wayakit_prediction_report.csv'
 try:
     df_results = pd.read_csv(csv_file_path)
-    logger.info(f"Archivo CSV '{csv_file_path}' cargado. Se encontraron {len(df_results)} filas.")
+    logger.info(f"CSV file '{csv_file_path}' loaded. Found {len(df_results)} rows.")
 except FileNotFoundError:
-    logger.error(f"ERROR: El archivo '{csv_file_path}' no se encontró. No se subirá nada a Odoo.")
+    logger.error(f"ERROR: The file '{csv_file_path}' was not found. Nothing will be uploaded to Odoo.")
     exit()
 
 all_records_data = []
@@ -102,14 +102,14 @@ for index, row in df_results.iterrows():
         }
         all_records_data.append(record_data)
     except Exception as e:
-        logger.warning(f"Error al procesar la fila {index+1} (Product ID: {row.get('Product_ID', 'N/A')}). Saltando registro.", exc_info=True)
+        logger.warning(f"Error processing row {index+1} (Product ID: {row.get('Product_ID', 'N/A')}). Skipping record.", exc_info=True)
 
 if not all_records_data:
-    logger.warning("No hay registros válidos para cargar desde el CSV. Proceso finalizado.")
+    logger.warning("There are no valid records to upload from the CSV. Process finished.")
     exit()
 if args.run_mode == 'full':
-    logger.info("--- MODO EJECUCIÓN: FULL ---")
-    logger.info(f"Iniciando archivado de '{MODEL_NAME}' a '{HISTORY_MODEL_NAME}'...")
+    logger.info("--- RUN MODE: FULL ---")
+    logger.info(f"Starting archiving from '{MODEL_NAME}' to '{HISTORY_MODEL_NAME}'...")
     try:
         existing_ids = models.execute_kw(
             ODOO_DB, uid, API_TOKEN,
@@ -117,7 +117,7 @@ if args.run_mode == 'full':
         )
         
         if existing_ids:
-            logger.info(f"Se encontraron {len(existing_ids)} registros para archivar.")
+            logger.info(f"Found {len(existing_ids)} records to archive.")
             
             fields_to_archive = [
                 'product_id_str', 'product_type', 'generic_product_type', 
@@ -138,33 +138,33 @@ if args.run_mode == 'full':
                     record['original_create_date'] = record.pop('create_date')
                 records_to_create_in_history.append(record)
             
-            logger.info(f"Creando {len(records_to_create_in_history)} registros en el historial '{HISTORY_MODEL_NAME}'...")
+            logger.info(f"Creating {len(records_to_create_in_history)} records in history '{HISTORY_MODEL_NAME}'...")
             models.execute_kw(
                 ODOO_DB, uid, API_TOKEN,
                 HISTORY_MODEL_NAME, 'create', [records_to_create_in_history]
             )
-            logger.info("¡Registros archivados en historial exitosamente!")
+            logger.info("Records archived to history successfully!")
 
-            logger.info(f"Borrando {len(existing_ids)} registros antiguos de '{MODEL_NAME}'...")
+            logger.info(f"Deleting {len(existing_ids)} old records from '{MODEL_NAME}'...")
             models.execute_kw(
                 ODOO_DB, uid, API_TOKEN,
                 MODEL_NAME, 'unlink', [existing_ids]
             )
-            logger.info("¡Registros antiguos borrados exitosamente!")
+            logger.info("Old records deleted successfully!")
 
         else:
-            logger.info("No se encontraron registros existentes. No se requiere archivado.")
+            logger.info("No existing records found. No archiving required.")
 
     except Exception as e:
-        logger.error(f"ERROR CRÍTICO durante el archivado/borrado.", exc_info=True)
-        logger.error("Abortando para prevenir carga duplicada. La tabla de sugerencias puede no estar limpia.")
+        logger.error(f"CRITICAL ERROR during archiving/deletion.", exc_info=True)
+        logger.error("Aborting to prevent a duplicate upload. The suggestions table may not be clean.")
         exit(1)
 
 else:
-    logger.info("--- MODO EJECUCIÓN: PARTIAL ---")
-    logger.info("Solo se añadirán los nuevos registros (sin borrar).")
+    logger.info("--- RUN MODE: PARTIAL ---")
+    logger.info("Only the new records will be added (without deleting).")
 
-logger.info(f"\n🚀 Enviando {len(all_records_data)} registros nuevos a '{MODEL_NAME}' en una sola llamada...")
+logger.info(f"\n🚀 Sending {len(all_records_data)} new records to '{MODEL_NAME}' in a single call...")
 try:
     new_record_ids = models.execute_kw(
         ODOO_DB, uid, API_TOKEN,
@@ -173,11 +173,11 @@ try:
         [all_records_data]
     )
     
-    logger.info(f"¡Carga masiva completada con éxito!")
-    logger.info(f"   Se crearon {len(new_record_ids)} nuevos registros.")
+    logger.info(f"Bulk upload completed successfully!")
+    logger.info(f"   Created {len(new_record_ids)} new records.")
 
 except Exception as e:
-    logger.error(f"ERROR CRÍTICO durante la carga masiva", exc_info=True)
-    logger.error("   La operación falló. Ningún registro fue creado en este lote.")
+    logger.error(f"CRITICAL ERROR during the bulk upload", exc_info=True)
+    logger.error("   The operation failed. No record was created in this batch.")
     
-logger.info("\nProceso finalizado.")
+logger.info("\nProcess finished.")

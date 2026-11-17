@@ -145,11 +145,11 @@ class RelevanceAgent:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # CAMBIO 2: Se usa la URL específica para la relevancia (flash-lite).
+                # CHANGE 2: The relevance-specific URL is used (flash-lite).
                 response = requests.post(self.relevance_api_url, headers=self.headers, data=json.dumps(payload))
                 
                 if response.status_code == 429:
-                    logger.warning(f"      -> 🛑 RATE LIMIT HIT. Google dice: {response.text}")
+                    logger.warning(f"      -> 🛑 RATE LIMIT HIT. Google says: {response.text}")
                     time.sleep(60)
                     continue
 
@@ -158,7 +158,7 @@ class RelevanceAgent:
 
                 if result.get('candidates'):
                     decision = result['candidates'][0]['content']['parts'][0]['text'].strip().lower()
-                    logger.debug(f"      -> IA decision: {decision}")
+                    logger.debug(f"      -> AI decision: {decision}")
                     time.sleep(3)
                     return "yes" in decision
                 else:
@@ -183,7 +183,7 @@ class RelevanceAgent:
         if not self.api_key:
             return 0
 
-        # CAMBIO 1: El nuevo prompt que definimos arriba.
+        # CHANGE 1: The new prompt we defined above.
         prompt = f"""
 You are an expert data extractor. Your goal is to calculate the TOTAL number of wipes from a product title. You must identify the base count per pack and any multipliers (like "Pack of 2", "3 Pack", "4x", etc.) and multiply them together.
 
@@ -238,7 +238,7 @@ Title: "{product_title}"
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Se usa la URL de extracción (gemini-2.5-pro) como ya lo tenías
+                # The extraction URL (gemini-2.5-pro) is used as you already had it
                 response = requests.post(self.extraction_api_url, headers=self.headers, data=json.dumps(payload))
 
                 if response.status_code == 429:
@@ -252,9 +252,9 @@ Title: "{product_title}"
                 if result.get('candidates'):
                     text_response = result['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # CAMBIO 2: Parsear la respuesta como JSON en lugar de usar regex.
+                    # CHANGE 2: Parse the response as JSON instead of using regex.
                     try:
-                        # Limpiar la respuesta por si viene con formato de bloque de código markdown
+                        # Clean the response in case it comes formatted as a markdown code block
                         if text_response.startswith("```json"):
                             text_response = text_response.strip("```json\n").strip("`")
                         
@@ -262,8 +262,8 @@ Title: "{product_title}"
                         reasoning = data.get("reasoning", "No reasoning provided.")
                         total_units = int(data.get("total_units", 0))
 
-                        logger.debug(f"      -> IA reasoning: {reasoning}")
-                        logger.debug(f"      -> IA wipes units: {total_units}")
+                        logger.debug(f"      -> AI reasoning: {reasoning}")
+                        logger.debug(f"      -> AI wipes units: {total_units}")
                         time.sleep(3)
                         return total_units
                         
