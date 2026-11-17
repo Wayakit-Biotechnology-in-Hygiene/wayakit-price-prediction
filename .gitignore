@@ -184,3 +184,6 @@ cython_debug/
 
 # Chrome profile for Mercado Libre scraper
 chrome_profile_ml/
+
+# Datos locales (copias de la instancia para diagnóstico); nunca al repo
+data/
