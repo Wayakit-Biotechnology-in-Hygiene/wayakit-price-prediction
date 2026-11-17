@@ -35,7 +35,11 @@ logger = logging.getLogger("wayakit_price_prediction")
 
 
 class SecretError(RuntimeError):
-    """The secret could not be read or parsed. The message never contains secret values."""
+    """The secret could not be read or parsed. The message never contains secret values, and
+    it is raised without a chained cause. `aws_error_code` is the AWS error code when the read
+    failed in AWS (e.g. 'AccessDeniedException'), otherwise None."""
+
+    aws_error_code = None
 
 
 class MissingSecretKeysError(SecretError):
@@ -112,7 +116,8 @@ def get_secret(secret_name: str = SECRET_NAME, region_name: str = REGION_NAME,
 
     `client` is any object with `get_secret_value(SecretId=...)`; when None, a boto3
     `secretsmanager` client is created for `region_name` (credentials from the environment or
-    the instance role). AWS errors are re-raised as `SecretError` with the error code only.
+    the instance role). AWS errors are re-raised as `SecretError` with the error code only (in the
+    message and in `aws_error_code`) and no chained cause.
     """
     if client is None:
         import boto3  # lazy: importing this module must not require AWS
@@ -124,9 +129,11 @@ def get_secret(secret_name: str = SECRET_NAME, region_name: str = REGION_NAME,
         resp = getattr(e, "response", None)
         code = resp.get("Error", {}).get("Code") if isinstance(resp, dict) else None
         logger.error("Could not read secret '%s' (%s).", secret_name, code or type(e).__name__)
-        raise SecretError(
-            f"Could not read secret '{secret_name}': {code or type(e).__name__}"
-        ) from e
+        error = SecretError(f"Could not read secret '{secret_name}': {code or type(e).__name__}")
+        error.aws_error_code = code
+        # `from None`: the AWS message (e.g. AccessDenied) carries the role ARN and the account
+        # ID, and the callers log with logger.exception, which would print the chained cause.
+        raise error from None
     return parse_secret_response(response, secret_name)
 
 

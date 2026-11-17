@@ -92,3 +92,32 @@ def test_zero_or_several_companies_refuse_to_guess(companies):
     session = po.OdooSession(models=models, db="FAKE-db", uid=3, api_token="FAKE-token")
     with pytest.raises(po.OdooError, match="company filter is needed"):
         po.get_single_company(session)
+
+
+# --- Review P2 (d9013ee): XML-RPC calls have a timeout -------------------------------------------
+def test_default_timeout_and_transport_per_scheme():
+    import inspect
+    import xmlrpc.client
+
+    assert po.XMLRPC_TIMEOUT_S == 300
+    assert inspect.signature(po.connect).parameters["server_proxy"].default is po.server_proxy_with_timeout
+    https = po.server_proxy_with_timeout("https://odoo.example.invalid/xmlrpc/2/common")
+    http = po.server_proxy_with_timeout("http://127.0.0.1:9/xmlrpc/2/common")
+    assert isinstance(https._ServerProxy__transport, xmlrpc.client.SafeTransport)
+    assert not isinstance(http._ServerProxy__transport, xmlrpc.client.SafeTransport)
+
+
+def test_a_server_that_never_answers_times_out():
+    """Local socket only (loopback): it accepts the connection and never replies."""
+    import socket
+    import time
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        proxy = po.server_proxy_with_timeout(f"http://127.0.0.1:{port}/xmlrpc/2/common", timeout=0.5)
+        t0 = time.monotonic()
+        with pytest.raises((TimeoutError, socket.timeout)):
+            proxy.version()
+        assert time.monotonic() - t0 < 10, "the timeout did not apply"

@@ -282,8 +282,11 @@ def test_fatal_error_on_the_fallback_also_raises():
 def test_preflight_is_not_counted_and_fails_loudly():
     agent, client, _ = _agent()
     agent.preflight()
+    # Review N1 (d9013ee): preflight checks BOTH models, one 1-title call each, primary first.
     # The title counters (the failure rate) ignore it; model_calls counts every converse call.
-    assert len(client.calls) == 1
+    assert client.models_called() == [PRIMARY, FALLBACK]
+    assert client.batch_sizes() == [1, 1]
+    assert agent.stats()["model_calls"] == 2
     assert {k: v for k, v in agent.stats().items() if k != "model_calls"} == {
         k: v for k, v in ai.empty_stats().items() if k != "model_calls"}
     assert agent.failure_rate() == 0.0

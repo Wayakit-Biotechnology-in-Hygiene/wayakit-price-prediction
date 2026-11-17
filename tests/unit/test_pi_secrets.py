@@ -187,3 +187,29 @@ def test_no_secret_value_is_logged(caplog):
     with caplog.at_level(logging.DEBUG):
         ps.get_odoo_credentials(client=FakeClient(_string(FAKE)))
     _assert_no_secret_values(caplog.text)
+
+
+# --- Review P1 (d9013ee): the AWS error is not chained -------------------------------------------
+@pytest.mark.parametrize("error", [
+    ClientError({"Error": {"Code": "AccessDeniedException",
+                           "Message": "User: arn:aws:iam::000000000000:role/fake is not authorized; FAKE-token-0123456789"}},
+                "GetSecretValue"),
+    ConnectionError("FAKE-token-0123456789 arn:aws:iam::000000000000:role/fake"),
+], ids=["client-error", "other"])
+def test_secret_error_is_not_chained_and_its_traceback_is_clean(error):
+    import traceback
+
+    with pytest.raises(ps.SecretError) as exc:
+        ps.get_secret(client=FakeClient(error=error))
+    assert exc.value.__cause__ is None and exc.value.__suppress_context__ is True
+    expected_code = "AccessDeniedException" if isinstance(error, ClientError) else None
+    assert exc.value.aws_error_code == expected_code
+    text = "".join(traceback.format_exception(type(exc.value), exc.value, exc.value.__traceback__))
+    _assert_no_secret_values(text)
+    assert "arn:aws" not in text and "000000000000" not in text, text
+
+
+def test_every_secret_error_has_aws_error_code():
+    with pytest.raises(ps.SecretError) as exc:
+        ps.parse_secret_response({})
+    assert exc.value.aws_error_code is None

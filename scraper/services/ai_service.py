@@ -24,6 +24,11 @@ Errors (fail loudly, never a silent "not relevant"):
 - Both models fail for a batch: those titles count as AI failures (``is_relevant`` returns
   False, wipes return 0) and ``check_failure_rate()`` raises ``AIFailureRateExceeded`` when
   failures exceed 5 % of the titles asked.
+- ``preflight()`` calls each model once before scraping, so a permission problem on the
+  fallback does not appear hours into the run.
+- Logs and exception messages carry only the exception class, the AWS error code and
+  ``model_label()`` (for an ARN, only the part after the last '/'); never the botocore message,
+  and no exception is chained to a botocore one (ARNs with account and instance IDs).
 
 Tests inject a fake client (``client=``, an object with ``converse(**kwargs)``) and a fake
 ``sleep``; nothing here calls AWS at import time.
@@ -32,6 +37,8 @@ import json
 import os
 import random
 import time
+
+from botocore import exceptions as botocore_exceptions
 
 from log_config import get_logger
 
@@ -79,7 +86,18 @@ class RelevanceAgentError(Exception):
 
 
 class RelevanceAgentFatalError(RelevanceAgentError):
-    """Credentials, permissions or configuration: the run must stop (exit 1)."""
+    """Credentials, permissions or configuration: the run must stop (exit 1).
+
+    Always raised without chaining (``from None``): botocore messages can contain the role ARN
+    (with the account ID and the instance ID) or endpoint URLs with a model ARN, and the scrapers
+    log exceptions with ``exc_info=True``. The AWS error code and the model label are kept as
+    attributes instead.
+    """
+
+    def __init__(self, message, aws_code="", model=""):
+        super().__init__(message)
+        self.aws_code = aws_code
+        self.model = model
 
 
 class AIFailureRateExceeded(RelevanceAgentError):
@@ -293,6 +311,15 @@ def parse_items(text, n, field):
     return [values[index] for index in range(n)]
 
 
+def model_label(model_id):
+    """Model name safe for logs: for an ARN only the part after the last '/' (the account ID
+    never appears); a plain model or inference profile ID is returned as is."""
+    model_id = str(model_id or "")
+    if model_id.startswith("arn:"):
+        return model_id.rsplit("/", 1)[-1] if "/" in model_id else "<arn>"
+    return model_id
+
+
 def backoff_delay(attempt, base=BACKOFF_BASE_S, cap=BACKOFF_MAX_S, jitter=1.0):
     """Seconds to wait before retry number ``attempt`` (0-based): exponential, capped, with
     jitter in [0, 1] scaling it between half and the full value."""
@@ -301,6 +328,30 @@ def backoff_delay(attempt, base=BACKOFF_BASE_S, cap=BACKOFF_MAX_S, jitter=1.0):
     jitter = min(max(jitter, 0.0), 1.0)
     ceiling = min(cap, base * (2 ** attempt))
     return ceiling * (0.5 + 0.5 * jitter)
+
+
+# Credentials or region missing: no retry or model switch fixes them.
+_FATAL_BOTOCORE_ERRORS = (
+    botocore_exceptions.NoCredentialsError,
+    botocore_exceptions.PartialCredentialsError,
+    botocore_exceptions.NoRegionError,
+    botocore_exceptions.CredentialRetrievalError,
+    botocore_exceptions.TokenRetrievalError,
+    botocore_exceptions.SSOError,
+)
+# Network problems left after botocore's own retries: a short blip must not abort a 30 h run.
+_TRANSIENT_BOTOCORE_ERRORS = (
+    botocore_exceptions.HTTPClientError,      # ReadTimeoutError, ConnectionClosedError, ...
+    botocore_exceptions.ConnectionError,      # EndpointConnectionError, ConnectTimeoutError, ...
+    botocore_exceptions.IncompleteReadError,
+)
+_FATAL_ERROR_NAMES = frozenset(cls.__name__ for cls in _FATAL_BOTOCORE_ERRORS) | {
+    "UnauthorizedSSOTokenError", "SSOTokenLoadError",
+}
+_TRANSIENT_ERROR_NAMES = frozenset(cls.__name__ for cls in _TRANSIENT_BOTOCORE_ERRORS) | {
+    "ReadTimeoutError", "ConnectTimeoutError", "EndpointConnectionError", "ConnectionClosedError",
+    "ProxyConnectionError", "ResponseStreamingError",
+}
 
 
 def error_code(error):
@@ -325,12 +376,15 @@ def classify_error(error):
         if code in TRANSIENT_ERROR_CODES:
             return "transient"
         return "model"
-    name = type(error).__name__
-    if name in {"NoCredentialsError", "PartialCredentialsError", "NoRegionError",
-                "CredentialRetrievalError", "UnauthorizedSSOTokenError", "SSOTokenLoadError"}:
+    if isinstance(error, _FATAL_BOTOCORE_ERRORS):
         return "fatal"
-    if name in {"ReadTimeoutError", "ConnectTimeoutError", "EndpointConnectionError",
-                "ConnectionClosedError"}:
+    if isinstance(error, _TRANSIENT_BOTOCORE_ERRORS):
+        return "transient"
+    # Same rules by class name, for errors that do not inherit from botocore (test fakes).
+    name = type(error).__name__
+    if name in _FATAL_ERROR_NAMES:
+        return "fatal"
+    if name in _TRANSIENT_ERROR_NAMES:
         return "transient"
     return "fatal"
 
@@ -352,31 +406,33 @@ def create_bedrock_client(region_name=REGION_NAME):
     """bedrock-runtime client with the instance credentials. Raises ``RelevanceAgentFatalError``
     if there are no credentials or the client cannot be created (no AWS call is made here;
     on EC2 the credentials come from the instance metadata)."""
+    # The fatal errors are raised outside the "except" blocks so that neither __cause__ nor
+    # __context__ keeps the botocore exception (its message can contain ARNs).
+    has_credentials, failure = False, None
     try:
         import boto3
         from botocore.config import Config
 
         session = boto3.session.Session(region_name=region_name)
-        if session.get_credentials() is None:
-            raise RelevanceAgentFatalError(
-                "No AWS credentials for Bedrock (instance role or profile). The run cannot "
-                "decide relevance."
+        has_credentials = session.get_credentials() is not None
+        if has_credentials:
+            return session.client(
+                "bedrock-runtime",
+                region_name=region_name,
+                config=Config(
+                    read_timeout=READ_TIMEOUT_S,
+                    connect_timeout=CONNECT_TIMEOUT_S,
+                    retries={"max_attempts": BOTOCORE_MAX_ATTEMPTS, "mode": "adaptive"},
+                ),
             )
-        return session.client(
-            "bedrock-runtime",
-            region_name=region_name,
-            config=Config(
-                read_timeout=READ_TIMEOUT_S,
-                connect_timeout=CONNECT_TIMEOUT_S,
-                retries={"max_attempts": BOTOCORE_MAX_ATTEMPTS, "mode": "adaptive"},
-            ),
-        )
-    except RelevanceAgentFatalError:
-        raise
     except Exception as error:
-        raise RelevanceAgentFatalError(
-            f"Could not create the Bedrock client ({type(error).__name__})"
-        ) from error
+        failure = type(error).__name__
+    if failure is not None:
+        raise RelevanceAgentFatalError(f"Could not create the Bedrock client ({failure})")
+    raise RelevanceAgentFatalError(
+        "No AWS credentials for Bedrock (instance role or profile). The run cannot "
+        "decide relevance."
+    )
 
 
 class RelevanceAgent:
@@ -399,7 +455,8 @@ class RelevanceAgent:
         self._stats = empty_stats()
         self.client = client if client is not None else create_bedrock_client(region_name)
         logger.info(
-            f"Relevance AI on Bedrock: primary '{self.primary_model}', fallback '{self.fallback_model}'."
+            f"Relevance AI on Bedrock: primary '{model_label(self.primary_model)}', "
+            f"fallback '{model_label(self.fallback_model)}'."
         )
 
     # --- Public API ---------------------------------------------------------------------------
@@ -460,16 +517,32 @@ class RelevanceAgent:
             raise AIFailureRateExceeded(failures, total, threshold)
 
     def preflight(self):
-        """One tiny relevance call before scraping starts, so missing permissions or a wrong
-        model ID stop the run in seconds instead of after hours of Selenium. Not counted in
-        the stats. Raises ``RelevanceAgentFatalError`` if neither model answers."""
-        if self._ask_models("relevance", ["Glass cleaner spray 500 ml"], "glass cleaner") is None:
-            raise self._fatal(RelevanceAgentFatalError(
-                "Bedrock preflight failed on both models; see the previous warnings."
-            ))
-        logger.info("Bedrock preflight OK.")
+        """One tiny relevance call to EACH model (primary and fallback) before scraping starts,
+        so missing permissions or a wrong model ID stop the run in seconds instead of after hours
+        of Selenium (the fallback may only be needed hours later). Not counted in the title stats
+        (``model_calls`` does count them). Raises ``RelevanceAgentFatalError`` if any model fails."""
+        for model_id in self._models():
+            failure = None
+            try:
+                self._call_with_backoff(model_id, "relevance", ["Glass cleaner spray 500 ml"],
+                                        "glass cleaner")
+            except _ModelFailure as model_failure:
+                failure = str(model_failure)
+            if failure is not None:
+                label = model_label(model_id)
+                logger.critical(f"Bedrock preflight failed on '{label}': {failure}")
+                raise self._fatal(RelevanceAgentFatalError(
+                    f"Bedrock preflight failed on '{label}': {failure}", model=label,
+                ))
+        logger.info("Bedrock preflight OK on every model.")
 
     # --- Internals -----------------------------------------------------------------------------
+
+    def _models(self):
+        models = [self.primary_model]
+        if self.fallback_model and self.fallback_model != self.primary_model:
+            models.append(self.fallback_model)
+        return models
 
     def _fatal(self, error):
         self.fatal_error = error
@@ -478,7 +551,11 @@ class RelevanceAgent:
     def _answer(self, task, titles, query, cache, key_of):
         """Answers per title (None = failed) using the cache and batches of unique titles."""
         if self.fatal_error is not None:
-            raise RelevanceAgentFatalError(f"Relevance agent stopped earlier: {self.fatal_error}")
+            raise RelevanceAgentFatalError(
+                f"Relevance agent stopped earlier: {self.fatal_error}",
+                aws_code=getattr(self.fatal_error, "aws_code", ""),
+                model=getattr(self.fatal_error, "model", ""),
+            )
         answers = [None] * len(titles)
         pending = {}  # title -> positions, in first-seen order
         for position, title in enumerate(titles):
@@ -501,15 +578,13 @@ class RelevanceAgent:
 
     def _ask_models(self, task, titles, query):
         """Values for the batch from the primary or, if it fails, the fallback; None if both fail."""
-        models = [self.primary_model]
-        if self.fallback_model and self.fallback_model != self.primary_model:
-            models.append(self.fallback_model)
-        for position, model_id in enumerate(models):
+        for position, model_id in enumerate(self._models()):
             try:
                 values = self._call_with_backoff(model_id, task, titles, query)
             except _ModelFailure as failure:
                 logger.warning(
-                    f"      -> Bedrock {task} batch of {len(titles)} failed on '{model_id}': {failure}"
+                    f"      -> Bedrock {task} batch of {len(titles)} failed on "
+                    f"'{model_label(model_id)}': {failure}"
                 )
                 continue
             if position > 0:
@@ -521,34 +596,44 @@ class RelevanceAgent:
     def _call_with_backoff(self, model_id, task, titles, query):
         field = _TASKS[task][3]
         request = build_converse_request(model_id, task, titles, query)
+        label = model_label(model_id)
         for attempt in range(self.transient_attempts):
             self._stats["model_calls"] += 1
+            # Only the class name and the AWS code of an error are kept: never str(error), and the
+            # raise happens outside the "except" block (no __cause__ or __context__), because
+            # botocore messages can carry ARNs, account and instance IDs, and URLs.
+            kind = code = description = None
+            response = None
             try:
                 response = self.client.converse(**request)
             except Exception as error:
                 kind = classify_error(error)
-                description = f"{type(error).__name__} {error_code(error)}".strip()
-                if kind == "fatal":
-                    logger.critical(f"Bedrock fatal error on '{model_id}': {description}")
-                    raise self._fatal(RelevanceAgentFatalError(
-                        f"Bedrock error on '{model_id}': {description}"
-                    )) from error
-                if kind == "model":
-                    raise _ModelFailure(description) from error
+                code = error_code(error)
+                description = f"{type(error).__name__} {code}".strip()
+            if kind == "fatal":
+                logger.critical(f"Bedrock fatal error on '{label}': {description}")
+                raise self._fatal(RelevanceAgentFatalError(
+                    f"Bedrock error on '{label}': {description}", aws_code=code, model=label,
+                ))
+            if kind == "model":
+                raise _ModelFailure(description)
+            if kind == "transient":
                 if attempt + 1 >= self.transient_attempts:
-                    raise _ModelFailure(f"{description} after {self.transient_attempts} attempts") from error
+                    raise _ModelFailure(f"{description} after {self.transient_attempts} attempts")
                 delay = backoff_delay(attempt, jitter=self._rng.random())
                 logger.warning(
-                    f"      -> Bedrock transient error on '{model_id}' ({description}); "
+                    f"      -> Bedrock transient error on '{label}' ({description}); "
                     f"retrying in {delay:.1f} s"
                 )
                 self._sleep(delay)
                 continue
+            invalid = None
             try:
                 if isinstance(response, dict) and response.get("stopReason") == "max_tokens":
                     raise InvalidModelResponse("answer cut by maxTokens")
                 return parse_items(response_text(response), len(titles), field)
-            except InvalidModelResponse as invalid:
-                # A malformed answer is not retried on the same model: the fallback is tried.
-                raise _ModelFailure(f"invalid answer: {invalid}") from invalid
+            except InvalidModelResponse as error:
+                invalid = str(error)
+            # A malformed answer is not retried on the same model: the fallback is tried.
+            raise _ModelFailure(f"invalid answer: {invalid}")
         raise _ModelFailure("no attempts left")  # unreachable with transient_attempts >= 1

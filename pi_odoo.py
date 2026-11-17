@@ -16,6 +16,38 @@ from typing import Any, Callable
 
 logger = logging.getLogger("wayakit_price_prediction")
 
+# Socket timeout for every XML-RPC call. Without it a hung call (e.g. a create that never
+# answers) blocks until `timeout 1h` kills the process. Creating a full batch takes well under it.
+XMLRPC_TIMEOUT_S = 300
+
+
+class _TimeoutTransport(xmlrpc.client.Transport):
+    def __init__(self, timeout: float, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self._timeout  # read by http.client when it opens the socket
+        return conn
+
+
+class _TimeoutSafeTransport(xmlrpc.client.SafeTransport):
+    def __init__(self, timeout: float, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self._timeout
+        return conn
+
+
+def server_proxy_with_timeout(url: str, timeout: float = XMLRPC_TIMEOUT_S) -> xmlrpc.client.ServerProxy:
+    """`xmlrpc.client.ServerProxy` whose socket operations time out after `timeout` seconds."""
+    transport_cls = _TimeoutSafeTransport if url.lower().startswith("https") else _TimeoutTransport
+    return xmlrpc.client.ServerProxy(url, transport=transport_cls(timeout))
+
 
 class OdooError(RuntimeError):
     """Odoo could not be used safely (authentication failed, ambiguous company, ...)."""
@@ -38,7 +70,7 @@ class OdooSession:
 
 
 def connect(credentials: Any,
-            server_proxy: Callable[[str], Any] = xmlrpc.client.ServerProxy) -> OdooSession:
+            server_proxy: Callable[[str], Any] = server_proxy_with_timeout) -> OdooSession:
     """Authenticates against Odoo and returns an `OdooSession`.
 
     `credentials` has `url`, `db`, `username` and `api_token` (`pi_secrets.OdooCredentials`).

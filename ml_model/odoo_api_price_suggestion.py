@@ -7,14 +7,20 @@ Modes:
 - `--run_mode partial` (default): creates the new records; deletes nothing.
 - `--run_mode full`: replaces the table without ever leaving it empty:
     1. reads the IDs of the current suggestions and saves them to
-       logs/odoo_previous_suggestion_ids.json;
-    2. creates the new batch (one call: Odoo creates all or none). If it fails, exit 1 and the
-       previous suggestions are untouched;
-    3. archives the PREVIOUS IDs only (read + create in `product.price.suggestion.history`) and
-       unlinks the PREVIOUS IDs only. If this fails, exit 1: the table has old and new rows,
-       and the old IDs stay in the JSON file for `--cleanup-previous`.
-- `--cleanup-previous`: finishes step 3 from the JSON file (skips the archive if it was
-  already done), then deletes the file.
+       logs/odoo_previous_suggestion_ids.json (`ids`, no `created_ids` yet);
+    2. creates the new batch (one call: Odoo creates all or none). If it fails, exit 1;
+    3. as soon as the create returns, writes the new IDs to the file (`created_ids`): from then
+       on the file proves that a new batch exists;
+    4. checks that the created IDs exist, archives the PREVIOUS IDs only (read + create in
+       `product.price.suggestion.history`) and unlinks the PREVIOUS IDs only. If this fails,
+       exit 1: the table has old and new rows, and the file stays for `--cleanup-previous`.
+- `--cleanup-previous`: finishes step 4 from the file (skips the archive if it was already
+  done), then deletes the file. It refuses (exit 1, deletes nothing) if the file has no
+  `created_ids` or those records no longer exist: then the previous suggestions may be the
+  only ones left (e.g. the process was killed during the create).
+- A full upload that finds a file WITHOUT `created_ids` (killed before step 3) deletes it and
+  starts again: it re-reads every current ID, so whatever that create did is replaced too. A file
+  WITH `created_ids` means a cleanup is pending: the upload refuses until `--cleanup-previous`.
 
 Before any write the script checks that the Odoo user sees exactly one company (the PI
 database is KSA only); if it sees more, it exits 1: a company filter is needed, not a guess.
@@ -166,14 +172,19 @@ def history_records(old_records: list) -> list:
 
 # --- Previous IDs file ------------------------------------------------------------------------
 
-def save_previous_ids(path: str, ids: list, archived: bool = False) -> None:
-    """Writes the pending-cleanup file atomically (temp file + rename)."""
+def save_previous_ids(path: str, ids: list, archived: bool = False, created_ids: list = None) -> None:
+    """Writes the pending-cleanup file atomically (temp file + rename).
+
+    `ids` are the previous suggestions to remove; `created_ids` (None until the create returns)
+    are the new batch that replaces them. Without `created_ids` nothing may be unlinked.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = {
         'model': MODEL_NAME,
         'saved_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         'archived': archived,
         'ids': sorted(int(i) for i in ids),
+        'created_ids': None if created_ids is None else sorted(int(i) for i in created_ids),
     }
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
@@ -184,9 +195,29 @@ def save_previous_ids(path: str, ids: list, archived: bool = False) -> None:
 def load_previous_ids(path: str) -> dict:
     with open(path, encoding='utf-8') as f:
         payload = json.load(f)
-    if payload.get('model') != MODEL_NAME or not isinstance(payload.get('ids'), list):
+    if payload.get('model') != MODEL_NAME or not isinstance(payload.get('ids'), list) \
+            or not isinstance(payload.get('created_ids'), (list, type(None))):
         raise UploadError(f"'{path}' is not a previous-suggestions file for '{MODEL_NAME}'.")
     return payload
+
+
+def check_new_batch_exists(session: 'OdooSession', created_ids: list, ids_file: str) -> None:
+    """Refuses (UploadError) to delete the previous suggestions unless the new batch is recorded
+    in `ids_file` and every one of its records still exists in Odoo."""
+    if not created_ids:
+        raise UploadError(
+            f"'{ids_file}' has no created_ids: the new batch was never confirmed (the upload was "
+            f"probably killed during the create), so the previous suggestions may be the only ones. "
+            f"Not deleting anything. Run the full upload again: it discards this file and replaces "
+            f"every current suggestion."
+        )
+    found = session.execute(MODEL_NAME, 'search_count', [['id', 'in', list(created_ids)]])
+    if found != len(created_ids):
+        raise UploadError(
+            f"Only {found} of the {len(created_ids)} new suggestions listed in '{ids_file}' exist in "
+            f"'{MODEL_NAME}'. Not deleting the previous ones. Check the table in Odoo; when it is "
+            f"understood, run the full upload again (after deleting '{ids_file}')."
+        )
 
 
 # --- Odoo steps -------------------------------------------------------------------------------
@@ -200,10 +231,14 @@ def confirm_company(session: 'OdooSession') -> str:
 
 
 def archive_and_unlink(session: 'OdooSession', previous_ids: list, ids_file: str,
-                       already_archived: bool = False) -> int:
-    """Archives (unless `already_archived`) and unlinks ONLY `previous_ids`. Returns how many
-    records were removed. Updates `ids_file` after archiving so a retry does not archive twice,
-    and deletes it when done."""
+                       created_ids: list, already_archived: bool = False) -> int:
+    """Archives (unless `already_archived`) and unlinks ONLY `previous_ids`, after checking that
+    the new batch `created_ids` exists (`check_new_batch_exists`). Returns how many records were
+    removed. Updates `ids_file` after archiving so a retry does not archive twice, and deletes it
+    when done."""
+    check_new_batch_exists(session, created_ids, ids_file)
+    if set(created_ids) & set(previous_ids):
+        raise UploadError("New and previous IDs overlap; refusing to delete anything.")
     old_records = session.execute(MODEL_NAME, 'read', list(previous_ids), fields=FIELDS_TO_ARCHIVE)
     existing_ids = sorted(r['id'] for r in old_records)
     if len(existing_ids) != len(previous_ids):
@@ -213,7 +248,7 @@ def archive_and_unlink(session: 'OdooSession', previous_ids: list, ids_file: str
     if existing_ids and not already_archived:
         logger.info(f"Archiving {len(old_records)} previous records to '{HISTORY_MODEL_NAME}'...")
         session.execute(HISTORY_MODEL_NAME, 'create', history_records(old_records))
-        save_previous_ids(ids_file, existing_ids, archived=True)
+        save_previous_ids(ids_file, existing_ids, archived=True, created_ids=created_ids)
         logger.info("Previous records archived.")
 
     if existing_ids:
@@ -239,10 +274,17 @@ def upload(session: 'OdooSession', records: list, run_mode: str,
     previous_ids = []
     if run_mode == 'full':
         if os.path.exists(ids_file):
-            raise UploadError(
-                f"'{ids_file}' exists: a previous full upload did not finish its cleanup. Run "
-                f"'python ml_model/odoo_api_price_suggestion.py --cleanup-previous' first. Nothing uploaded."
-            )
+            if load_previous_ids(ids_file).get('created_ids'):
+                raise UploadError(
+                    f"'{ids_file}' exists: a previous full upload created its batch but did not finish "
+                    f"its cleanup. Run 'python ml_model/odoo_api_price_suggestion.py --cleanup-previous' "
+                    f"first. Nothing uploaded."
+                )
+            # Killed before the create was confirmed: its new batch, if Odoo committed it, is
+            # among the current IDs read below, so this run replaces it too.
+            logger.warning(f"'{ids_file}' from an interrupted upload has no created_ids; discarding it. "
+                           f"Every current suggestion is re-read and replaced by this upload.")
+            os.remove(ids_file)
         previous_ids = session.execute(MODEL_NAME, 'search', [])
         logger.info(f"Found {len(previous_ids)} current suggestions in '{MODEL_NAME}'.")
         if previous_ids:
@@ -254,19 +296,22 @@ def upload(session: 'OdooSession', records: list, run_mode: str,
         new_ids = session.execute(MODEL_NAME, 'create', records)
     except Exception as e:
         if previous_ids:
-            os.remove(ids_file)  # nothing to clean up: the old records are still the only ones
+            os.remove(ids_file)  # no created_ids: nothing may be deleted on its account
         raise UploadError(
-            f"Creating the new suggestions failed ({type(e).__name__}). No record was created and "
-            f"the previous suggestions are untouched."
+            f"Creating the new suggestions failed ({type(e).__name__}). The previous suggestions "
+            f"were not touched. Odoo creates all or none; after a timeout or a lost connection it "
+            f"may still have created them: the next full upload replaces every current suggestion "
+            f"either way."
         ) from e
     new_ids = new_ids if isinstance(new_ids, list) else [new_ids]
     logger.info(f"Created {len(new_ids)} new records.")
 
     if run_mode == 'full' and previous_ids:
-        if set(new_ids) & set(previous_ids):
-            raise UploadError("New and previous IDs overlap; refusing to delete anything.")
         try:
-            removed = archive_and_unlink(session, previous_ids, ids_file)
+            save_previous_ids(ids_file, previous_ids, created_ids=new_ids)
+            removed = archive_and_unlink(session, previous_ids, ids_file, new_ids)
+        except UploadError:
+            raise  # already says what state Odoo is in and what to do
         except Exception as e:
             raise UploadError(
                 f"The new suggestions were created, but archiving/deleting the previous ones failed "
@@ -278,12 +323,14 @@ def upload(session: 'OdooSession', records: list, run_mode: str,
 
 
 def cleanup_previous(session: 'OdooSession', ids_file: str = PREVIOUS_IDS_FILE) -> int:
-    """`--cleanup-previous`: archives and unlinks the IDs stored by a failed full upload."""
+    """`--cleanup-previous`: archives and unlinks the IDs stored by a full upload whose cleanup
+    failed. Refuses (UploadError, nothing deleted) if the file has no `created_ids` or the new
+    batch no longer exists in Odoo (`check_new_batch_exists`)."""
     payload = load_previous_ids(ids_file)
     confirm_company(session)
     logger.info(f"Cleaning up {len(payload['ids'])} previous suggestions from '{ids_file}' "
                 f"(already archived: {payload.get('archived', False)}).")
-    return archive_and_unlink(session, payload['ids'], ids_file,
+    return archive_and_unlink(session, payload['ids'], ids_file, payload.get('created_ids'),
                               already_archived=bool(payload.get('archived', False)))
 
 

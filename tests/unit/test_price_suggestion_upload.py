@@ -50,6 +50,8 @@ class FakeOdoo:
         self.history = {}
         self.fail = set(fail)
         self.calls = []
+        self.ids_file = None   # if set, the IDs file content is snapshotted at every call
+        self.file_at = []      # (model, method, parsed file or None), one per call
 
     def _insert(self, table, rec):
         self.next_id += 1
@@ -58,6 +60,9 @@ class FakeOdoo:
 
     def execute_kw(self, db, uid, token, model, method, args, kwargs=None):
         self.calls.append((model, method))
+        if self.ids_file is not None:
+            content = json.loads(self.ids_file.read_text(encoding="utf-8")) if self.ids_file.exists() else None
+            self.file_at.append((model, method, content))
         if (model, method) in self.fail:
             raise OdooDown(f"fake failure on {model}.{method}")
         if model == "res.company" and method == "search_read":
@@ -68,6 +73,10 @@ class FakeOdoo:
             return sorted(table)
         if method == "create":
             return [self._insert(table, r) for r in args[0]]
+        if method == "search_count":
+            [[field, op, ids]] = args[0]
+            assert (field, op) == ("id", "in") and kwargs == {}, (args, kwargs)
+            return sum(1 for i in ids if i in table)
         if method == "read":
             return [{"id": i, **{f: table[i].get(f) for f in kwargs["fields"]}} for i in args[0] if i in table]
         if method == "unlink":
@@ -119,8 +128,8 @@ def test_full_mode_creates_first_then_archives_and_unlinks_only_the_old_ids(repo
     old_ids = sorted(odoo.table)
     old = {i: dict(r) for i, r in odoo.table.items()}
     assert _main(report([_row(i) for i in range(5)]), ids_file, "--run_mode", "full", odoo=odoo) == 0
-    assert odoo.calls == [("res.company", "search_read"), (SUG, "search"), (SUG, "create"), (SUG, "read"),
-                          (HIST, "create"), (SUG, "unlink")]
+    assert odoo.calls == [("res.company", "search_read"), (SUG, "search"), (SUG, "create"),
+                          (SUG, "search_count"), (SUG, "read"), (HIST, "create"), (SUG, "unlink")]
     assert sorted(r["product_id_str"] for r in odoo.table.values()) == [f"FP-{i:03d}" for i in range(5)]
     assert not set(odoo.table) & set(old_ids)
     # History: every old record once, create_date → original_create_date, no id.
@@ -154,6 +163,7 @@ def test_cleanup_failure_exits_1_keeps_the_ids_file_and_cleanup_previous_finishe
     assert len(odoo.table) == 3 + 4, "old and new rows: the table is never left empty"
     payload = json.loads(ids_file.read_text(encoding="utf-8"))
     assert payload["ids"] == old_ids and payload["model"] == SUG
+    assert payload["created_ids"] == sorted(set(odoo.table) - set(old_ids)), "the new batch is recorded"
     assert payload["archived"] is (failing == (SUG, "unlink"))
 
     # Another full upload refuses to start while the cleanup is pending.
@@ -301,3 +311,149 @@ def test_load_previous_ids_rejects_other_files(tmp_path):
     p.write_text(json.dumps({"model": "res.partner", "ids": [1]}))
     with pytest.raises(up.UploadError):
         up.load_previous_ids(str(p))
+
+
+
+# --- Review I2 (d9013ee): never let --cleanup-previous empty the table ---------------------------
+def _ids_payload(ids, archived=False, **extra):
+    return {"model": SUG, "saved_at_utc": "2026-11-17 04:00:00", "archived": archived, "ids": sorted(ids), **extra}
+
+
+@pytest.mark.parametrize("created", ["missing", None, []], ids=["key-missing", "null", "empty"])
+def test_cleanup_refuses_when_the_new_batch_was_never_confirmed(report, ids_file, created):
+    """Upload killed between saving the IDs and the create: only the old suggestions exist."""
+    odoo = FakeOdoo(existing=3)
+    before = {i: dict(r) for i, r in odoo.table.items()}
+    extra = {} if created == "missing" else {"created_ids": created}
+    ids_file.parent.mkdir(parents=True, exist_ok=True)
+    ids_file.write_text(json.dumps(_ids_payload(sorted(odoo.table), **extra)), encoding="utf-8")
+    content = ids_file.read_text(encoding="utf-8")
+    assert _main(report([_row(1)]), ids_file, "--cleanup-previous", odoo=odoo) == 1
+    assert odoo.calls == [("res.company", "search_read")], "no Odoo call beyond the company check"
+    assert odoo.table == before and odoo.history == {}
+    assert ids_file.read_text(encoding="utf-8") == content, "the file is left as it was"
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_cleanup_refuses_when_created_ids_no_longer_exist(report, ids_file, archived):
+    odoo = FakeOdoo(existing=3)
+    old = sorted(odoo.table)
+    new_id = odoo._insert(odoo.table, {"product_id_str": "NEW-1"})
+    up.save_previous_ids(str(ids_file), old, archived=archived, created_ids=[new_id, 99999])  # 99999 is gone
+    before = {i: dict(r) for i, r in odoo.table.items()}
+    assert _main(report([_row(1)]), ids_file, "--cleanup-previous", odoo=odoo) == 1
+    assert odoo.calls == [("res.company", "search_read"), (SUG, "search_count")]
+    assert odoo.table == before and odoo.history == {} and ids_file.exists()
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_cleanup_with_a_confirmed_batch_finishes(report, ids_file, archived):
+    odoo = FakeOdoo(existing=3)
+    old = sorted(odoo.table)
+    new_ids = [odoo._insert(odoo.table, {"product_id_str": f"NEW-{i}"}) for i in range(2)]
+    up.save_previous_ids(str(ids_file), old, archived=archived, created_ids=new_ids)
+    assert _main(report([_row(1)]), ids_file, "--cleanup-previous", odoo=odoo) == 0
+    expected = [("res.company", "search_read"), (SUG, "search_count"), (SUG, "read")]
+    expected += [] if archived else [(HIST, "create")]
+    assert odoo.calls == expected + [(SUG, "unlink")]
+    assert sorted(odoo.table) == sorted(new_ids)
+    assert len(odoo.history) == (0 if archived else 3)
+    assert not ids_file.exists()
+
+
+def test_cleanup_when_the_old_ids_are_already_gone_only_removes_the_file(report, ids_file):
+    odoo = FakeOdoo(existing=0)
+    new_ids = [odoo._insert(odoo.table, {"product_id_str": "NEW-1"})]
+    up.save_previous_ids(str(ids_file), [5, 6], created_ids=new_ids)
+    assert _main(report([_row(1)]), ids_file, "--cleanup-previous", odoo=odoo) == 0
+    assert odoo.calls == [("res.company", "search_read"), (SUG, "search_count"), (SUG, "read")]
+    assert sorted(odoo.table) == new_ids and odoo.history == {} and not ids_file.exists()
+
+
+def test_cleanup_refuses_overlapping_created_and_previous_ids(report, ids_file):
+    odoo = FakeOdoo(existing=2)
+    old = sorted(odoo.table)
+    up.save_previous_ids(str(ids_file), old, created_ids=[old[0]])
+    assert _main(report([_row(1)]), ids_file, "--cleanup-previous", odoo=odoo) == 1
+    assert odoo.writes() == [] and (HIST, "create") not in odoo.calls and ids_file.exists()
+
+
+def test_full_flow_records_created_ids_before_archiving(report, ids_file):
+    odoo = FakeOdoo(existing=3)
+    old = sorted(odoo.table)
+    odoo.ids_file = ids_file
+    assert _main(report([_row(i) for i in range(4)]), ids_file, "--run_mode", "full", odoo=odoo) == 0
+    new_ids = sorted(odoo.table)
+    seen = {(mdl, meth): content for mdl, meth, content in odoo.file_at}
+    # Before the create: previous IDs saved, no created_ids yet.
+    assert seen[(SUG, "create")]["ids"] == old and seen[(SUG, "create")]["created_ids"] is None
+    # From the existence check on, created_ids is on disk; archived only after the history create.
+    for call in ((SUG, "search_count"), (SUG, "read"), (HIST, "create")):
+        assert seen[call]["created_ids"] == new_ids, call
+        assert seen[call]["archived"] is False, call
+    assert seen[(SUG, "unlink")]["archived"] is True and seen[(SUG, "unlink")]["created_ids"] == new_ids
+    assert not ids_file.exists()
+
+
+def test_full_flow_with_a_missing_new_batch_refuses_before_archiving(report, ids_file):
+    """If Odoo does not see the new records right after the create, nothing old is touched."""
+    odoo = FakeOdoo(existing=3)
+    real = odoo.execute_kw
+
+    def lying_count(db, uid, token, model, method, args, kwargs=None):
+        if method == "search_count":
+            odoo.calls.append((model, method))
+            return 0
+        return real(db, uid, token, model, method, args, kwargs)
+
+    odoo.execute_kw = lying_count
+    assert _main(report([_row(i) for i in range(2)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    assert (SUG, "read") not in odoo.calls and (SUG, "unlink") not in odoo.calls and odoo.history == {}
+    assert json.loads(ids_file.read_text())["created_ids"], "kept for --cleanup-previous"
+
+
+def test_full_upload_refuses_while_a_confirmed_batch_awaits_cleanup(report, ids_file):
+    odoo = FakeOdoo(existing=3)
+    up.save_previous_ids(str(ids_file), sorted(odoo.table), created_ids=[500])
+    content = ids_file.read_text(encoding="utf-8")
+    assert _main(report([_row(1)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    assert odoo.calls == [("res.company", "search_read")]
+    assert ids_file.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.parametrize("created", ["missing", None])
+def test_full_upload_discards_an_unconfirmed_stale_file_and_replaces_everything(report, ids_file, created):
+    """Killed before/while creating: the next full run reads ALL current IDs (incl. any batch the
+    killed create committed) and replaces them."""
+    odoo = FakeOdoo(existing=2)
+    stray = odoo._insert(odoo.table, {"product_id_str": "BATCH-OF-KILLED-RUN"})
+    extra = {} if created == "missing" else {"created_ids": None}
+    ids_file.parent.mkdir(parents=True, exist_ok=True)
+    ids_file.write_text(json.dumps(_ids_payload(sorted(set(odoo.table) - {stray}), **extra)), encoding="utf-8")
+    assert _main(report([_row(i) for i in range(3)]), ids_file, "--run_mode", "full", odoo=odoo) == 0
+    assert sorted(r["product_id_str"] for r in odoo.table.values()) == ["FP-000", "FP-001", "FP-002"]
+    assert len(odoo.history) == 3 and not ids_file.exists()
+
+
+def test_malformed_ids_file_refuses_the_full_upload(report, ids_file):
+    odoo = FakeOdoo(existing=1)
+    ids_file.parent.mkdir(parents=True, exist_ok=True)
+    ids_file.write_text(json.dumps(_ids_payload([1], created_ids="not-a-list")), encoding="utf-8")
+    assert _main(report([_row(1)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    assert odoo.writes() == []
+
+
+def test_partial_upload_ignores_the_ids_file(report, ids_file):
+    odoo = FakeOdoo(existing=1)
+    up.save_previous_ids(str(ids_file), sorted(odoo.table), created_ids=[500])
+    assert _main(report([_row(1)]), ids_file, "--run_mode", "partial", odoo=odoo) == 0
+    assert odoo.calls == [("res.company", "search_read"), (SUG, "create")] and ids_file.exists()
+
+
+def test_ids_file_round_trip_and_old_format(tmp_path):
+    p = tmp_path / "ids.json"
+    up.save_previous_ids(str(p), [3, 1], archived=True, created_ids=[9, 7])
+    payload = up.load_previous_ids(str(p))
+    assert (payload["ids"], payload["archived"], payload["created_ids"]) == ([1, 3], True, [7, 9])
+    p.write_text(json.dumps({"model": SUG, "ids": [1], "archived": False}))  # pre-I2 file
+    assert up.load_previous_ids(str(p)).get("created_ids") is None
