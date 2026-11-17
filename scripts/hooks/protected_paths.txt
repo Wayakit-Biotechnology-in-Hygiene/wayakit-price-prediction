@@ -1,0 +1,23 @@
+# PI verification files ("checks"). One path per line, relative to the repo root.
+# Supported formats: exact path, or a directory ending in "/**" (everything under it).
+# Empty lines and lines starting with "#" are ignored.
+#
+# Read by:
+#   scripts/hooks/protect_checks.sh       blocks Edit/Write on these paths unless PI_EDIT_CHECKS=1.
+#   scripts/hooks/gate_task_completed.sh  fails if the same change touches these paths and production code.
+#
+# Rule: checks and code are changed in separate changes; a change cannot modify
+# the tests or rules that judge it. Editing this file also requires PI_EDIT_CHECKS=1.
+REVIEW.md
+pytest.ini
+docs/reliability-checklist.md
+.claude/settings.json
+.claude/settings.local.json
+.claude/agents/**
+.claude/skills/**
+.claude/state/**
+scripts/**
+tests/conftest.py
+tests/e2e/_helpers.py
+tests/e2e/_pipeline_sandbox.py
+tests/differential/_harness.py

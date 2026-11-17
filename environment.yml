@@ -1,6 +1,6 @@
-# Entorno de PI tomado de `pip freeze` de la instancia el 2026-11-17 (F1). Local: conda env `wayakit-price-prediction`.
-# En la instancia el entorno todavía se llama `wayakit_env` (run_pipeline.sh:6); se renombra en el bootstrap de F3.
-# Para Bedrock con outputConfig (F2) quizá haya que subir boto3/botocore (local se probó con 1.43.115).
+# PI environment taken from the instance's `pip freeze` on 2026-11-17 (F1). Local: conda env `wayakit-price-prediction`.
+# On the instance the environment is still called `wayakit_env` (run_pipeline.sh:6); it is renamed in the F3 bootstrap.
+# For Bedrock with outputConfig (F2), boto3/botocore may need to be upgraded (tested locally with 1.43.115).
 name: wayakit-price-prediction
 channels:
   - conda-forge

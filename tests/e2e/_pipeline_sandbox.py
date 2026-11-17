@@ -1,30 +1,30 @@
-"""Caja de arena para correr `run_pipeline.sh` sin tocar nada real.
+"""Sandbox to run `run_pipeline.sh` without touching anything real.
 
-Lo usa `tests/e2e/test_run_pipeline_e2e.py`. Qué arma, todo dentro de un directorio temporal:
+Used by `tests/e2e/test_run_pipeline_e2e.py`. What it builds, all inside a temporary directory:
 
-- `<tmp>/project/run_pipeline.sh`: COPIA del script del árbol de trabajo. El script real nunca
-  se ejecuta en su lugar. En la copia no hay código (`*.py`): aunque un shim fallara, no hay nada
-  de Odoo ni de scraping que correr.
-- `<tmp>/shims/`: comandos falsos `python`, `timeout`, `git`, `conda`, `aws`, `sudo` y
-  `shutdown`. Cada uno anota su llamada en `<tmp>/llamadas.tsv` y no hace nada más. `sudo` y
-  `shutdown` son obligatorios: el `trap EXIT` del script corre `sudo shutdown -h +1`.
-  `timeout` descarta la duración y ejecuta el resto (que llega al shim de `python`).
-- `<tmp>/sistema/`: enlaces solo a las utilidades que el script usa (`date`, `tee`, `mkdir`,
-  `cat`, `rm`, `wc`, `xargs`, `echo`, `dirname`). El `PATH` es `shims:sistema` y nada más, así que
-  cualquier otro comando (`curl`, `ssh`, ...) da "command not found" y la prueba lo detecta.
-  Si `run_pipeline.sh` empieza a usar otra utilidad sin efectos externos, se agrega a
-  `UTILIDADES`; si tiene efectos externos, se le hace un shim.
-- `<tmp>/conda/etc/profile.d/conda.sh`: vacío; `conda info --base` (shim) apunta ahí.
+- `<tmp>/project/run_pipeline.sh`: a COPY of the script from the working tree. The real script never
+  runs in its place. The copy has no code (`*.py`): even if a shim failed, there is nothing
+  from Odoo or scraping to run.
+- `<tmp>/shims/`: fake `python`, `timeout`, `git`, `conda`, `aws`, `sudo` and `shutdown`
+  commands. Each one records its call in `<tmp>/calls.tsv` and does nothing else. `sudo` and
+  `shutdown` are mandatory: the script's `trap EXIT` runs `sudo shutdown -h +1`.
+  `timeout` drops the duration and executes the rest (which reaches the `python` shim).
+- `<tmp>/system/`: links only to the utilities the script uses (`date`, `tee`, `mkdir`,
+  `cat`, `rm`, `wc`, `xargs`, `echo`, `dirname`). The `PATH` is `shims:system` and nothing else, so
+  any other command (`curl`, `ssh`, ...) gives "command not found" and the test detects it.
+  If `run_pipeline.sh` starts using another utility without external effects, add it to
+  `UTILITIES`; if it has external effects, give it a shim.
+- `<tmp>/conda/etc/profile.d/conda.sh`: empty; `conda info --base` (shim) points there.
 
-El entorno del subproceso se arma desde cero (sin `BASH_ENV`, funciones exportadas, credenciales
-de AWS ni `PYTHONPATH`), con proxies a `127.0.0.1:9` y el IMDS de AWS apagado.
+The subprocess environment is built from scratch (no `BASH_ENV`, exported functions, AWS
+credentials or `PYTHONPATH`), with proxies set to `127.0.0.1:9` and the AWS IMDS turned off.
 
-Antes de cada corrida, `check_shims()` comprueba con el mismo bash y el mismo entorno que cada
-comando protegido resuelve a su shim (tipo `file`, ruta dentro de `<tmp>/shims`). Si no, lanza
-`ShimNoProtege` y la corrida NO se hace.
+Before each run, `check_shims()` checks, with the same bash and the same environment, that each
+protected command resolves to its shim (type `file`, path inside `<tmp>/shims`). If not, it raises
+`ShimNotProtecting` and the run is NOT done.
 
-Fallas a propósito: `run(fallar={"scraper/main.py": 124})` hace que el shim de `python` salga con
-124 (lo que devuelve `timeout` al vencerse) cuando el primer argumento es ese script.
+Deliberate failures: `run(fail={"scraper/main.py": 124})` makes the `python` shim exit with
+124 (what `timeout` returns when it expires) when the first argument is that script.
 """
 from __future__ import annotations
 
@@ -39,18 +39,18 @@ from tests.e2e import _helpers as h
 SCRIPT = "run_pipeline.sh"
 BASH = "/bin/bash"
 SHIMS = ("python", "timeout", "git", "conda", "aws", "sudo", "shutdown")
-UTILIDADES = ("date", "tee", "mkdir", "cat", "rm", "wc", "xargs", "echo", "dirname")
-SISTEMA_PATH = "/usr/bin:/bin"
+UTILITIES = ("date", "tee", "mkdir", "cat", "rm", "wc", "xargs", "echo", "dirname")
+SYSTEM_PATH = "/usr/bin:/bin"
 RUN_TIMEOUT_S = 60
 
-_REGISTRO = 'printf \'%s\\t%s\\t%s\\n\' "${0##*/}" "$PWD" "$*" >> "$PI_SHIM_LOG"\n'
+_RECORD = 'printf \'%s\\t%s\\t%s\\n\' "${0##*/}" "$PWD" "$*" >> "$PI_SHIM_LOG"\n'
 _SHIM_BODIES = {
     "python": (
         'script="$1"\n'
         "code=0\n"
-        "# PI_SHIM_FALLAR='scraper/main.py=124 ml_model/x.py=1'\n"
-        "for regla in $PI_SHIM_FALLAR; do\n"
-        '  case "$regla" in "$script="*) code="${regla#*=}";; esac\n'
+        "# PI_SHIM_FAIL='scraper/main.py=124 ml_model/x.py=1'\n"
+        "for rule in $PI_SHIM_FAIL; do\n"
+        '  case "$rule" in "$script="*) code="${rule#*=}";; esac\n'
         "done\n"
         'printf \'shim python: %s -> exit %s\\n\' "$script" "$code"\n'
         'exit "$code"\n'
@@ -61,16 +61,16 @@ _SHIM_BODIES = {
         "exit 0\n"
     ),
 }
-_DEFAULT_BODY = "exit 0\n"  # git, aws, sudo, shutdown: solo registran
+_DEFAULT_BODY = "exit 0\n"  # git, aws, sudo, shutdown: they only record
 
 
-class ShimNoProtege(RuntimeError):
-    """Un comando protegido no resuelve a su shim: la corrida se niega a empezar."""
+class ShimNotProtecting(RuntimeError):
+    """A protected command does not resolve to its shim: the run refuses to start."""
 
 
 @dataclass(frozen=True)
-class Llamada:
-    comando: str
+class Call:
+    command: str
     cwd: str
     args: str
 
@@ -80,30 +80,30 @@ class Llamada:
 
 
 @dataclass
-class Corrida:
+class SandboxRun:
     returncode: int
     stdout: str
     stderr: str
-    llamadas: list[Llamada]
+    calls: list[Call]
     project: Path
 
-    def de(self, comando: str) -> list[Llamada]:
-        return [c for c in self.llamadas if c.comando == comando]
+    def of(self, command: str) -> list[Call]:
+        return [c for c in self.calls if c.command == command]
 
     @property
-    def scripts_python(self) -> list[str]:
-        return [c.script for c in self.de("python")]
+    def python_scripts(self) -> list[str]:
+        return [c.script for c in self.of("python")]
 
     @property
     def pipeline_log(self) -> str:
         p = self.project / "logs" / "pipeline_execution.log"
         return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
 
-    def traza(self) -> str:
-        lines = [f"run_pipeline.sh (copia en {self.project}) salió con {self.returncode}. Llamadas:"]
-        lines += [f"  {c.comando} {c.args}" for c in self.llamadas]
-        lines += ["--- stdout ---", self.stdout.rstrip() or "(vacío)",
-                  "--- stderr ---", self.stderr.rstrip() or "(vacío)"]
+    def trace(self) -> str:
+        lines = [f"run_pipeline.sh (copy in {self.project}) exited with {self.returncode}. Calls:"]
+        lines += [f"  {c.command} {c.args}" for c in self.calls]
+        lines += ["--- stdout ---", self.stdout.rstrip() or "(empty)",
+                  "--- stderr ---", self.stderr.rstrip() or "(empty)"]
         return "\n".join(lines)
 
 
@@ -112,7 +112,7 @@ class Sandbox:
     root: Path
     project: Path = field(init=False)
     shims: Path = field(init=False)
-    sistema: Path = field(init=False)
+    system: Path = field(init=False)
     conda_base: Path = field(init=False)
     log: Path = field(init=False)
 
@@ -121,46 +121,46 @@ class Sandbox:
         h._check_outside_repo(self.root)
         self.project = self.root / "project"
         self.shims = self.root / "shims"
-        self.sistema = self.root / "sistema"
+        self.system = self.root / "system"
         self.conda_base = self.root / "conda"
-        self.log = self.root / "llamadas.tsv"
+        self.log = self.root / "calls.tsv"
         for d in (self.project / "ml_model", self.project / "scraper", self.project / "logs",
-                  self.shims, self.sistema, self.conda_base / "etc" / "profile.d",
+                  self.shims, self.system, self.conda_base / "etc" / "profile.d",
                   self.root / "home", self.root / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
         shutil.copy2(h.REPO_ROOT / SCRIPT, self.project / SCRIPT)
         (self.conda_base / "etc" / "profile.d" / "conda.sh").write_text(
-            "# conda.sh falso de la prueba: 'conda' resuelve al shim del PATH.\n")
+            "# Fake conda.sh for the test: 'conda' resolves to the shim on the PATH.\n")
         for name in SHIMS:
             p = self.shims / name
-            p.write_text("#!/bin/sh\n# Shim de prueba de run_pipeline.sh: registra y no hace nada real.\n"
-                         + _REGISTRO + _SHIM_BODIES.get(name, _DEFAULT_BODY))
+            p.write_text("#!/bin/sh\n# run_pipeline.sh test shim: records and does nothing real.\n"
+                         + _RECORD + _SHIM_BODIES.get(name, _DEFAULT_BODY))
             p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        for name in UTILIDADES:
-            real = shutil.which(name, path=SISTEMA_PATH)
+        for name in UTILITIES:
+            real = shutil.which(name, path=SYSTEM_PATH)
             if real is None:
-                raise RuntimeError(f"No se encontró la utilidad '{name}' en {SISTEMA_PATH}.")
-            (self.sistema / name).symlink_to(real)
+                raise RuntimeError(f"Utility '{name}' not found in {SYSTEM_PATH}.")
+            (self.system / name).symlink_to(real)
 
-    # --- estado inicial de la copia -----------------------------------------------------------
+    # --- initial state of the copy ------------------------------------------------------------
     def write(self, rel: str, text: str) -> Path:
         p = self.project / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
         return p
 
-    # --- entorno y candado --------------------------------------------------------------------
-    def env(self, fallar: dict[str, int] | None = None, path: str | None = None) -> dict[str, str]:
+    # --- environment and lock -----------------------------------------------------------------
+    def env(self, fail: dict[str, int] | None = None, path: str | None = None) -> dict[str, str]:
         proxy = "http://127.0.0.1:9"
         return {
-            "PATH": path or f"{self.shims}:{self.sistema}",
+            "PATH": path or f"{self.shims}:{self.system}",
             "HOME": str(self.root / "home"),
             "TMPDIR": str(self.root / "tmp"),
             "LANG": "en_US.UTF-8",
             "LC_ALL": "en_US.UTF-8",
             "PI_SHIM_LOG": str(self.log),
             "PI_SHIM_CONDA_BASE": str(self.conda_base),
-            "PI_SHIM_FALLAR": " ".join(f"{k}={v}" for k, v in (fallar or {}).items()),
+            "PI_SHIM_FAIL": " ".join(f"{k}={v}" for k, v in (fail or {}).items()),
             "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy,
             "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy,
             "AWS_EC2_METADATA_DISABLED": "true",
@@ -169,7 +169,7 @@ class Sandbox:
         }
 
     def check_shims(self, env: dict[str, str]) -> None:
-        """Exige que cada comando protegido resuelva a su shim; si no, se niega a correr."""
+        """Requires each protected command to resolve to its shim; otherwise refuses to run."""
         probe = 'for c in "$@"; do printf \'%s\\t%s\\t%s\\n\' "$c" "$(type -t "$c")" "$(type -P "$c")"; done'
         r = subprocess.run([BASH, "--noprofile", "--norc", "-c", probe, "probe", *SHIMS],
                            env=env, capture_output=True, text=True, timeout=10)
@@ -177,18 +177,18 @@ class Sandbox:
         for line in r.stdout.splitlines():
             name, kind, where = (line.split("\t") + ["", ""])[:3]
             if kind != "file" or Path(where).parent != self.shims:
-                problems.append(f"{name}: tipo={kind or '?'} ruta={where or '?'}")
+                problems.append(f"{name}: type={kind or '?'} path={where or '?'}")
         if r.returncode != 0 or len(r.stdout.splitlines()) != len(SHIMS) or problems:
-            raise ShimNoProtege(
-                "Se niega a correr run_pipeline.sh: estos comandos no resuelven a su shim "
-                f"en {self.shims} (sudo/shutdown son obligatorios por el trap EXIT): "
-                + ("; ".join(problems) or r.stderr.strip() or "salida inesperada"))
+            raise ShimNotProtecting(
+                "Refusing to run run_pipeline.sh: these commands do not resolve to their shim "
+                f"in {self.shims} (sudo/shutdown are mandatory because of the trap EXIT): "
+                + ("; ".join(problems) or r.stderr.strip() or "unexpected output"))
         if any(self.project.rglob("*.py")):
-            raise ShimNoProtege("La copia del proyecto trae código .py; no se corre.")
+            raise ShimNotProtecting("The project copy contains .py code; not running.")
 
-    # --- corrida ------------------------------------------------------------------------------
-    def run(self, stage: int = 1, fallar: dict[str, int] | None = None) -> Corrida:
-        env = self.env(fallar)
+    # --- run ----------------------------------------------------------------------------------
+    def run(self, stage: int = 1, fail: dict[str, int] | None = None) -> SandboxRun:
+        env = self.env(fail)
         self.check_shims(env)
         self.log.unlink(missing_ok=True)
         args = [BASH, "--noprofile", "--norc", str(self.project / SCRIPT)]
@@ -196,9 +196,9 @@ class Sandbox:
             args += ["--stage", "2"]
         p = subprocess.run(args, cwd=self.project, env=env, capture_output=True, text=True,
                            timeout=RUN_TIMEOUT_S)
-        llamadas = []
+        calls = []
         if self.log.is_file():
             for line in self.log.read_text(encoding="utf-8").splitlines():
-                comando, cwd, args_ = (line.split("\t", 2) + ["", ""])[:3]
-                llamadas.append(Llamada(comando, cwd, args_))
-        return Corrida(p.returncode, p.stdout, p.stderr, llamadas, self.project)
+                command, cwd, args_ = (line.split("\t", 2) + ["", ""])[:3]
+                calls.append(Call(command, cwd, args_))
+        return SandboxRun(p.returncode, p.stdout, p.stderr, calls, self.project)

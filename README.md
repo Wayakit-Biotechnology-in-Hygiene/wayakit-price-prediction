@@ -1,96 +1,96 @@
 # Price Intelligence (PI)
 
-Precios sugeridos para el catálogo de Wayakit en Arabia Saudita. Scrapers de sitios de competencia → CSV → modelo RandomForest (scikit-learn) → `product.price.suggestion` en Odoo (las sugerencias anteriores se archivan en `product.price.suggestion.history`). Corre en una EC2 de la cuenta AWS de Wayakit, región eu-north-1.
+Suggested prices for Wayakit's Saudi Arabia catalog. Competitor site scrapers → CSV → RandomForest model (scikit-learn) → `product.price.suggestion` in Odoo (previous suggestions are archived in `product.price.suggestion.history`). It runs on an EC2 in Wayakit's AWS account, region eu-north-1.
 
-> **Odoo:** confirmar la compañía (KSA o MX) antes de leer o escribir. Hoy las consultas **no filtran por compañía** (`ml_model/odoo_api_*.py`); se asume KSA porque todo está en SAR. El filtro por compañía está Planeado (F2).
+> **Odoo:** confirm the company (KSA or MX) before reading or writing. Today the queries **do not filter by company** (`ml_model/odoo_api_*.py`); KSA is assumed because everything is in SAR. The company filter is Planned (F2).
 
-Ninguna credencial va en el repo, y no se agregan CSV ni datos nuevos: los únicos CSV versionados son los 3 que se listan en «Cómo correrlo en local».
+No credentials go in the repo, and no new CSVs or data are added: the only versioned CSVs are the 3 listed in "How to run it locally".
 
-## Arquitectura hoy
+## Architecture today
 
 ```mermaid
 flowchart TD
-    S["EventBridge Scheduler (grupo default)<br/>jueves y viernes 21:50 CDMX"] -->|StartInstances| EC2["EC2 wayakit-app-server<br/>t3.medium, AL2023"]
-    EC2 -->|"crontab de ec2-user<br/>vie y sáb 04:00 UTC"| E1["run_pipeline.sh, etapa 1<br/>productos de Odoo → analysis-odoo.csv"]
-    E1 --> R["Revisión manual<br/>edición de analysis-odoo.csv por git"]
+    S["EventBridge Scheduler (default group)<br/>Thursday and Friday 21:50 CDMX"] -->|StartInstances| EC2["EC2 wayakit-app-server<br/>t3.medium, AL2023"]
+    EC2 -->|"ec2-user crontab<br/>Fri and Sat 04:00 UTC"| E1["run_pipeline.sh, stage 1<br/>Odoo products → analysis-odoo.csv"]
+    E1 --> R["Manual review<br/>editing analysis-odoo.csv through git"]
     R --> E2["run_pipeline.sh --stage 2<br/>git pull"]
-    E2 --> SC["scraper/main.py<br/>Amazon, Mumzworld, SACO, sitios B2B"]
-    SC <-->|relevancia y conteo de wipes| G["Gemini"]
+    E2 --> SC["scraper/main.py<br/>Amazon, Mumzworld, SACO, B2B sites"]
+    SC <-->|relevance and wipes count| G["Gemini"]
     SC --> CSV["scraper/competitors_complete.csv"]
     OD[("Odoo: product.master,<br/>sale.order.line, competitor.product")] --> ML
-    CSV --> ML["ml_model/<br/>precio por L o por pieza, recorte p10–p90, RandomForest"]
+    CSV --> ML["ml_model/<br/>price per L or per piece, p10–p90 trimming, RandomForest"]
     ML --> OUT[("Odoo: product.price.suggestion")]
 ```
 
-- Cada etapa es un encendido distinto y al terminar la instancia se apaga sola (`trap EXIT`, `run_pipeline.sh:52`). Las lanza el crontab de `ec2-user` (no está en el repo): etapa 1 el viernes 04:00 UTC y etapa 2 el sábado 04:00 UTC (jueves y viernes 22:00 CDMX). Encender la instancia a otra hora no lanza nada.
-- La corrida es siempre completa: desde e25e2c9 el modo parcial (solo productos nuevos, en append) está deshabilitado (`run_pipeline.sh:67-68`), aunque su código sigue en el script.
-- Todo el estado (CSV, modelos `.joblib`, `logs/last_full_run.txt`, logs) vive solo en el disco de la instancia. Hay un snapshot manual del 2026-11-17 (`pi-f1-antes-inventario`).
-- La instancia corre la rama **`server-improvement`** (e25e2c9), un commit adelante de `main`.
-- La última corrida completa (13–15 nov 2026) falló en el scraping (timeout de 30 h, 53 filas) y aun así subió sugerencias a Odoo: hoy salen casi solo de `competitor.product`.
+- Each stage is a separate start-up, and when it finishes the instance stops itself (`trap EXIT`, `run_pipeline.sh:52`). They are launched by the `ec2-user` crontab (not in the repo): stage 1 on Friday 04:00 UTC and stage 2 on Saturday 04:00 UTC (Thursday and Friday 22:00 CDMX). Starting the instance at any other time launches nothing.
+- The run is always full: since e25e2c9 partial mode (new products only, in append) is disabled (`run_pipeline.sh:67-68`), although its code is still in the script.
+- All state (CSVs, `.joblib` models, `logs/last_full_run.txt`, logs) lives only on the instance disk. There is a manual snapshot from 2026-11-17 (`pi-f1-antes-inventario`).
+- The instance runs the **`server-improvement`** branch (e25e2c9), one commit ahead of `main`.
+- The last full run (13–15 Nov 2026) failed in scraping (30 h timeout, 53 rows) and still uploaded suggestions to Odoo: today they come almost only from `competitor.product`.
 
-## Arquitectura objetivo
+## Target architecture
 
-Nada de esto existe todavía; en AWS no se ha creado ningún recurso nuevo. Detalle en [docs/plan.md](docs/plan.md).
+None of this exists yet; no new resource has been created in AWS. Details in [docs/plan.md](docs/plan.md).
 
-- **Planeado (F6):** Amazon KSA y Noon KSA por Apify (`junglee/amazon-crawler` y `saswave/noon-product-scraper`), en la cuenta de Apify de VdC. Mumzworld y SACO se quedan igual.
-- **Planeado (F2):** relevancia con Bedrock en lugar de Gemini: DeepSeek V3.2 como principal y Claude Haiku 4.5 como respaldo, por lotes y con la misma interfaz de `RelevanceAgent`.
-- **Planeado (F2, F3):** una sola corrida mensual y completa, el último jueves de cada mes. Sin etapa 2 ni `git pull`; la lista de búsqueda sale de `modifiers_mapping.csv` por PR (hora, zona horaria y la eliminación de la revisión manual siguen abiertas en `docs/plan.md`, sección 4).
-- **Planeado (F3):** estado en S3 (`price-intelligence-<cuenta>`) y recursos en `infra/` (scripts boto3 con `--dry-run`, etiqueta `project=price-intelligence`).
-- **Planeado (F4):** CI/CD pull-on-boot: GitHub Actions (OIDC) publica el release en S3 y enciende la instancia en modo "solo deploy".
-- **Planeado (F2):** subida segura a Odoo (`create` del lote nuevo y luego `unlink` del anterior), con `--dry-run` y filtro por compañía KSA.
+- **Planned (F6):** Amazon KSA and Noon KSA through Apify (`junglee/amazon-crawler` and `saswave/noon-product-scraper`), in VdC's Apify account. Mumzworld and SACO stay the same.
+- **Planned (F2):** relevance with Bedrock instead of Gemini: DeepSeek V3.2 as primary and Claude Haiku 4.5 as fallback, in batches and with the same `RelevanceAgent` interface.
+- **Planned (F2, F3):** a single monthly full run, on the last Thursday of each month. No stage 2 and no `git pull`; the search list comes from `modifiers_mapping.csv` through a PR (time, time zone and removing the manual review are still open in `docs/plan.md`, section 4).
+- **Planned (F3):** state in S3 (`price-intelligence-<account>`) and resources in `infra/` (boto3 scripts with `--dry-run`, tag `project=price-intelligence`).
+- **Planned (F4):** pull-on-boot CI/CD: GitHub Actions (OIDC) publishes the release to S3 and starts the instance in "deploy only" mode.
+- **Planned (F2):** safe upload to Odoo (`create` of the new batch and then `unlink` of the previous one), with `--dry-run` and a KSA company filter.
 
-## Estructura
+## Structure
 
-| Ruta | Qué hay |
+| Path | What it contains |
 |---|---|
-| `scraper/` | `main.py` (orquesta el scraping), `config.py` (`TARGET_MAP`, columnas del CSV, exclusiones), `odoo_api_connection_products.py` (genera `analysis-odoo.csv`), `modifiers_mapping.csv` (keywords por tipo de producto) |
-| `scraper/scrapers/` | Un scraper por sitio (Selenium + BeautifulSoup) con la firma `scrape(keyword, search_mode) -> list[dict]` (AeroSense usa `scrape(search_term, mode='volume')`, mismo orden de argumentos) |
-| `scraper/services/` | `ai_service.py`: `RelevanceAgent` (Gemini hoy) |
-| `ml_model/` | Lecturas de Odoo, preprocesado (`1a`, `1b`), entrenamiento (`2`), predicción (`3`) y subida (`odoo_api_price_suggestion.py`) |
-| `docs/` | Plan, runbook, inventario de AWS, decisiones y checklist de confiabilidad |
-| `run_pipeline.sh` | Pipeline de 2 etapas que corre en la instancia |
-| `log_config.py` | Logging con rotación; escribe en `../logs/wayakit_app.log`, fuera del repo (`log_config.py:7`) |
-| `requirements.txt` | Dependencias, sin versiones fijas |
-| `infra/` | Planeado (F3) |
-| `tests/` | Pruebas sin red: `unit/`, `property/` (Hypothesis), `e2e/` (etapas del ML y `run_pipeline.sh` en una copia temporal) y `differential/` (rama base contra versión nueva). Se corren con `scripts/verify.sh rapido\|completo` |
-| `scripts/` | `verify.sh`, `install_githooks.sh` (hook `commit-msg` del sello `Verificado:`) y los hooks de Claude Code (`hooks/`) |
-| `.claude/` | Agentes del equipo de desarrollo (`pi-dev`, `pi-tester`, `pi-reviewer`), skills `equipo` y `verify`, y `settings.json` con los hooks |
-| `.github/workflows/` | Planeado (F4): `ci.yml` y `deploy.yml` |
+| `scraper/` | `main.py` (orchestrates the scraping), `config.py` (`TARGET_MAP`, CSV columns, exclusions), `odoo_api_connection_products.py` (generates `analysis-odoo.csv`), `modifiers_mapping.csv` (keywords per product type) |
+| `scraper/scrapers/` | One scraper per site (Selenium + BeautifulSoup) with the signature `scrape(keyword, search_mode) -> list[dict]` (AeroSense uses `scrape(search_term, mode='volume')`, same argument order) |
+| `scraper/services/` | `ai_service.py`: `RelevanceAgent` (Gemini today) |
+| `ml_model/` | Odoo reads, preprocessing (`1a`, `1b`), training (`2`), prediction (`3`) and upload (`odoo_api_price_suggestion.py`) |
+| `docs/` | Plan, runbook, AWS inventory, decisions and reliability checklist |
+| `run_pipeline.sh` | 2-stage pipeline that runs on the instance |
+| `log_config.py` | Logging with rotation; writes to `../logs/wayakit_app.log`, outside the repo (`log_config.py:7`) |
+| `requirements.txt` | Dependencies, without pinned versions |
+| `infra/` | Planned (F3) |
+| `tests/` | Tests without network: `unit/`, `property/` (Hypothesis), `e2e/` (ML stages and `run_pipeline.sh` in a temporary copy) and `differential/` (base branch against the new version). Run with `scripts/verify.sh quick\|full` |
+| `scripts/` | `verify.sh`, `install_githooks.sh` (`commit-msg` hook for the `Verified:` stamp) and the Claude Code hooks (`hooks/`) |
+| `.claude/` | Development team agents (`pi-dev`, `pi-tester`, `pi-reviewer`), skills `team` and `verify`, and `settings.json` with the hooks |
+| `.github/workflows/` | Planned (F4): `ci.yml` and `deploy.yml` |
 
-## Fuentes
+## Sources
 
-Sale de `TARGET_MAP` (`scraper/config.py:9-24`). El canal lo decide `scraper/main.py:364-365`: B2C si la subindustria es Home, Automotive o Pets; B2B en las demás.
+Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `scraper/main.py:364-365`: B2C if the subindustry is Home, Automotive or Pets; B2B for all others.
 
-| Sitio | Canal | Subindustrias | Método hoy | Cambio planeado |
+| Site | Channel | Subindustries | Method today | Planned change |
 |---|---|---|---|---|
-| Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Selenium + Gemini | Apify `junglee/amazon-crawler` (F6). Alcance por subindustria pendiente |
-| Noon (noon.com/saudi-en) | B2C | No existe hoy | — | Apify `saswave/noon-product-scraper` (F6). Subindustrias pendientes |
-| Mumzworld | B2C | Home | Selenium + Gemini | Igual; solo cambia la IA a Bedrock (F2) |
-| SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Selenium + Gemini | Igual; solo cambia la IA a Bedrock (F2) |
-| Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Selenium + Gemini | IA a Bedrock (F2) |
-| GoGreen (gogreen.com.sa) | B2B | Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | IA a Bedrock (F2) |
-| OfficeSupply (officesupply.sa) | B2B | Facilities management, Faith, Gyms, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | IA a Bedrock (F2) |
-| AeroSense (aero-sense.com) | B2B | Aviation | Selenium, sin filtro de IA | Ninguno |
+| Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Selenium + Gemini | Apify `junglee/amazon-crawler` (F6). Scope per subindustry pending |
+| Noon (noon.com/saudi-en) | B2C | Does not exist today | — | Apify `saswave/noon-product-scraper` (F6). Subindustries pending |
+| Mumzworld | B2C | Home | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
+| SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
+| Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
+| GoGreen (gogreen.com.sa) | B2B | Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
+| OfficeSupply (officesupply.sa) | B2B | Facilities management, Faith, Gyms, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
+| AeroSense (aero-sense.com) | B2B | Aviation | Selenium, no AI filter | None |
 
-Ojo: `Land Transportation` (`config.py:19`) no coincide con `Land transportation` del CSV, así que hoy esa subindustria nunca se scrapea.
+Note: `Land Transportation` (`config.py:19`) does not match `Land transportation` in the CSV, so today that subindustry is never scraped.
 
-## Cómo correrlo en local
+## How to run it locally
 
-Requisitos: Python con `requirements.txt` y Chrome instalado (`webdriver-manager` descarga el driver). [environment.yml](environment.yml) fija las versiones de la instancia (Python 3.10.20):
+Requirements: Python with `requirements.txt` and Chrome installed (`webdriver-manager` downloads the driver). [environment.yml](environment.yml) pins the instance versions (Python 3.10.20):
 
-- **Local:** `conda env create -f environment.yml` crea el entorno `wayakit-price-prediction`. Para las pruebas, además `pip install -r requirements-dev.txt` y, una vez por clon, `scripts/install_githooks.sh`.
-- **Instancia:** el entorno sigue llamándose `wayakit_env` hasta F3 (`run_pipeline.sh:6`). Si hay que recrearlo allí: `conda env create -f environment.yml -n wayakit_env`; sin `-n` se crea `wayakit-price-prediction` y el pipeline no lo encuentra. Los scripts leen el secreto `prod/wayakit-app` (eu-north-1) con la sesión por defecto de boto3, así que necesitas un perfil SSO con permiso de lectura sobre ese secreto.
+- **Local:** `conda env create -f environment.yml` creates the `wayakit-price-prediction` environment. For the tests, also `pip install -r requirements-dev.txt` and, once per clone, `scripts/install_githooks.sh`.
+- **Instance:** the environment is still called `wayakit_env` until F3 (`run_pipeline.sh:6`). If it has to be recreated there: `conda env create -f environment.yml -n wayakit_env`; without `-n` it creates `wayakit-price-prediction` and the pipeline does not find it. The scripts read the `prod/wayakit-app` secret (eu-north-1) with the default boto3 session, so you need an SSO profile with read permission on that secret.
 
-Los CSV no están en git (salvo `scraper/analysis-odoo.csv`, `scraper/modifiers_mapping.csv` y `ml_model/wayakit_products_competition.csv`): se generan al correr. Todos los comandos van desde la raíz del repo.
+The CSVs are not in git (except `scraper/analysis-odoo.csv`, `scraper/modifiers_mapping.csv` and `ml_model/wayakit_products_competition.csv`): they are generated when running. All commands run from the repo root.
 
 ```bash
-aws sso login --profile <perfil>
-export AWS_PROFILE=<perfil>
+aws sso login --profile <profile>
+export AWS_PROFILE=<profile>
 pip install -r requirements.txt
 python ml_model/odoo_api_products.py                 # Odoo → ml_model/wayakit_products.csv
-python scraper/odoo_api_connection_products.py       # → scraper/analysis-odoo.csv (sobrescribe un archivo versionado)
+python scraper/odoo_api_connection_products.py       # → scraper/analysis-odoo.csv (overwrites a versioned file)
 python scraper/main.py --analysis_file scraper/analysis-odoo.csv --output_file scraper/competitors_complete.csv
-python ml_model/odoo_api_cotizations.py              # ventas fijas a 2025 (odoo_api_cotizations.py:75-76)
+python ml_model/odoo_api_cotizations.py              # sales fixed to 2025 (odoo_api_cotizations.py:75-76)
 python ml_model/odoo_api_competitor_products.py
 python ml_model/1a_preprocess_data.py
 python ml_model/1b_preprocess_data.py --run_mode full
@@ -98,16 +98,16 @@ python ml_model/2_train_models.py                    # → ml_model/trained_mode
 python ml_model/3_predicted_prices.py                # → ml_model/wayakit_prediction_report.csv
 ```
 
-- El scraping completo puede tardar hasta 30 h (`run_pipeline.sh:154`); para probar, usa un `analysis-odoo.csv` recortado y no lo subas a git.
-- **No corras `ml_model/odoo_api_price_suggestion.py` en local.** Escribe en Odoo de producción: con `--run_mode full` copia todas las sugerencias a `product.price.suggestion.history`, las borra (`unlink`) y crea las nuevas; si el `create` falla, la tabla queda vacía. Sin argumentos corre en `partial` y solo agrega registros. No tiene `--dry-run` (Planeado, F2). Solo con OK de Mafer y la compañía KSA confirmada.
+- Full scraping can take up to 30 h (`run_pipeline.sh:154`); for testing, use a trimmed `analysis-odoo.csv` and do not push it to git.
+- **Do not run `ml_model/odoo_api_price_suggestion.py` locally.** It writes to production Odoo: with `--run_mode full` it copies all suggestions to `product.price.suggestion.history`, deletes them (`unlink`) and creates the new ones; if the `create` fails, the table is left empty. Without arguments it runs in `partial` and only adds records. It has no `--dry-run` (Planned, F2). Only with Mafer's OK and the KSA company confirmed.
 
-## Documentación
+## Documentation
 
-- [CLAUDE.md](CLAUDE.md): reglas y contexto para Claude Code
-- [docs/runbook.md](docs/runbook.md): cómo operar, correr a mano, volver a subir a Odoo y problemas conocidos
-- [docs/recursos.md](docs/recursos.md): inventario de lo que existe en AWS
-- [docs/decisiones.md](docs/decisiones.md): por qué está así
-- [docs/plan.md](docs/plan.md): plan de mejoras nov–dic 2026 (fases F0–F8)
-- [REVIEW.md](REVIEW.md) y [docs/checklist-confiabilidad.md](docs/checklist-confiabilidad.md): qué bloquea un commit y qué chequeos correr según el diff (se leen desde la rama base)
-- Skills [`verify`](.claude/skills/verify/SKILL.md) (cómo verificar sin tocar producción) y [`equipo`](.claude/skills/equipo/SKILL.md) (cómo trabaja el equipo de agentes)
-- Tickets: [A, corregir mascotas y migrar B2C a Apify](https://app.notion.com/p/41abe65f8c1381ffb1dad8a51e4eb87a) · [B, infraestructura como código y CI/CD a EC2](https://app.notion.com/p/41abe65f8c1381e88806e23603e434b3)
+- [CLAUDE.md](CLAUDE.md): rules and context for Claude Code
+- [docs/runbook.md](docs/runbook.md): how to operate, run by hand, re-upload to Odoo and known issues
+- [docs/resources.md](docs/resources.md): inventory of what exists in AWS
+- [docs/decisions.md](docs/decisions.md): why it is the way it is
+- [docs/plan.md](docs/plan.md): Nov–Dec 2026 improvement plan (phases F0–F8)
+- [REVIEW.md](REVIEW.md) and [docs/reliability-checklist.md](docs/reliability-checklist.md): what blocks a commit and which checks to run depending on the diff (read from the base branch)
+- Skills [`verify`](.claude/skills/verify/SKILL.md) (how to verify without touching production) and [`team`](.claude/skills/team/SKILL.md) (how the agent team works)
+- Tickets: [A, fix Pets and migrate B2C to Apify](https://app.notion.com/p/41abe65f8c1381ffb1dad8a51e4eb87a) · [B, infrastructure as code and CI/CD to EC2](https://app.notion.com/p/41abe65f8c1381e88806e23603e434b3)

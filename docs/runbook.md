@@ -1,195 +1,195 @@
 # Runbook — Price Intelligence
 
-Guía práctica para operar Price Intelligence (PI). Cada sección resuelve una tarea concreta.
-Para saber *qué* existe en AWS, ver [recursos.md](recursos.md). Para saber *por qué* está así, ver [decisiones.md](decisiones.md). El plan de mejoras está en [plan.md](plan.md).
+Practical guide to operating Price Intelligence (PI). Each section solves one concrete task.
+To know *what* exists in AWS, see [resources.md](resources.md). To know *why* it is the way it is, see [decisions.md](decisions.md). The improvement plan is in [plan.md](plan.md).
 
-Estado al 2026-11-17: la operación descrita aquí es la de **hoy** (rama `server-improvement` en la instancia, inventario de F1). Lo que dice **Planeado (F#)** todavía no existe; el número es la fase de [plan.md](plan.md). En AWS no se ha creado ni cambiado nada para el plan.
+Status as of 2026-11-17: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory). Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). Nothing has been created or changed in AWS for the plan.
 
-Los comandos de AWS se corren desde la raíz del repo, en una Mac con AWS CLI v2. Los del pipeline se corren dentro de la instancia EC2.
+AWS commands are run from the repo root, on a Mac with AWS CLI v2. Pipeline commands are run inside the EC2 instance.
 
 ---
 
-## Antes de empezar
+## Before you start
 
-### Una sola vez por máquina
+### Once per machine
 
-1. Tener usuario en IAM Identity Center con acceso a la cuenta de Wayakit.
-2. Configurar el perfil SSO `wayakit-vdc`, igual que en VdC (ver `voz-del-cliente/docs/runbook.md`, sección *Antes de empezar*):
+1. Have a user in IAM Identity Center with access to the Wayakit account.
+2. Configure the SSO profile `wayakit-vdc`, same as in VdC (see `voz-del-cliente/docs/runbook.md`, section *Before you start*):
 
-   | Pregunta | Respuesta |
+   | Question | Answer |
    |---|---|
    | SSO region | `eu-north-1` |
-   | Default client Region | `eu-north-1` (la CLI propone `us-east-1`; no aceptarlo) |
+   | Default client Region | `eu-north-1` (the CLI suggests `us-east-1`; do not accept it) |
    | Profile name | `wayakit-vdc` |
 
-3. Para entrar a la instancia se usa **SSM** (desde 2026-11-17). Instalar el [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) de la AWS CLI. Ya no hace falta la llave SSH (`wayakit-stockholm-key`).
-4. **Entorno local** (para correr pruebas y desarrollar), desde la raíz del repo:
+3. Access to the instance is through **SSM** (since 2026-11-17). Install the AWS CLI [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html). The SSH key (`wayakit-stockholm-key`) is no longer needed.
+4. **Local environment** (to run tests and develop), from the repo root:
    ```bash
-   conda env create -f environment.yml          # crea el entorno local "wayakit-price-prediction"
+   conda env create -f environment.yml          # creates the local environment "wayakit-price-prediction"
    conda activate wayakit-price-prediction
-   pip install -r requirements-dev.txt          # pytest e hypothesis
-   scripts/install_githooks.sh                  # hook commit-msg que valida el sello "Verificado:"
+   pip install -r requirements-dev.txt          # pytest and hypothesis
+   scripts/install_githooks.sh                  # commit-msg hook that validates the "Verified:" stamp
    ```
-   El nombre local (`wayakit-price-prediction`) es distinto del de la instancia (`wayakit_env`, hasta F3). En la instancia nunca se usa `conda env create -f environment.yml` sin `-n wayakit_env` (ver [Correr a mano](#correr-a-mano), paso 4).
+   The local name (`wayakit-price-prediction`) differs from the instance's (`wayakit_env`, until F3). On the instance, never use `conda env create -f environment.yml` without `-n wayakit_env` (see [Running by hand](#running-by-hand), step 4).
 
-### Cada día, o cuando expire la sesión
+### Every day, or when the session expires
 
 ```bash
 aws sso login --profile wayakit-vdc
 aws sts get-caller-identity --profile wayakit-vdc
 ```
 
-- **Usar siempre `--profile wayakit-vdc`, nunca el perfil `default`**: en las Mac del equipo `default` usa llaves de acceso de largo plazo.
-- Región: **`eu-north-1` (Stockholm)**. En la consola, revisar el selector de región antes de buscar algo. Hay restos de la región anterior, me-south-1 (2 roles y el secreto `wayakit/test/credentials`), que no se pudieron inventariar (pregunta 10 del plan).
-- Las credenciales de Odoo y de Gemini viven en el secreto `prod/wayakit-app` (llaves `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` y `GEMINI_API_KEY`). Nunca imprimir ni copiar los valores.
+- **Always use `--profile wayakit-vdc`, never the `default` profile**: on the team's Macs, `default` uses long-term access keys.
+- Region: **`eu-north-1` (Stockholm)**. In the console, check the region selector before looking for anything. There are leftovers in the previous region, me-south-1 (2 roles and the secret `wayakit/test/credentials`), that could not be inventoried (plan question 10).
+- The Odoo and Gemini credentials live in the secret `prod/wayakit-app` (keys `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` and `GEMINI_API_KEY`). Never print or copy the values.
 
 ---
 
-## Cómo corre hoy
+## How it runs today
 
-### Disparo
+### Trigger
 
-| Schedule (EventBridge Scheduler, grupo `default`) | Expresión | Zona horaria | Qué hace |
+| Schedule (EventBridge Scheduler, group `default`) | Expression | Time zone | What it does |
 |---|---|---|---|
-| `Wayakit-Start-Thursday-Night` | `cron(50 21 ? * 5 *)` | America/Mexico_City | Enciende la instancia `wayakit-app-server` (jueves 21:50 CDMX) |
-| `Wayakit-Start-Friday-Night` | `cron(50 21 ? * 6 *)` | America/Mexico_City | Enciende la instancia (viernes 21:50 CDMX) |
+| `Wayakit-Start-Thursday-Night` | `cron(50 21 ? * 5 *)` | America/Mexico_City | Starts the `wayakit-app-server` instance (Thursday 21:50 CDMX) |
+| `Wayakit-Start-Friday-Night` | `cron(50 21 ? * 6 *)` | America/Mexico_City | Starts the instance (Friday 21:50 CDMX) |
 
-- Los schedules **solo encienden** la instancia (destino `ec2:startInstances`, rol `Wayakit-EventBridge-Role`). No hay Lambda ni reglas de EventBridge de PI.
-- Dentro de la instancia, el **crontab de `ec2-user`** (no está en el repo; verificado en F1, 2026-11-17) lanza las etapas. El repo está en `/home/ec2-user/wayakit-price-prediction`, rama **`server-improvement`**:
+- The schedules **only start** the instance (target `ec2:startInstances`, role `Wayakit-EventBridge-Role`). There are no PI Lambdas or EventBridge rules.
+- Inside the instance, the **`ec2-user` crontab** (not in the repo; verified in F1, 2026-11-17) launches the stages. The repo is at `/home/ec2-user/wayakit-price-prediction`, branch **`server-improvement`**:
   ```
   0 4 * * 5 /home/ec2-user/wayakit-price-prediction/run_pipeline.sh >> .../logs/cron.log 2>&1
   0 4 * * 6 /home/ec2-user/wayakit-price-prediction/run_pipeline.sh --stage 2 >> .../logs/cron.log 2>&1
   ```
-  En UTC: viernes y sábado 04:00 = **jueves y viernes 22:00 CDMX**, 10 minutos después de que los schedules encienden la instancia. No hay `@reboot`, timers de systemd propios ni `rc.local`: encender la instancia a otra hora no lanza nada.
-- Al terminar, cualquier salida del script (éxito o error) dispara `trap EXIT`, que programa `sudo shutdown -h +1` (`run_pipeline.sh:52`). No hay `StopInstances` por API.
-- Si la etapa 1 sigue corriendo cuando llega el schedule del viernes, ese `StartInstances` no hace nada (la instancia ya está encendida). Como el cron es a hora fija, la etapa 2 se lanza igual el sábado 04:00 UTC aunque la etapa 1 no haya terminado (las dos correrían a la vez).
-- Planeado (F3): un solo schedule mensual, el último jueves de cada mes (`cron(50 21 ? * 5L *)`), en el grupo `price-intelligence`. A las 21:50 en horario de CDMX (decisión de Mafer, 2026-11-17).
+  In UTC: Friday and Saturday 04:00 = **Thursday and Friday 22:00 CDMX**, 10 minutes after the schedules start the instance. There is no `@reboot`, no custom systemd timers and no `rc.local`: starting the instance at another time launches nothing.
+- When it finishes, any exit of the script (success or error) fires `trap EXIT`, which schedules `sudo shutdown -h +1` (`run_pipeline.sh:52`). There is no `StopInstances` via API.
+- If stage 1 is still running when the Friday schedule fires, that `StartInstances` does nothing (the instance is already running). Since the cron is at a fixed time, stage 2 is launched anyway on Saturday 04:00 UTC even if stage 1 has not finished (both would run at the same time).
+- Planned (F3): a single monthly schedule, the last Thursday of each month (`cron(50 21 ? * 5L *)`), in the group `price-intelligence`. At 21:50 CDMX time (Mafer's decision, 2026-11-17).
 
-### Etapa 1: preparar la lista de búsqueda (`run_pipeline.sh:65-109`)
+### Stage 1: prepare the search list (`run_pipeline.sh:65-109`)
 
-1. La corrida es **siempre completa**: desde e25e2c9 el modo parcial está deshabilitado (`IS_FULL_RUN="true"`, `run_pipeline.sh:67-68`). `logs/last_full_run.txt` se sigue escribiendo, pero ya no decide nada.
-2. Activa conda (`wayakit_env`) y corre `ml_model/odoo_api_products.py` → `ml_model/wayakit_products.csv` (`run_pipeline.sh:86`).
-3. `scraper/odoo_api_connection_products.py` genera `scraper/analysis-odoo.csv` desde los productos de Odoo y `scraper/modifiers_mapping.csv`, y escribe `run_mode.txt=full` y `last_full_run.txt` (`run_pipeline.sh:90-93`).
-4. La rama parcial (`ml_model/filter_new_products.py` → `ml_model/wayakit_new_products_temp.csv`, `run_mode.txt=partial`, `run_pipeline.sh:95-100`) sigue en el código, pero ya no se alcanza.
-5. Sale y la instancia se apaga.
+1. The run is **always full**: since e25e2c9 partial mode is disabled (`IS_FULL_RUN="true"`, `run_pipeline.sh:67-68`). `logs/last_full_run.txt` is still written, but it no longer decides anything.
+2. Activates conda (`wayakit_env`) and runs `ml_model/odoo_api_products.py` → `ml_model/wayakit_products.csv` (`run_pipeline.sh:86`).
+3. `scraper/odoo_api_connection_products.py` generates `scraper/analysis-odoo.csv` from the Odoo products and `scraper/modifiers_mapping.csv`, and writes `run_mode.txt=full` and `last_full_run.txt` (`run_pipeline.sh:90-93`).
+4. The partial branch (`ml_model/filter_new_products.py` → `ml_model/wayakit_new_products_temp.csv`, `run_mode.txt=partial`, `run_pipeline.sh:95-100`) is still in the code, but is no longer reached.
+5. Exits and the instance shuts down.
 
-En la etapa 1, cada paso lleva `|| exit 1`: si algo falla, la etapa termina con error (y se apaga igual).
+In stage 1, every step has `|| exit 1`: if something fails, the stage ends with an error (and shuts down anyway).
 
-### Etapa 2: scraping, entrenamiento y subida a Odoo (`run_pipeline.sh:116-215`)
+### Stage 2: scraping, training and upload to Odoo (`run_pipeline.sh:116-215`)
 
-1. Lee `logs/run_mode.txt`; si no existe, sale con error (`run_pipeline.sh:122-128`).
-2. `git pull` de la rama que esté en checkout, **sin revisar el resultado** (`run_pipeline.sh:133`).
-3. Completa (`run_pipeline.sh:144-167`):
-   - **borra** `scraper/competitors_complete.csv` (línea 151) y hace scraping con `timeout 30h` (línea 154);
-   - lee de Odoo las cotizaciones y los productos de competencia (155-156);
-   - corre `1a_preprocess_data.py`, `1b_preprocess_data.py --run_mode full`, `2_train_models.py` y `3_predicted_prices.py` (163-166), cada uno con `timeout 1h`;
-   - sube a Odoo con `odoo_api_price_suggestion.py --run_mode full` (167).
-4. Parcial (`run_pipeline.sh:172-202`). Sigue en el código, pero desde e25e2c9 la etapa 1 siempre escribe `run_mode.txt=full`, así que no se alcanza:
-   - si `wayakit_new_products_temp.csv` tiene 1 línea o menos, no hace nada (178-180);
-   - si no, genera `scraper/analysis-odoo_partial.csv` (187), hace scraping en modo `append` con `timeout 4h` (188) y sigue igual que la completa, pero con `--run_mode partial` (189-201).
-5. Sale y la instancia se apaga.
+1. Reads `logs/run_mode.txt`; if it does not exist, exits with an error (`run_pipeline.sh:122-128`).
+2. `git pull` of whatever branch is checked out, **without checking the result** (`run_pipeline.sh:133`).
+3. Full (`run_pipeline.sh:144-167`):
+   - **deletes** `scraper/competitors_complete.csv` (line 151) and scrapes with `timeout 30h` (line 154);
+   - reads the quotations and competitor products from Odoo (155-156);
+   - runs `1a_preprocess_data.py`, `1b_preprocess_data.py --run_mode full`, `2_train_models.py` and `3_predicted_prices.py` (163-166), each with `timeout 1h`;
+   - uploads to Odoo with `odoo_api_price_suggestion.py --run_mode full` (167).
+4. Partial (`run_pipeline.sh:172-202`). Still in the code, but since e25e2c9 stage 1 always writes `run_mode.txt=full`, so it is not reached:
+   - if `wayakit_new_products_temp.csv` has 1 line or fewer, it does nothing (178-180);
+   - otherwise, it generates `scraper/analysis-odoo_partial.csv` (187), scrapes in `append` mode with `timeout 4h` (188) and continues like the full run, but with `--run_mode partial` (189-201).
+5. Exits and the instance shuts down.
 
-En la etapa 2, **los pasos no llevan `|| exit 1`**: si uno falla, los siguientes corren igual con los archivos que haya. Ver [Problemas conocidos](#problemas-conocidos).
+In stage 2, **the steps do not have `|| exit 1`**: if one fails, the following ones run anyway with whatever files exist. See [Known issues](#known-issues).
 
-La rama `origin/server-improvement` (e25e2c9) desactiva el modo parcial y cambia el entrenamiento y la predicción. La instancia corre **`server-improvement`** (verificado en F1, 2026-11-17), y `pi-mejoras` ya está en e25e2c9: las líneas de este documento son de ese commit.
+The branch `origin/server-improvement` (e25e2c9) disables partial mode and changes training and prediction. The instance runs **`server-improvement`** (verified in F1, 2026-11-17), and `pi-improvements` contains e25e2c9 with no production changes since, so the line numbers in this document are from that commit.
 
-### Archivos que produce
+### Files it produces
 
-Todo vive **solo en el disco de la instancia** (volumen sin snapshots). Las rutas son relativas a la raíz del repo; los scripts asumen que el directorio de trabajo es esa raíz.
+Everything lives **only on the instance's disk** (volume without snapshots). Paths are relative to the repo root; the scripts assume the working directory is that root.
 
-| Archivo | Lo escribe | Etapa |
+| File | Written by | Stage |
 |---|---|---|
-| `logs/pipeline_execution.log` | `run_pipeline.sh` (salida de todos los pasos, línea 12) | 1 y 2 |
-| `logs/last_full_run.txt`, `logs/run_mode.txt` | `run_pipeline.sh` (líneas 10-11) | 1 |
-| `../logs/wayakit_app.log` (rotación 5 MB × 3) | `log_config.py:7-8,32-34`. Sube un nivel desde la raíz del repo: queda **fuera del repo**, en el directorio padre | 1 y 2 |
+| `logs/pipeline_execution.log` | `run_pipeline.sh` (output of every step, line 12) | 1 and 2 |
+| `logs/last_full_run.txt`, `logs/run_mode.txt` | `run_pipeline.sh` (lines 10-11) | 1 |
+| `../logs/wayakit_app.log` (rotation 5 MB × 3) | `log_config.py:7-8,32-34`. Goes up one level from the repo root: it ends up **outside the repo**, in the parent directory | 1 and 2 |
 | `ml_model/wayakit_products.csv` | `odoo_api_products.py` | 1 |
-| `ml_model/wayakit_new_products_temp.csv` | `filter_new_products.py` (solo parcial) | 1 |
-| `scraper/analysis-odoo.csv` (versionado en git) | `odoo_api_connection_products.py` (solo completa) | 1 |
-| `scraper/analysis-odoo_partial.csv` | `odoo_api_connection_products.py` (solo parcial) | 2 |
+| `ml_model/wayakit_new_products_temp.csv` | `filter_new_products.py` (partial only) | 1 |
+| `scraper/analysis-odoo.csv` (versioned in git) | `odoo_api_connection_products.py` (full only) | 1 |
+| `scraper/analysis-odoo_partial.csv` | `odoo_api_connection_products.py` (partial only) | 2 |
 | `scraper/competitors_complete.csv` | `scraper/main.py` | 2 |
 | `ml_model/wayakit_cotizations.csv` | `odoo_api_cotizations.py` | 2 |
 | `ml_model/competitor_products_from_odoo.csv` | `odoo_api_competitor_products.py` | 2 |
 | `ml_model/competitor_volumetric_processed.csv`, `competitor_unit_processed.csv` | `1a_preprocess_data.py` | 2 |
 | `ml_model/wayakit_products_to_predict_odoo.csv` | `1b_preprocess_data.py` | 2 |
-| `ml_model/trained_models/*.joblib` (modelos, columnas y `*_market_stats.joblib`) | `2_train_models.py:110-111,171-178` | 2 |
-| `ml_model/wayakit_prediction_report.csv` | `3_predicted_prices.py` (lo sube `odoo_api_price_suggestion.py`) | 2 |
+| `ml_model/trained_models/*.joblib` (models, columns and `*_market_stats.joblib`) | `2_train_models.py:110-111,171-178` | 2 |
+| `ml_model/wayakit_prediction_report.csv` | `3_predicted_prices.py` (uploaded by `odoo_api_price_suggestion.py`) | 2 |
 
-No hay grupos de CloudWatch Logs ni bucket de S3 de PI. La foto "antes" (CSV de la corrida del 13–15 nov 2026) se copió el 2026-11-17 a `data/f1_antes_2026-11-15/` en el repo local, ignorada por git; los modelos `.joblib` quedan en el snapshot del disco. Planeado (F3): bucket `price-intelligence-<cuenta>` con `data/`, `models/`, `state/`, `logs/` y `releases/`.
+There are no CloudWatch Logs groups or S3 bucket for PI. The "before" snapshot (CSVs from the Nov 13–15, 2026 run) was copied on 2026-11-17 to `data/f1_before_2026-11-15/` in the local repo, ignored by git; the `.joblib` models remain in the disk snapshot. Planned (F3): bucket `price-intelligence-<account>` with `data/`, `models/`, `state/`, `logs/` and `releases/`.
 
-### Saber si la última corrida funcionó
+### Knowing whether the last run worked
 
-No hay alertas ni correos hoy. Planeado (F3): aviso por SNS desde el trap de salida.
+There are no alerts or emails today. Planned (F3): SNS notification from the exit trap.
 
-1. **Sin encender la instancia:** en Odoo (compañía KSA, ver [Revisar resultados en Odoo](#revisar-resultados-en-odoo)), revisar la fecha de creación de los registros de `product.price.suggestion`. Si es de la última corrida completa, la subida se hizo.
-2. **CloudTrail** (eu-north-1): eventos `StartInstances` de los jueves y viernes a las 21:50 CDMX confirman que los schedules dispararon. No dicen si el pipeline terminó bien.
-3. **Con la instancia encendida** (ver [Correr a mano](#correr-a-mano)): leer `logs/pipeline_execution.log` completo. **No basta con buscar "Éxito"**: varios scripts terminan con código 0 aunque fallen.
-
----
-
-## Revisión manual entre etapas
-
-Cómo funciona hoy (solo en las corridas **completas**):
-
-1. La etapa 1 (jueves) regenera `scraper/analysis-odoo.csv` en el disco de la instancia y registra "listo para revisión manual" (`run_pipeline.sh:93`).
-2. Antes de la etapa 2 (viernes 21:50 CDMX), alguien revisa la lista de búsqueda (columna `Search Modifiers`), hace commit en `main` de `scraper/analysis-odoo.csv` y, para que el cambio dure, también de `scraper/modifiers_mapping.csv`. En el historial hay commits "weekly analysis-odoo edition" (6be62f5 y 7a5b506). Algunos se hicieron desde el servidor (autor "Ubuntu", noviembre de 2025).
-3. La etapa 2 hace `git pull` y usa la lista revisada.
-
-Quién revisa hoy y cómo es una pregunta abierta (pregunta 2 del plan).
-
-Riesgos:
-
-- La etapa 1 **reescribe en la instancia un archivo versionado**. Si alguien hizo push de su revisión, `git pull` falla con "local changes would be overwritten", el error no se revisa y la etapa 2 sigue con la lista **sin revisar**.
-- Las ediciones que se hacen solo en `analysis-odoo.csv` se pierden en la siguiente completa, porque ese archivo se regenera desde `modifiers_mapping.csv`.
-- En las corridas **parciales** (deshabilitadas desde e25e2c9) no había revisión: `analysis-odoo_partial.csv` se genera dentro de la etapa 2 (`run_pipeline.sh:187`).
-- El `git pull` también trae cualquier cambio de código que haya en la rama en checkout (`server-improvement`), a mitad de la corrida.
-- Verificado en F1: la instancia no tiene credenciales de git guardadas (sin `credential.helper` ni `~/.git-credentials`).
-
-Mafer confirmó que **la revisión de keywords hace falta** (los sitios no encuentran algunos productos con el nombre genérico). El nuevo diseño, que no frene la corrida mensual, está en revisión (`plan.md`, sección 6).
+1. **Without starting the instance:** in Odoo (KSA company, see [Reviewing results in Odoo](#reviewing-results-in-odoo)), check the creation date of the `product.price.suggestion` records. If it matches the last full run, the upload happened.
+2. **CloudTrail** (eu-north-1): `StartInstances` events on Thursdays and Fridays at 21:50 CDMX confirm that the schedules fired. They do not say whether the pipeline finished successfully.
+3. **With the instance running** (see [Running by hand](#running-by-hand)): read the full `logs/pipeline_execution.log`. **Searching for `Success` (`Éxito` in logs written before the English translation reaches the instance) is not enough**: several scripts exit with code 0 even when they fail.
 
 ---
 
-## Correr a mano
+## Manual review between stages
 
-> **Aviso.** Encender la instancia a otra hora no lanza el pipeline (el cron es viernes y sábado 04:00 UTC, sin `@reboot`). Pero la etapa 2 en modo completo **escribe en Odoo** y borra las sugerencias anteriores, y correr `run_pipeline.sh` apaga la instancia al terminar. Antes de encenderla:
-> 1. Tener el OK de Mafer.
-> 2. Si se va a trabajar cerca de los horarios del cron, [pausar la corrida](#pausar-la-corrida) (deshabilitar los dos schedules) y comentar el crontab.
+How it works today (only in **full** runs):
+
+1. Stage 1 (Thursday) regenerates `scraper/analysis-odoo.csv` on the instance's disk and logs that the file is ready for manual review (`run_pipeline.sh:93`).
+2. Before stage 2 (Friday 21:50 CDMX), someone reviews the search list (column `Search Modifiers`), commits `scraper/analysis-odoo.csv` to `main` and, for the change to last, also `scraper/modifiers_mapping.csv`. The history has "weekly analysis-odoo edition" commits (6be62f5 and 7a5b506). Some were made from the server (author "Ubuntu", November 2025).
+3. Stage 2 runs `git pull` and uses the reviewed list.
+
+Who reviews today and how is an open question (plan question 2).
+
+Risks:
+
+- Stage 1 **rewrites a versioned file on the instance**. If someone pushed their review, `git pull` fails with "local changes would be overwritten", the error is not checked and stage 2 continues with the **unreviewed** list.
+- Edits made only in `analysis-odoo.csv` are lost on the next full run, because that file is regenerated from `modifiers_mapping.csv`.
+- In **partial** runs (disabled since e25e2c9) there was no review: `analysis-odoo_partial.csv` is generated inside stage 2 (`run_pipeline.sh:187`).
+- The `git pull` also brings in any code change on the checked-out branch (`server-improvement`), in the middle of the run.
+- Verified in F1: the instance has no stored git credentials (no `credential.helper` and no `~/.git-credentials`).
+
+Mafer confirmed that **the keyword review is needed** (the sites do not find some products by their generic name). The new design, which must not hold up the monthly run, is under review (`plan.md`, section 6).
+
+---
+
+## Running by hand
+
+> **Warning.** Starting the instance at another time does not launch the pipeline (the cron is Friday and Saturday 04:00 UTC, with no `@reboot`). But stage 2 in full mode **writes to Odoo** and deletes the previous suggestions, and running `run_pipeline.sh` shuts down the instance when it finishes. Before starting it:
+> 1. Get Mafer's OK.
+> 2. If you will be working close to the cron times, [pause the run](#pausing-the-run) (disable both schedules) and comment out the crontab.
 >
-> Hay un snapshot del disco del 2026-11-17 (`pi-f1-antes-inventario`, ver `docs/recursos.md`).
+> There is a disk snapshot from 2026-11-17 (`pi-f1-antes-inventario`, see `docs/resources.md`).
 
-1. **Encender la instancia.** Consola de EC2 (Stockholm) → *Instances* → filtrar por `Name = wayakit-app-server` → *Instance state → Start*. La IP pública cambia en cada encendido (no tiene Elastic IP). Para verla sin la consola:
+1. **Start the instance.** EC2 console (Stockholm) → *Instances* → filter by `Name = wayakit-app-server` → *Instance state → Start*. The public IP changes on every start (it has no Elastic IP). To see it without the console:
    ```bash
    aws ec2 describe-instances --profile wayakit-vdc \
      --filters "Name=tag:Name,Values=wayakit-app-server" \
      --query "Reservations[].Instances[].[InstanceId,State.Name]" --output table
    ```
-2. **Entrar por SSM** (desde 2026-11-17; el rol tiene `AmazonSSMManagedInstanceCore`). Esperar 1–2 minutos a que la instancia quede "Online" en SSM. No hace falta llave ni abrir el security group:
+2. **Connect through SSM** (since 2026-11-17; the role has `AmazonSSMManagedInstanceCore`). Wait 1–2 minutes for the instance to show as "Online" in SSM. No key is needed and the security group does not need to be opened:
    ```bash
    aws ssm describe-instance-information --profile wayakit-vdc --query "InstanceInformationList[].[InstanceId,PingStatus]" --output table
-   aws ssm start-session --profile wayakit-vdc --target <instance-id>   # requiere el Session Manager plugin
+   aws ssm start-session --profile wayakit-vdc --target <instance-id>   # requires the Session Manager plugin
    sudo su - ec2-user
    ```
-   Para un comando suelto sin sesión interactiva, usar Run Command (`aws ssm send-command --document-name AWS-RunShellScript ...`). Así se hizo el inventario de F1.
-3. **Revisar el cron y cualquier corrida en curso:**
+   For a one-off command without an interactive session, use Run Command (`aws ssm send-command --document-name AWS-RunShellScript ...`). That is how the F1 inventory was done.
+3. **Check the cron and any run in progress:**
    ```bash
    crontab -l; sudo crontab -l; ls /etc/cron.d; systemctl list-timers --all
    ps aux | grep -E "run_pipeline|python|chrome" | grep -v grep
-   sudo shutdown -c    # cancela un apagado programado por el trap (tiene 1 minuto)
+   sudo shutdown -c    # cancels a shutdown scheduled by the trap (you have 1 minute)
    ```
-   Para pausar el cron, comentar sus líneas con `crontab -e` y anotar qué se cambió para restaurarlo.
-4. **Preparar el entorno.** Repo en `/home/ec2-user/wayakit-price-prediction` (rama `server-improvement`), conda en `/home/ec2-user/miniconda`, entorno `wayakit_env` con Python 3.10.20 (versiones en `environment.yml`). `run_pipeline.sh:14-18` busca conda en `conda info --base` o, si no, en `/home/ec2-user/miniconda` (o en `/home/ubuntu/miniconda3` si existe `/home/ubuntu`, resto del servidor anterior; la AMI actual es Amazon Linux 2023, usuario `ec2-user`).
+   To pause the cron, comment out its lines with `crontab -e` and note what was changed so you can restore it.
+4. **Prepare the environment.** Repo at `/home/ec2-user/wayakit-price-prediction` (branch `server-improvement`), conda at `/home/ec2-user/miniconda`, environment `wayakit_env` with Python 3.10.20 (versions in `environment.yml`). `run_pipeline.sh:14-18` looks for conda at `conda info --base` or, failing that, at `/home/ec2-user/miniconda` (or at `/home/ubuntu/miniconda3` if `/home/ubuntu` exists, a leftover from the previous server; the current AMI is Amazon Linux 2023, user `ec2-user`).
    ```bash
    cd /home/ec2-user/wayakit-price-prediction
    source "$(conda info --base)/etc/profile.d/conda.sh"
    conda activate wayakit_env
    git status; git branch --show-current; git log -1 --oneline
    ```
-   Si hay que recrear el entorno en la instancia: `conda env create -f environment.yml -n wayakit_env`. Sin `-n`, `environment.yml` crea `wayakit-price-prediction` (el nombre local) y `run_pipeline.sh:6` no lo encuentra.
-5. **Correr los pasos**, siempre desde la raíz del repo (las rutas de los scripts son relativas). Es la corrida completa de `run_pipeline.sh`, paso por paso y **sin** el apagado automático:
+   If the environment has to be recreated on the instance: `conda env create -f environment.yml -n wayakit_env`. Without `-n`, `environment.yml` creates `wayakit-price-prediction` (the local name) and `run_pipeline.sh:6` does not find it.
+5. **Run the steps**, always from the repo root (the scripts' paths are relative). This is the full run of `run_pipeline.sh`, step by step and **without** the automatic shutdown:
    ```bash
-   # Etapa 1
+   # Stage 1
    python ml_model/odoo_api_products.py
    python scraper/odoo_api_connection_products.py --input_odoo_products_file ml_model/wayakit_products.csv --output_analysis_file scraper/analysis-odoo.csv
-   # Etapa 2 (respaldar antes el CSV de competencia: el modo overwrite lo reemplaza)
+   # Stage 2 (back up the competitor CSV first: overwrite mode replaces it)
    cp scraper/competitors_complete.csv scraper/competitors_complete.bak.csv
    timeout 30h python scraper/main.py --analysis_file scraper/analysis-odoo.csv --output_mode overwrite --output_file scraper/competitors_complete.csv
    python ml_model/odoo_api_cotizations.py
@@ -198,207 +198,207 @@ Mafer confirmó que **la revisión de keywords hace falta** (los sitios no encue
    python ml_model/1b_preprocess_data.py --run_mode full
    python ml_model/2_train_models.py
    python ml_model/3_predicted_prices.py
-   # Subida a Odoo: solo con OK de Mafer y la compañía KSA confirmada (ver "Volver a subir sugerencias")
+   # Upload to Odoo: only with Mafer's OK and the KSA company confirmed (see "Re-uploading suggestions")
    python ml_model/odoo_api_price_suggestion.py --run_mode full
    ```
-   - Para probar **sin escribir en Odoo**, detenerse después de `3_predicted_prices.py` y revisar `ml_model/wayakit_prediction_report.csv`. Hoy no existe `--dry-run`. Planeado (F2).
-   - Después de cada paso, revisar el final de `../logs/wayakit_app.log`: un paso puede terminar con código 0 aunque haya fallado.
-   - El scraping completo dura hasta 30 h. Si se corta la sesión, el proceso muere: correrlo con `nohup … > <archivo>.log 2>&1 &` (o en `tmux`, si está instalado).
-   - Correr los pasos a mano **no** actualiza `logs/last_full_run.txt` ni `logs/run_mode.txt`. Desde e25e2c9 no importa para el modo: la etapa 1 siempre escribe `run_mode.txt=full`.
-   - La etapa 1 reescribe `scraper/analysis-odoo.csv`, que está versionado: `git status` lo mostrará modificado.
-6. **Al terminar:** cerrar los Chrome que queden (`pkill -f chrome`), restaurar el cron, apagar la instancia (`sudo shutdown -h now` o desde la consola) y volver a habilitar los schedules si corresponde.
+   - To test **without writing to Odoo**, stop after `3_predicted_prices.py` and review `ml_model/wayakit_prediction_report.csv`. There is no `--dry-run` today. Planned (F2).
+   - After each step, check the end of `../logs/wayakit_app.log`: a step can exit with code 0 even if it failed.
+   - The full scraping takes up to 30 h. If the session drops, the process dies: run it with `nohup … > <file>.log 2>&1 &` (or in `tmux`, if installed).
+   - Running the steps by hand does **not** update `logs/last_full_run.txt` or `logs/run_mode.txt`. Since e25e2c9 it does not matter for the mode: stage 1 always writes `run_mode.txt=full`.
+   - Stage 1 rewrites `scraper/analysis-odoo.csv`, which is versioned: `git status` will show it as modified.
+6. **When done:** close any leftover Chrome processes (`pkill -f chrome`), restore the cron, shut down the instance (`sudo shutdown -h now` or from the console) and re-enable the schedules if applicable.
 
-Correr el script completo (`bash run_pipeline.sh` o `bash run_pipeline.sh --stage 2`) también funciona, pero **apaga la instancia al terminar**.
+Running the whole script (`bash run_pipeline.sh` or `bash run_pipeline.sh --stage 2`) also works, but **it shuts down the instance when it finishes**.
 
 ---
 
-## Pausar la corrida
+## Pausing the run
 
-Hoy, desde la consola: **Amazon EventBridge → Scheduler → Schedules** (Stockholm) → seleccionar `Wayakit-Start-Thursday-Night` y `Wayakit-Start-Friday-Night` → **Disable**. Para reanudar, **Enable**. Con los schedules deshabilitados, la instancia no se enciende y el cron interno no corre.
+Today, from the console: **Amazon EventBridge → Scheduler → Schedules** (Stockholm) → select `Wayakit-Start-Thursday-Night` and `Wayakit-Start-Friday-Night` → **Disable**. To resume, **Enable**. With the schedules disabled, the instance does not start and the internal cron does not run.
 
-Revisar el estado (solo lectura):
+Check the state (read-only):
 
 ```bash
 aws scheduler list-schedules --group-name default --profile wayakit-vdc
 aws scheduler get-schedule --group-name default --name Wayakit-Start-Thursday-Night --profile wayakit-vdc
 ```
 
-- No tocar los schedules del grupo `voz-del-cliente`: son de VdC.
-- Si hay que detener una corrida en curso: entrar por SSM, detener el proceso y revisar si ya empezó la subida a Odoo (paso 9 del log). Si se detiene a mitad de la subida en modo completo, la tabla de sugerencias puede quedar vacía (ver [Volver a subir sugerencias](#volver-a-subir-sugerencias)).
-- Planeado (F3): `python infra/schedule.py --disable` / `python infra/schedule.py`, como en VdC. Los dos schedules de `default` se retiran con la lista `RETIRED`.
+- Do not touch the schedules in the `voz-del-cliente` group: they belong to VdC.
+- If a run in progress has to be stopped: connect through SSM, stop the process and check whether the upload to Odoo has already started (step 9 in the log). If it is stopped in the middle of a full-mode upload, the suggestions table may end up empty (see [Re-uploading suggestions](#re-uploading-suggestions)).
+- Planned (F3): `python infra/schedule.py --disable` / `python infra/schedule.py`, as in VdC. The two `default` schedules are retired with the `RETIRED` list.
 
 ---
 
-## Revisar resultados en Odoo
+## Reviewing results in Odoo
 
-> **Confirmar la compañía antes de leer o escribir.** PI es de **KSA** (precios en SAR, scrapers de sitios .sa), pero **hoy ninguna consulta filtra por compañía**: ningún dominio usa `company_id` ni `allowed_company_ids`. No se sabe si la base de `prod/wayakit-app` es solo KSA o compartida con MX, ni a qué compañía pertenece el usuario de la API (pregunta 4 del plan). Al consultar Odoo, a mano o con el conector de Odoo desde Claude, confirmar primero que se trata de la compañía KSA.
+> **Confirm the company before reading or writing.** PI belongs to **KSA** (prices in SAR, scrapers for .sa sites), but **today no query filters by company**: no domain uses `company_id` or `allowed_company_ids`. It is unknown whether the `prod/wayakit-app` database is KSA-only or shared with MX, or which company the API user belongs to (plan question 4). When querying Odoo, by hand or with the Odoo connector from Claude, first confirm that it is the KSA company.
 
-Qué escribe PI:
+What PI writes:
 
-| Modelo | Qué guarda |
+| Model | What it stores |
 |---|---|
-| `product.price.suggestion` | La sugerencia vigente por producto: `product_id_str`, `product_name`, `product_type`, `generic_product_type`, `subindustry`, `industry`, `volume_units`, `production_cost`, `suggested_price`, `profit`, `predicted_price_per_unit`, `model_confidence`, `market_min_found`, `market_max_found`, `competitors_count` (`odoo_api_price_suggestion.py:86-102`) |
-| `product.price.suggestion.history` | Copia de las sugerencias anteriores, con `original_create_date`, que se archiva antes de cada subida completa (`odoo_api_price_suggestion.py:111-146`) |
+| `product.price.suggestion` | The current suggestion per product: `product_id_str`, `product_name`, `product_type`, `generic_product_type`, `subindustry`, `industry`, `volume_units`, `production_cost`, `suggested_price`, `profit`, `predicted_price_per_unit`, `model_confidence`, `market_min_found`, `market_max_found`, `competitors_count` (`odoo_api_price_suggestion.py:86-102`) |
+| `product.price.suggestion.history` | Copy of the previous suggestions, with `original_create_date`, archived before each full upload (`odoo_api_price_suggestion.py:111-146`) |
 
-Qué revisar:
+What to check:
 
-- Después de una corrida **completa**, que el número de registros de `product.price.suggestion` coincida con las filas de `ml_model/wayakit_prediction_report.csv`. Si hay del doble, se subió además en modo parcial (ver Problemas conocidos). Después de una parcial, la tabla tiene las sugerencias anteriores más las de los productos nuevos: el CSV parcial solo trae los nuevos (`1b_preprocess_data.py:23-27`).
-- Que la fecha de creación sea la de la última corrida.
-- `suggested_price` contra `production_cost`: el precio nunca baja de costo × 1.30 (`3_predicted_prices.py:134-136`). Desde e25e2c9, si hay 3 competidores o más, la predicción se recorta al rango `market_min_found`–`market_max_found` antes del piso (`3_predicted_prices.py:126-132`); el piso gana, así que puede quedar arriba del máximo del mercado. Con menos de 3 competidores **no tiene techo**. En Pets suele salir alto (ver [plan.md](plan.md), F5 y F7).
-- `market_min_found` y `market_max_found` salen solo de competidores, sin precios de Wayakit (`2_train_models.py:177-178`).
-- `competitors_count` bajo (1 o 2) quiere decir que la sugerencia se apoya en muy pocos datos y que no se aplicó el recorte al rango de mercado.
-- El reporte trae además `clamped_to_market` y `volume_outside_market` (`3_predicted_prices.py:150-151`), pero `odoo_api_price_suggestion.py` no las sube: solo se ven en `ml_model/wayakit_prediction_report.csv`.
+- After a **full** run, that the number of `product.price.suggestion` records matches the rows in `ml_model/wayakit_prediction_report.csv`. If there are twice as many, it was also uploaded in partial mode (see Known issues). After a partial run, the table has the previous suggestions plus those for the new products: the partial CSV only contains the new ones (`1b_preprocess_data.py:23-27`).
+- That the creation date is that of the last run.
+- `suggested_price` against `production_cost`: the price never goes below cost × 1.30 (`3_predicted_prices.py:134-136`). Since e25e2c9, if there are 3 or more competitors, the prediction is clipped to the `market_min_found`–`market_max_found` range before the floor (`3_predicted_prices.py:126-132`); the floor wins, so it can end up above the market maximum. With fewer than 3 competitors **there is no ceiling**. In Pets it tends to come out high (see [plan.md](plan.md), F5 and F7).
+- `market_min_found` and `market_max_found` come only from competitors, without Wayakit prices (`2_train_models.py:177-178`).
+- A low `competitors_count` (1 or 2) means the suggestion relies on very little data and that the clip to the market range was not applied.
+- The report also includes `clamped_to_market` and `volume_outside_market` (`3_predicted_prices.py:150-151`), but `odoo_api_price_suggestion.py` does not upload them: they are only visible in `ml_model/wayakit_prediction_report.csv`.
 
-Lo que lee PI de Odoo: `product.master` (activos), `sale.order.line` (ventas confirmadas, **fijas a 2025**) y `competitor.product` (todos los registros).
+What PI reads from Odoo: `product.master` (active), `sale.order.line` (confirmed sales, **fixed to 2025**) and `competitor.product` (all records).
 
 ---
 
-## Volver a subir sugerencias
+## Re-uploading suggestions
 
-Sube el contenido de `ml_model/wayakit_prediction_report.csv` a `product.price.suggestion`. Se corre dentro de la instancia, desde la raíz del repo, con `wayakit_env` activo. **Escribe en Odoo: solo con OK de Mafer y con la compañía KSA confirmada.**
+Uploads the contents of `ml_model/wayakit_prediction_report.csv` to `product.price.suggestion`. It is run inside the instance, from the repo root, with `wayakit_env` active. **It writes to Odoo: only with Mafer's OK and with the KSA company confirmed.**
 
 ```bash
 python ml_model/odoo_api_price_suggestion.py --run_mode full
 ```
 
-| Modo | Qué hace |
+| Mode | What it does |
 |---|---|
-| `--run_mode full` | Lee **todos** los registros de `product.price.suggestion` (dominio `id != 0`, sin filtro de compañía), los copia a `product.price.suggestion.history`, hace `unlink` de todos y después un `create` masivo con el CSV (`odoo_api_price_suggestion.py:110-182`) |
-| `--run_mode partial` (o **sin** `--run_mode`: es el valor por defecto, línea 68) | Solo hace `create`, sin borrar. Si ya había sugerencias, quedan duplicadas |
+| `--run_mode full` | Reads **all** `product.price.suggestion` records (domain `id != 0`, no company filter), copies them to `product.price.suggestion.history`, runs `unlink` on all of them and then a bulk `create` with the CSV (`odoo_api_price_suggestion.py:110-182`) |
+| `--run_mode partial` (or **without** `--run_mode`: it is the default value, line 68) | Only runs `create`, without deleting. If there were already suggestions, they end up duplicated |
 
-Riesgos de hoy:
+Today's risks:
 
-- En modo completo se **borra primero y se crea después**. Si el `create` falla, `product.price.suggestion` queda **vacía** (el historial sí queda guardado), y el script solo lo registra en el log: sale con código 0 (líneas 179-181).
-- Si falla el archivado o el `unlink`, el script sale con `exit(1)` sin crear nada (líneas 158-161); si el historial ya se creó, al reintentar se vuelve a copiar.
-- Para recuperar una tabla vacía con el mismo CSV: correr con `--run_mode partial` (solo crea).
-- Si el CSV no existe o no tiene filas válidas, el script termina con `exit()` (código 0) sin subir nada (líneas 78 y 109).
+- In full mode it **deletes first and creates afterwards**. If the `create` fails, `product.price.suggestion` is left **empty** (the history is kept), and the script only logs it: it exits with code 0 (lines 179-181).
+- If archiving or the `unlink` fails, the script exits with `exit(1)` without creating anything (lines 158-161); if the history was already created, retrying copies it again.
+- To recover an empty table with the same CSV: run with `--run_mode partial` (create only).
+- If the CSV does not exist or has no valid rows, the script ends with `exit()` (code 0) without uploading anything (lines 78 and 109).
 
-Planeado (F2): primero `create` del lote nuevo y, solo si sale bien, `unlink` del anterior por IDs guardados (se puede reintentar), con `--dry-run` y filtro por la compañía KSA. XML-RPC no es transaccional: habrá unos segundos con duplicados, y si falla el `unlink`, se reintenta con los IDs guardados.
+Planned (F2): first `create` the new batch and, only if it succeeds, `unlink` the previous one by stored IDs (retryable), with `--dry-run` and a filter for the KSA company. XML-RPC is not transactional: there will be a few seconds with duplicates, and if the `unlink` fails, it is retried with the stored IDs.
 
 ---
 
-## Verificar un cambio antes del commit
+## Verifying a change before committing
 
-En local, con el entorno `wayakit-price-prediction` (ver [Antes de empezar](#antes-de-empezar)). Nada de esto llama a AWS, Odoo, Apify ni Bedrock. Detalle en la skill [`verify`](../.claude/skills/verify/SKILL.md); reglas en [REVIEW.md](../REVIEW.md) y [checklist-confiabilidad.md](checklist-confiabilidad.md), leídas desde la rama base.
+Locally, with the `wayakit-price-prediction` environment (see [Before you start](#before-you-start)). None of this calls AWS, Odoo, Apify or Bedrock. Details in the [`verify`](../.claude/skills/verify/SKILL.md) skill; rules in [REVIEW.md](../REVIEW.md) and [reliability-checklist.md](reliability-checklist.md), read from the base branch.
 
 ```bash
-scripts/verify.sh rapido     # unit + property, segundos
-scripts/verify.sh completo   # + e2e + differential contra origin/server-improvement, ~1.5 min
+scripts/verify.sh quick   # unit + property, seconds
+scripts/verify.sh full    # + e2e + differential against origin/server-improvement, ~1.5 min
 ```
 
-- `completo` necesita `data/f1_antes_2026-11-15/` (ignorada por git) y `git fetch origin`. Si faltan los datos, sale en FALLA: el commit solo puede decir `rapido`.
-- Cada corrida deja `.claude/state/ultima_verificacion.json` (modo, resultado y árbol) y una línea en `.claude/state/verificaciones.jsonl`. El hook `commit-msg` exige el trailer `Verificado: <rapido|completo|ninguna> (<detalle>)` y, para `rapido` o `completo`, un registro OK del mismo árbol. `verify.sh` registra el árbol del índice, así que el orden es `git add` de todo lo que va en el commit, luego `verify.sh` y luego `git commit`, sin tocar nada en medio. El trailer va en el último párrafo del mensaje, junto a `Co-Authored-By` si lo hay (sin línea en blanco entre los dos).
-- Los checks (`REVIEW.md`, `.claude/`, `scripts/`, `pytest.ini`, `tests/conftest.py`, los arneses de `tests/` y `docs/checklist-confiabilidad.md`) van en un PR aparte del código de producción. `scripts/hooks/protect_checks.sh` impide editarlos desde Claude Code salvo con `PI_EDITAR_CHECKS=1`, que solo pone la líder en una sesión sin equipo.
-- **Sesión de solo checks** (para cambiar checks):
-  1. Mafer crea `.claude/settings.local.json` con `{"env": {"PI_EDITAR_CHECKS": "1"}}` (archivo local, ignorado por git). Mientras exista, **no se arma equipo**, porque los compañeros heredarían el permiso.
-  2. Se cambian solo checks y docs, sin `scraper/`, `ml_model/` ni `run_pipeline.sh`. Luego `git add`, `verify.sh completo` y commit con su sello.
-  3. Mafer borra `.claude/settings.local.json` al terminar **y reinicia la sesión de Claude Code**: la variable se queda en el entorno de la sesión que ya está abierta (comprobado el 2026-11-17), así que el candado no vuelve a cerrarse hasta abrir una sesión nueva.
-- **Mientras los checks no estén en la rama base:** el gate de `TaskCompleted` compara contra `merge-base(PI_CHECKS_BASE, HEAD)`. Hasta que el PR de checks entre a `server-improvement`, todo el setup cuenta como "checks cambiados" y el gate bloquearía cualquier tarea que toque producción. Por eso, después del commit de checks y antes de arrancar un equipo, Mafer deja en `.claude/settings.local.json` solo `{"env": {"PI_CHECKS_BASE": "<sha del commit de checks>"}}` (sin `PI_EDITAR_CHECKS`). Los hooks leen el entorno de Claude Code, no el de una terminal. Cuando el PR entra a la base, se quita y vuelve el valor por defecto (`origin/server-improvement`).
-- Si `verify.sh` falla por XPASS, se arregló un bug que tenía `xfail(strict=True)`: hay que quitar ese `xfail` (lo hace `pi-tester`).
-- Si el mismo check falla 3 veces seguidas, parar y escalar a Mafer (regla de las 3 rondas).
+- `full` needs `data/f1_before_2026-11-15/` (ignored by git) and `git fetch origin`. If the data is missing, it ends in FAIL: the commit can only say `quick`.
+- Each run leaves `.claude/state/last_verification.json` (mode, result and tree) and a line in `.claude/state/verifications.jsonl`. The `commit-msg` hook requires the trailer `Verified: <quick|full|none> (<detail>)` and, for `quick` or `full`, an OK record for the same tree. `verify.sh` records the index tree, so the order is `git add` of everything that goes in the commit, then `verify.sh` and then `git commit`, without touching anything in between. The trailer goes in the last paragraph of the message, next to `Co-Authored-By` if present (no blank line between the two).
+- The checks (`REVIEW.md`, `.claude/`, `scripts/`, `pytest.ini`, `tests/conftest.py`, the harnesses in `tests/` and `docs/reliability-checklist.md`) go in a PR separate from production code. `scripts/hooks/protect_checks.sh` blocks editing them from Claude Code unless `PI_EDIT_CHECKS=1`, which only the lead sets in a session without a team.
+- **Checks-only session** (to change checks):
+  1. Mafer creates `.claude/settings.local.json` with `{"env": {"PI_EDIT_CHECKS": "1"}}` (local file, ignored by git). While it exists, **no team is assembled**, because the teammates would inherit the permission.
+  2. Only checks and docs are changed, without `scraper/`, `ml_model/` or `run_pipeline.sh`. Then `git add`, `verify.sh full` and commit with its stamp.
+  3. Mafer deletes `.claude/settings.local.json` when done **and restarts the Claude Code session**: the variable stays in the environment of the session that is already open (confirmed on 2026-11-17), so the lock does not close again until a new session is opened.
+- **While the checks are not on the base branch:** the `TaskCompleted` gate compares against `merge-base(PI_CHECKS_BASE, HEAD)`. Until the checks PR is merged into `server-improvement`, the whole setup counts as "changed checks" and the gate would block any task that touches production. So, after the checks commit and before starting a team, Mafer leaves only `{"env": {"PI_CHECKS_BASE": "<sha of the checks commit>"}}` in `.claude/settings.local.json` (without `PI_EDIT_CHECKS`). The hooks read the Claude Code environment, not a terminal's. When the PR is merged into the base, it is removed and the default value (`origin/server-improvement`) comes back.
+- If `verify.sh` fails due to XPASS, a bug that had `xfail(strict=True)` was fixed: that `xfail` must be removed (`pi-tester` does it).
+- If the same check fails 3 times in a row, stop and escalate to Mafer (3-rounds rule).
 
 ---
 
-## Desplegar y rollback
+## Deploy and rollback
 
-### Hoy
+### Today
 
-- No hay CI/CD ni deploy. El código llega a la instancia con el `git pull` del inicio de la etapa 2 (`run_pipeline.sh:133`): la rama en checkout (`server-improvement`), sin fijar versión y sin revisar el resultado.
-- Un push a `server-improvement` llega en la siguiente etapa 2 programada (viernes), si el pull no falla.
-- **Rollback hoy:** `git revert` del commit en `server-improvement` y push; la siguiente etapa 2 lo trae. No hacer `git checkout <sha>` dentro de la instancia sin OK de Mafer: deja la instancia fuera de la rama y los siguientes `git pull` fallan sin aviso.
+- There is no CI/CD or deploy. Code reaches the instance through the `git pull` at the start of stage 2 (`run_pipeline.sh:133`): the checked-out branch (`server-improvement`), without a pinned version and without checking the result.
+- A push to `server-improvement` arrives on the next scheduled stage 2 (Friday), if the pull does not fail.
+- **Rollback today:** `git revert` of the commit on `server-improvement` and push; the next stage 2 brings it in. Do not run `git checkout <sha>` inside the instance without Mafer's OK: it leaves the instance off the branch and the following `git pull` runs fail silently.
 
-### Planeado (F4): pull-on-boot
+### Planned (F4): pull-on-boot
 
-1. GitHub Actions (OIDC, sin llaves) corre las pruebas en cada push a `main`.
-2. Con CI en verde, publica `releases/<sha>.tar.gz` en S3 y actualiza el puntero `current`.
-3. Enciende la instancia en modo **"solo deploy"**: la instancia instala el release, lo verifica, cambia el symlink de forma atómica y se apaga, sin correr el pipeline.
-4. Si el deploy falla, el symlink no se toca y la versión anterior sigue funcionando.
-5. **Rollback:** `workflow_dispatch` con un `sha`, que mueve el puntero y vuelve a correr el deploy. En la instancia se guardan los últimos 5 releases.
+1. GitHub Actions (OIDC, no keys) runs the tests on every push to `main`.
+2. With CI green, it publishes `releases/<sha>.tar.gz` to S3 and updates the `current` pointer.
+3. It starts the instance in **"deploy only"** mode: the instance installs the release, verifies it, switches the symlink atomically and shuts down, without running the pipeline.
+4. If the deploy fails, the symlink is not touched and the previous version keeps working.
+5. **Rollback:** `workflow_dispatch` with a `sha`, which moves the pointer and runs the deploy again. The last 5 releases are kept on the instance.
 
-Esto depende de F3 (bucket, roles, proveedor OIDC de GitHub, agente SSM, `bootstrap.sh`), que todavía no existe. Los pasos exactos se escriben aquí cuando se implementen.
+This depends on F3 (bucket, roles, GitHub OIDC provider, SSM agent, `bootstrap.sh`), which does not exist yet. The exact steps will be written here when they are implemented.
 
 ---
 
-## Calibración de Apify y prueba de modelos
+## Apify calibration and model test
 
-Las dos corridas se hicieron el 2026-11-16 desde la Mac de Mafer, con su aprobación. Los resultados están en [plan.md](plan.md), sección 5. Los scripts y los datos crudos quedaron **fuera del repo**, en el scratchpad temporal de esa sesión.
+Both runs were done on 2026-11-16 from Mafer's Mac, with her approval. The results are in [plan.md](plan.md), section 5. The scripts and raw data stayed **outside the repo**, in that session's temporary scratchpad.
 
-| Corrida | Cómo se corrió | Costo |
+| Run | How it was run | Cost |
 |---|---|---|
-| Calibración de Apify (`calibrate.py`) | Cliente de VdC (`voz-del-cliente/pipeline/apify.py`), token desde `voz-del-cliente/api-keys` (nunca se imprime). Keyword "pet urine odor remover". `junglee~amazon-crawler` con la URL de búsqueda de amazon.sa, 20 resultados, `scrapeProductDetails: true`, sin `countryCode` ni `zipCode`, tope USD 0.15. `saswave~noon-product-scraper` con la búsqueda de `noon.com/saudi-en`, 1 página, tope USD 0.10, más el detalle de 5 productos (tope USD 0.05) | ~USD 0.08 |
-| Prueba de modelos de Bedrock (`bakeoff.py`) | boto3 con el perfil `wayakit-vdc` en eu-north-1, API Converse con `temperature=0` y salida JSON con schema. DeepSeek V3.2, Qwen3 235B y Haiku 4.5 sobre 66 títulos de la calibración: lotes de 22, un título por llamada y 10 títulos de wipes. Con ella se aceptaron los EULA de DeepSeek y Qwen | ~USD 0.04 en total |
+| Apify calibration (`calibrate.py`) | VdC client (`voz-del-cliente/pipeline/apify.py`), token from `voz-del-cliente/api-keys` (never printed). Keyword "pet urine odor remover". `junglee~amazon-crawler` with the amazon.sa search URL, 20 results, `scrapeProductDetails: true`, no `countryCode` or `zipCode`, cap USD 0.15. `saswave~noon-product-scraper` with the `noon.com/saudi-en` search, 1 page, cap USD 0.10, plus the details of 5 products (cap USD 0.05) | ~USD 0.08 |
+| Bedrock model test (`bakeoff.py`) | boto3 with the `wayakit-vdc` profile in eu-north-1, Converse API with `temperature=0` and JSON output with schema. DeepSeek V3.2, Qwen3 235B and Haiku 4.5 on 66 titles from the calibration: batches of 22, one title per call and 10 wipes titles. The DeepSeek and Qwen EULAs were accepted with it | ~USD 0.04 in total |
 
-- Volver a correrlas cuesta dinero (Apify y Bedrock): pedir OK de Mafer y fijar topes por actor (`maxItems` y `maxTotalChargeUsd`).
-- La cuenta de Apify es la de VdC: el gasto de PI compite con el límite mensual de esa cuenta (ver `voz-del-cliente/docs/runbook.md`, sección *Apify*).
-- Planeado (F2): el script de la prueba de modelos pasa al repo como `tests/bakeoff_relevance.py`. [plan.md](plan.md) no dice si el script de calibración también se pasa al repo; pendiente de decidir (sería útil para repetir la calibración con otras keywords en F6).
-
----
-
-## Cambiar una llave
-
-Todas las credenciales de PI están en el secreto `prod/wayakit-app` (eu-north-1), como pares llave/valor. Las llaves nunca pasan por el chat, el repo, un archivo ni Notion.
-
-1. Consola de AWS (Stockholm) → **Secrets Manager → `prod/wayakit-app` → Retrieve secret value → Edit** → pestaña *Key/value*.
-2. Cambiar solo el valor de la llave que corresponde. **No borrar las otras filas.** → **Save**.
-3. Si fue un reemplazo, revocar la llave vieja en su servicio.
-
-- Hoy hay 6 copias de `get_secret()` con el nombre del secreto y la región fijos en el código. Planeado (F2): un solo módulo, `pi_secrets.py`, y la llave de Apify en el mismo secreto.
-- Planeado (después de F2): al terminar el cambio a Bedrock, quitar `GEMINI_API_KEY` del secreto, revocar la key y limpiar los logs (ver Problemas conocidos, *Seguridad*).
+- Running them again costs money (Apify and Bedrock): ask for Mafer's OK and set caps per actor (`maxItems` and `maxTotalChargeUsd`).
+- The Apify account is VdC's: PI's spending competes with that account's monthly limit (see `voz-del-cliente/docs/runbook.md`, section *Apify*).
+- Planned (F2): the model test script moves into the repo as `tests/bakeoff_relevance.py`. [plan.md](plan.md) does not say whether the calibration script also moves into the repo; pending decision (it would be useful to repeat the calibration with other keywords in F6).
 
 ---
 
-## Problemas conocidos
+## Changing a key
 
-Errores que ya aparecieron o que se ven en el código, y qué hacer. Las líneas son de e25e2c9 (`server-improvement`, lo que corre la instancia; `pi-mejoras` ya está en ese commit).
+All PI credentials are in the secret `prod/wayakit-app` (eu-north-1), as key/value pairs. Keys never go through chat, the repo, a file or Notion.
 
-### Ejecución
+1. AWS console (Stockholm) → **Secrets Manager → `prod/wayakit-app` → Retrieve secret value → Edit** → *Key/value* tab.
+2. Change only the value of the relevant key. **Do not delete the other rows.** → **Save**.
+3. If it was a replacement, revoke the old key in its service.
 
-| Síntoma | Causa | Solución |
+- Today there are 6 copies of `get_secret()` with the secret name and region hard-coded. Planned (F2): a single module, `pi_secrets.py`, and the Apify key in the same secret.
+- Planned (after F2): once the switch to Bedrock is done, remove `GEMINI_API_KEY` from the secret, revoke the key and clean the logs (see Known issues, *Security*).
+
+---
+
+## Known issues
+
+Errors that have already appeared or that are visible in the code, and what to do. Line numbers are from e25e2c9 (`server-improvement`, what the instance runs; `pi-improvements` contains that commit with no production changes since).
+
+### Execution
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| El log dice "Éxito" en un paso que falló | Varios scripts terminan con `exit()`, que devuelve 0: `odoo_api_products.py:48,54,67,126`, `odoo_api_cotizations.py:49,55,66,101`, `odoo_api_price_suggestion.py:52,56,65,78,109`. Otros atrapan la excepción y siguen (`1a_preprocess_data.py:87-90`, `2_train_models.py:182-183`) | Leer el log completo, no solo "Éxito". Planeado (F2): `sys.exit(1)` |
-| La etapa 2 entrena y sube a Odoo aunque el scraping falló | Los pasos de la etapa 2 no llevan `\|\| exit 1` (`run_pipeline.sh:154-167,187-201`), y la completa borra `competitors_complete.csv` antes de scrapear (línea 151) | Revisar el log antes de confiar en las sugerencias. Planeado (F2): `\|\| exit 1` por paso y escribir el CSV nuevo en un temporal |
-| La etapa 2 usó la lista sin revisar o código viejo | `git pull` falló ("local changes would be overwritten") porque la etapa 1 reescribe `scraper/analysis-odoo.csv`, y nadie revisa el resultado (`run_pipeline.sh:133`) | Ver [Revisión manual entre etapas](#revisión-manual-entre-etapas). Planeado (F2): quitar `git pull` |
-| La etapa 1 y la etapa 2 corren a la vez (posible, no observado) | El cron de la etapa 2 es a hora fija (sábado 04:00 UTC) y no revisa si la etapa 1 sigue corriendo | Revisar `logs/pipeline_execution.log`. Planeado (F3): un solo schedule mensual |
-| **La corrida del 13–15 nov 2026 subió sugerencias a Odoo con el scraping fallido** | El scraping llegó al `timeout 30h` y salió con error, pero `competitors_complete.csv` ya tenía solo 53 filas (SACO Automotive 36, AeroSense 14, Fine Airports 3; nada de Amazon, Home ni Pets). Los pasos siguientes no revisan el error: entrenó, subió en modo full (borró las anteriores) y terminó con código 0 | Las sugerencias actuales de Odoo salen casi solo de `competitor.product`. Planeado (F2): `\|\| exit 1` por paso, mínimo de filas por fuente y subida segura |
-| `wayakit_app.log` no está en `logs/` del repo | `log_config.py:7` sube un nivel desde la raíz del repo | Buscarlo en `../logs/wayakit_app.log` |
-| Un `.joblib` no carga después de actualizar paquetes | `requirements.txt` no fija versiones de pandas, numpy ni scikit-learn | No actualizar paquetes en `wayakit_env` a mano. `environment.yml` (2026-11-17) fija las versiones de la instancia (Python 3.10.20, scikit-learn 1.7.2, pandas 2.3.3, numpy 2.2.6). Para recrearlo en la instancia: `conda env create -f environment.yml -n wayakit_env` |
-| La corrida local da otros precios que el reporte de producción | Con los datos congelados de `data/f1_antes_2026-11-15/`, la corrida local cambia 520 de 738 `predicted_price` (hasta 51.86 SAR), aunque los procesados salen iguales. Causa en investigación: CPU/BLAS, versiones de scikit-learn o numpy, o que esa corrida no fuera e25e2c9 | No comparar salidas locales contra producción. Las pruebas diferenciales comparan base contra versión nueva en la misma máquina (`scripts/verify.sh completo`). Ver `plan.md`, hallazgo 13 |
+| The log says `Success` for a step that failed | Several scripts end with `exit()`, which returns 0: `odoo_api_products.py:48,54,67,126`, `odoo_api_cotizations.py:49,55,66,101`, `odoo_api_price_suggestion.py:52,56,65,78,109`. Others catch the exception and continue (`1a_preprocess_data.py:87-90`, `2_train_models.py:182-183`) | Read the full log, not just `Success`. Planned (F2): `sys.exit(1)` |
+| Stage 2 trains and uploads to Odoo even though scraping failed | The stage 2 steps do not have `\|\| exit 1` (`run_pipeline.sh:154-167,187-201`), and the full run deletes `competitors_complete.csv` before scraping (line 151) | Check the log before trusting the suggestions. Planned (F2): `\|\| exit 1` per step and write the new CSV to a temporary file |
+| Stage 2 used the unreviewed list or old code | `git pull` failed ("local changes would be overwritten") because stage 1 rewrites `scraper/analysis-odoo.csv`, and nobody checks the result (`run_pipeline.sh:133`) | See [Manual review between stages](#manual-review-between-stages). Planned (F2): remove `git pull` |
+| Stage 1 and stage 2 run at the same time (possible, not observed) | The stage 2 cron is at a fixed time (Saturday 04:00 UTC) and does not check whether stage 1 is still running | Check `logs/pipeline_execution.log`. Planned (F3): a single monthly schedule |
+| **The Nov 13–15, 2026 run uploaded suggestions to Odoo with failed scraping** | Scraping hit the `timeout 30h` and exited with an error, but `competitors_complete.csv` only had 53 rows (SACO Automotive 36, AeroSense 14, Fine Airports 3; nothing from Amazon, Home or Pets). The following steps do not check the error: it trained, uploaded in full mode (deleted the previous ones) and ended with code 0 | The current suggestions in Odoo come almost entirely from `competitor.product`. Planned (F2): `\|\| exit 1` per step, minimum rows per source and safe upload |
+| `wayakit_app.log` is not in the repo's `logs/` | `log_config.py:7` goes up one level from the repo root | Look for it at `../logs/wayakit_app.log` |
+| A `.joblib` does not load after updating packages | `requirements.txt` does not pin versions of pandas, numpy or scikit-learn | Do not update packages in `wayakit_env` by hand. `environment.yml` (2026-11-17) pins the instance's versions (Python 3.10.20, scikit-learn 1.7.2, pandas 2.3.3, numpy 2.2.6). To recreate it on the instance: `conda env create -f environment.yml -n wayakit_env` |
+| The local run gives different prices than the production report | With the frozen data in `data/f1_before_2026-11-15/`, the local run changes 520 of 738 `predicted_price` values (up to 51.86 SAR), even though the processed files come out identical. Cause under investigation: CPU/BLAS, scikit-learn or numpy versions, or that run not being e25e2c9 | Do not compare local outputs against production. The differential tests compare base against the new version on the same machine (`scripts/verify.sh full`). See `plan.md`, finding 13 |
 
 ### Scraping
 
-| Síntoma | Causa | Solución |
+| Symptom | Cause | Fix |
 |---|---|---|
-| La corrida termina con 0 productos y sin error | Falta `GEMINI_API_KEY` en `prod/wayakit-app` o no se pudo leer: `is_relevant` devuelve `False` para todo (`scraper/services/ai_service.py:138-139`) y solo queda el aviso "API KEY not found" | Revisar que la llave exista en el secreto (sin imprimir el valor). Planeado (F2): Bedrock y fallar si los errores de la IA pasan del 5 % |
-| Se descartan productos en silencio | Ante un 429, Gemini espera 60 s; al tercer intento devuelve `False` (`ai_service.py:151-154`) | Buscar "RATE LIMIT HIT" en `wayakit_app.log`. Planeado (F2): Bedrock por lotes |
-| Land transportation no tiene datos de competencia | `config.py:19` dice `'Land Transportation'` y `analysis-odoo.csv` dice `Land transportation` (31 filas). La comparación distingue mayúsculas (`main.py:333`) y no avisa | Pendiente: corregir la clave en `scraper/config.py:19` (cambio de código, con OK de Mafer) |
-| 4 exclusiones de SACO no se aplican | Faltan comas en `SACO_EXCLUSIONS` (`config.py:65,70`): Python une los textos | Pendiente: agregar las comas |
-| GoGreen: "Could not set language to English" muchas veces | Visto en la corrida del 13–15 nov 2026 (`gogreen_scraper.py:48`); el cambio de idioma del sitio falla | Pendiente: revisar el scraper de GoGreen (cambio de código, con OK de Mafer) |
-| Quedan procesos de Chrome abiertos | En SACO, `driver.get` y `_handle_overlays` están fuera del `try` (`saco_scraper.py:122-123`) y los errores que no son Timeout no cierran el navegador | `pkill -f chrome` al correr a mano. La instancia se apaga al final de la corrida programada |
-| El scraping no arranca: "No se pudo instalar ChromeDriver" | `ChromeDriverManager().install()` resuelve el driver en cada corrida y lo descarga si no está en caché (`main.py:263`) y depende de la red y de la versión de Chrome | Reintentar. En la instancia: Google Chrome 146.0.7680.177 y webdriver-manager 4.0.2 (F1) |
-| Precio por litro inflado en Amazon | Sin multiplicador de pack: un "Pack of 3, 500 ml" se guarda como 500 ml con el precio de 3 (`amazon_scraper.py:80-109`). En Mumzworld, la regex de pack toma el volumen como multiplicador (`mumzworld_scraper.py:58`) | Planeado (F6/F7): multiplicador de pack en los adaptadores de Apify y estadística robusta en Pets |
-| Productos de Wayakit en los resultados de Amazon y Noon | Ni el scraper de Amazon ni los actores excluyen la marca o el vendedor Wayakit (se vio en la calibración) | Planeado (F6): excluir marca y vendedor Wayakit, como VdC |
+| The run ends with 0 products and no error | `GEMINI_API_KEY` is missing from `prod/wayakit-app` or could not be read: `is_relevant` returns `False` for everything (`scraper/services/ai_service.py:138-139`) and the only trace is the "API KEY not found" warning | Check that the key exists in the secret (without printing the value). Planned (F2): Bedrock and fail if AI errors exceed 5 % |
+| Products are silently discarded | On a 429, Gemini waits 60 s; on the third attempt it returns `False` (`ai_service.py:151-154`) | Search for "RATE LIMIT HIT" in `wayakit_app.log`. Planned (F2): Bedrock in batches |
+| Land transportation has no competitor data | `config.py:19` says `'Land Transportation'` and `analysis-odoo.csv` says `Land transportation` (31 rows). The comparison is case-sensitive (`main.py:333`) and gives no warning | Pending: fix the key in `scraper/config.py:19` (code change, with Mafer's OK) |
+| 4 SACO exclusions are not applied | Missing commas in `SACO_EXCLUSIONS` (`config.py:65,70`): Python concatenates the strings | Pending: add the commas |
+| GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
+| Chrome processes are left open | In SACO, `driver.get` and `_handle_overlays` are outside the `try` (`saco_scraper.py:122-123`) and errors other than Timeout do not close the browser | `pkill -f chrome` when running by hand. The instance shuts down at the end of the scheduled run |
+| Scraping does not start: `Could not install ChromeDriver` | `ChromeDriverManager().install()` resolves the driver on every run and downloads it if it is not cached (`main.py:263`), and depends on the network and the Chrome version | Retry. On the instance: Google Chrome 146.0.7680.177 and webdriver-manager 4.0.2 (F1) |
+| Inflated price per liter on Amazon | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (`amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Planned (F6/F7): pack multiplier in the Apify adapters and robust statistics in Pets |
+| Wayakit products in the Amazon and Noon results | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | Planned (F6): exclude the Wayakit brand and seller, as VdC does |
 
-### ML y Odoo
+### ML and Odoo
 
-| Síntoma | Causa | Solución |
+| Symptom | Cause | Fix |
 |---|---|---|
-| Las ventas de 2026 no influyen en las sugerencias | Fechas fijas de 2025-01-01 a 2025-12-31 (`odoo_api_cotizations.py:75-76`) | Planeado (F2): últimos 12 meses móviles |
-| Filas con precio 0 o productos en `kg` con precios raros | Las filas `0.00` no se descartan y `kg` no está en `volumetric_units`, así que cae en precio por pieza (`1a_preprocess_data.py:55-57,79`) | Planeado (F7): correcciones chicas |
-| `product.price.suggestion` vacía | En modo completo se hace `unlink` y después `create`; si el `create` falló, la tabla queda vacía (`odoo_api_price_suggestion.py:148-182`) | Volver a subir con `--run_mode partial` (ver [Volver a subir sugerencias](#volver-a-subir-sugerencias)). Planeado (F2): `create` y luego `unlink` |
-| Sugerencias duplicadas | Se corrió `odoo_api_price_suggestion.py` sin `--run_mode` (por defecto `partial`) o dos veces en parcial | Volver a subir con `--run_mode full`, solo si `wayakit_prediction_report.csv` es de una corrida completa (el parcial solo trae productos nuevos) |
-| Datos de otra compañía en ventas o sugerencias | Ninguna consulta filtra por compañía (`ml_model/odoo_api_*.py`) | Confirmar la compañía KSA antes de leer o escribir. Planeado (F2): filtro por compañía |
+| 2026 sales do not influence the suggestions | Dates fixed from 2025-01-01 to 2025-12-31 (`odoo_api_cotizations.py:75-76`) | Planned (F2): rolling last 12 months |
+| Rows with price 0 or products in `kg` with odd prices | `0.00` rows are not discarded and `kg` is not in `volumetric_units`, so it falls into price per piece (`1a_preprocess_data.py:55-57,79`) | Planned (F7): small fixes |
+| `product.price.suggestion` empty | In full mode `unlink` runs first and then `create`; if the `create` failed, the table is left empty (`odoo_api_price_suggestion.py:148-182`) | Re-upload with `--run_mode partial` (see [Re-uploading suggestions](#re-uploading-suggestions)). Planned (F2): `create` and then `unlink` |
+| Duplicate suggestions | `odoo_api_price_suggestion.py` was run without `--run_mode` (defaults to `partial`) or twice in partial | Re-upload with `--run_mode full`, only if `wayakit_prediction_report.csv` is from a full run (the partial one only contains new products) |
+| Data from another company in sales or suggestions | No query filters by company (`ml_model/odoo_api_*.py`) | Confirm the KSA company before reading or writing. Planned (F2): company filter |
 
-### Apify (Planeado, F6; visto en la calibración)
+### Apify (Planned, F6; seen in the calibration)
 
-| Síntoma | Causa | Solución |
+| Symptom | Cause | Fix |
 |---|---|---|
-| Noon devuelve 50 filas aunque `maxItems` era 20 | `saswave/noon-product-scraper` entrega la página completa | Correr una vez por keyword, con tope de gasto (`maxTotalChargeUsd`), y cortar en el convertidor |
-| En Amazon, los tamaños no coinciden entre `Item Volume`, `Unit Count` y `Size` (ej. "5 Liters" contra "907 Grams") | Amazon llena esos campos de forma inconsistente | Conservar la regla de que 2 de 3 fuentes coincidan, o resolverlo con el modelo de IA |
-| Casi nunca viene el país de origen | `Country of Origin` vino en 3 de 20 en Amazon y no viene en Noon | Usar señales que sí vienen: vendedor, envío "global" de Noon, unidades en fl oz (F7) |
+| Noon returns 50 rows even though `maxItems` was 20 | `saswave/noon-product-scraper` delivers the full page | Run once per keyword, with a spending cap (`maxTotalChargeUsd`), and truncate in the converter |
+| On Amazon, sizes do not match between `Item Volume`, `Unit Count` and `Size` (e.g. "5 Liters" vs "907 Grams") | Amazon fills those fields inconsistently | Keep the rule that 2 of 3 sources must agree, or resolve it with the AI model |
+| Country of origin almost never comes through | `Country of Origin` came in 3 of 20 on Amazon and does not come on Noon | Use signals that do come through: seller, Noon "global" shipping, units in fl oz (F7) |
 
-### Seguridad
+### Security
 
-| Síntoma | Causa | Solución |
+| Symptom | Cause | Fix |
 |---|---|---|
-| **La key de Gemini está en texto plano** en `logs/cron.log` (72 líneas) y `logs/pipeline_execution.log` (87 líneas) de la instancia (confirmado en F1). En `~/logs/wayakit_app.log*` no aparece | La key va en la URL (`ai_service.py:54-55`) y los `requests.exceptions.HTTPError` se registran con la URL completa | No copiar ni imprimir esos logs sin redactar `key=`. **Revocar o rotar la key en Google ya**, depurar o borrar los logs y avisar a IT (Mafer). Planeado (F2): Bedrock y quitar la llave de `prod/wayakit-app` |
-| El rol de la instancia puede leer y escribir todos los secretos de la cuenta, incluido `voz-del-cliente/api-keys` | `Wayakit-EC2-Secrets-Role` tiene `SecretsManagerReadWrite` | Avisar a IT. Planeado (F3): `instance_role.py` con mínimo privilegio |
+| **The Gemini key is in plain text** in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance (confirmed in F1). It does not appear in `~/logs/wayakit_app.log*` | The key goes in the URL (`ai_service.py:54-55`) and `requests.exceptions.HTTPError` exceptions are logged with the full URL | Do not copy or print those logs without redacting `key=`. **Revoke or rotate the key in Google now**, clean up or delete the logs and notify IT (Mafer). Planned (F2): Bedrock and remove the key from `prod/wayakit-app` |
+| The instance role can read and write every secret in the account, including `voz-del-cliente/api-keys` | `Wayakit-EC2-Secrets-Role` has `SecretsManagerReadWrite` | Notify IT. Planned (F3): `instance_role.py` with least privilege |
