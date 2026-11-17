@@ -60,7 +60,7 @@ Open questions for Mafer (numbered as in `plan.md`, section 4):
 12. Should a "3X" concentration in the title multiply the volume? Today `'Detergent 3X concentrate 500 ml'` gives 1500 ml (`plan.md`, finding 12, bug 9).
 13. Should the bugs in the shared parsers in `scraper/utils.py` be fixed (this changes Mumzworld and SACO rows), or only corrected in the Apify adapters? (`plan.md`, finding 12, bugs 1–4)
 14. Data contracts still in Spanish: the report column `porcentaje_de_ganancia` (read by `odoo_api_price_suggestion.py`) and the `'Desconocido'` fill value in `2_train_models.py` (it ends up in one-hot column names). Rename them too? It changes outputs, so it needs a differential approval.
-15. Remove the legacy `PI_EDITAR_CHECKS` alias line from `scripts/hooks/protect_checks.sh` (`TODO(remove-after-translation)`) once Mafer restarts the Claude Code session; it is a checks-only change.
+15. ~~Remove the legacy `PI_EDITAR_CHECKS` alias from `scripts/hooks/protect_checks.sh`.~~ Done 2026-11-17, after PRs #2 and #3 were merged.
 
 To investigate (F2): the local run does not reproduce the production report (520 of 738 prices differ, by up to 51.86 SAR; `plan.md`, finding 13). Meanwhile, the differential tests only compare base against the new version on the same machine.
 
