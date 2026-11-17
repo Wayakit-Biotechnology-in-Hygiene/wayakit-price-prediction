@@ -126,7 +126,15 @@ Original plan:
 4. Review the cron (if it has `@reboot`, turn it off before it fires), the checked-out branch, local changes, the conda environment, the git credentials and the Gemini log.
 5. Copy the current CSVs and models to S3. That is the **"before" snapshot** for ticket A.
 
-### F2 · Harden the pipeline (2 days)
+### F2 · Harden the pipeline (2 days) — **implemented on branch `f2-hardening` (2026-11-17), not deployed**
+
+Result (details in `docs/decisions.md` and `docs/runbook.md`):
+- Done: `|| exit 1` on every step and no `git pull` in stage 2 (the two stages stay while question 2 is open); `sys.exit(1)` and no swallowed exceptions in the ML and Odoo scripts (Odoo reads with 0 records also exit 1); `scraper/main.py` writes to a temporary file and renames it only on success; `pi_secrets.py` (plus `pi_odoo.py` for the connection) replaces the 6 copies of `get_secret()`; Bedrock (DeepSeek V3.2 + Haiku 4.5) replaces Gemini with the same `RelevanceAgent` interface; safe upload (company check, create first, unlink the saved IDs, `--dry-run`, `--cleanup-previous`); sales from the last rolling 12 months; coverage report `scraper/coverage_report.csv` (section 6, step 1). The ML differential shows no price change.
+- **Not deployed:** the instance role has no `bedrock:InvokeModel` until F3, so F2 must not reach the instance before then (Pending 16 in `decisions.md`).
+- Left for later: `infra/bedrock_profile.py` and the IAM permission (F3); the single monthly stage (question 2); the company filter beyond the one-company check; the bake-off script in the repo; environment parity (finding 13); the property-test bugs (finding 12) and the `TARGET_MAP` case bug (C06), which change rows.
+
+Original plan:
+
 
 - `|| exit 1` on every step (do not use `set -u`, because it breaks conda) and `sys.exit(1)` in the Odoo scripts.
 - Do not delete `competitors_complete.csv` before the new one exists: write to a temporary file and rename it.

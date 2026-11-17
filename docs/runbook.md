@@ -3,7 +3,7 @@
 Practical guide to operating Price Intelligence (PI). Each section solves one concrete task.
 To know *what* exists in AWS, see [resources.md](resources.md). To know *why* it is the way it is, see [decisions.md](decisions.md). The improvement plan is in [plan.md](plan.md).
 
-Status as of 2026-11-17: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory). Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). Nothing has been created or changed in AWS for the plan.
+Status as of 2026-11-17: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory), plus the **F2 changes** (marked "since F2"): they are in the code of this branch but **not yet on the instance**, which still runs the pre-F2 code (see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)). Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). Nothing has been created or changed in AWS for the plan.
 
 AWS commands are run from the repo root, on a Mac with AWS CLI v2. Pipeline commands are run inside the EC2 instance.
 
@@ -41,7 +41,7 @@ aws sts get-caller-identity --profile wayakit-vdc
 
 - **Always use `--profile wayakit-vdc`, never the `default` profile**: on the team's Macs, `default` uses long-term access keys.
 - Region: **`eu-north-1` (Stockholm)**. In the console, check the region selector before looking for anything. There are leftovers in the previous region, me-south-1 (2 roles and the secret `wayakit/test/credentials`), that could not be inventoried (plan question 10).
-- The Odoo and Gemini credentials live in the secret `prod/wayakit-app` (keys `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` and `GEMINI_API_KEY`). Never print or copy the values.
+- The Odoo and Gemini credentials live in the secret `prod/wayakit-app` (keys `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` and `GEMINI_API_KEY`). Never print or copy the values. Since F2 the code reads them only through `pi_secrets.py` and no longer reads `GEMINI_API_KEY` (Bedrock uses the instance role).
 
 ---
 
@@ -69,27 +69,28 @@ aws sts get-caller-identity --profile wayakit-vdc
 
 1. The run is **always full**: since e25e2c9 partial mode is disabled (`IS_FULL_RUN="true"`, `run_pipeline.sh:67-68`). `logs/last_full_run.txt` is still written, but it no longer decides anything.
 2. Activates conda (`wayakit_env`) and runs `ml_model/odoo_api_products.py` → `ml_model/wayakit_products.csv` (`run_pipeline.sh:86`).
-3. `scraper/odoo_api_connection_products.py` generates `scraper/analysis-odoo.csv` from the Odoo products and `scraper/modifiers_mapping.csv`, and writes `run_mode.txt=full` and `last_full_run.txt` (`run_pipeline.sh:90-93`).
+3. `scraper/odoo_api_connection_products.py` generates `scraper/analysis-odoo.csv` from the Odoo products and `scraper/modifiers_mapping.csv`, and writes `run_mode.txt=full` and `last_full_run.txt` (`run_pipeline.sh:90-93`). Since F2 it does not connect to Odoo or read secrets (it only reads the CSV), and a missing or malformed `modifiers_mapping.csv` is an error (exit 1) instead of a warning with empty modifiers.
 4. The partial branch (`ml_model/filter_new_products.py` → `ml_model/wayakit_new_products_temp.csv`, `run_mode.txt=partial`, `run_pipeline.sh:95-100`) is still in the code, but is no longer reached.
 5. Exits and the instance shuts down.
 
 In stage 1, every step has `|| exit 1`: if something fails, the stage ends with an error (and shuts down anyway).
 
-### Stage 2: scraping, training and upload to Odoo (`run_pipeline.sh:116-215`)
+### Stage 2: scraping, training and upload to Odoo (`run_pipeline.sh:114-221`)
 
-1. Reads `logs/run_mode.txt`; if it does not exist, exits with an error (`run_pipeline.sh:122-128`).
-2. `git pull` of whatever branch is checked out, **without checking the result** (`run_pipeline.sh:133`).
-3. Full (`run_pipeline.sh:144-167`):
-   - **deletes** `scraper/competitors_complete.csv` (line 151) and scrapes with `timeout 30h` (line 154);
-   - reads the quotations and competitor products from Odoo (155-156);
-   - runs `1a_preprocess_data.py`, `1b_preprocess_data.py --run_mode full`, `2_train_models.py` and `3_predicted_prices.py` (163-166), each with `timeout 1h`;
-   - uploads to Odoo with `odoo_api_price_suggestion.py --run_mode full` (167).
-4. Partial (`run_pipeline.sh:172-202`). Still in the code, but since e25e2c9 stage 1 always writes `run_mode.txt=full`, so it is not reached:
-   - if `wayakit_new_products_temp.csv` has 1 line or fewer, it does nothing (178-180);
-   - otherwise, it generates `scraper/analysis-odoo_partial.csv` (187), scrapes in `append` mode with `timeout 4h` (188) and continues like the full run, but with `--run_mode partial` (189-201).
-5. Exits and the instance shuts down.
+1. Reads `logs/run_mode.txt`; if it does not exist, exits with an error.
+2. Since F2 there is **no `git pull`** (before: `run_pipeline.sh:133` of e25e2c9, without checking the result). Code reaches the instance by hand (see [Deploy and rollback](#deploy-and-rollback)).
+3. Full (`run_pipeline.sh:146-169`):
+   - scrapes with `timeout 30h` (line 154). Since F2 the previous `scraper/competitors_complete.csv` is **not deleted**: `scraper/main.py` writes to `scraper/competitors_complete.tmp.csv` and replaces the CSV only if the run succeeds (see [Scraper: fail loudly and temp file](#scraper-fail-loudly-and-temp-file));
+   - reads the quotations (last 12 rolling months) and competitor products from Odoo;
+   - runs `1a_preprocess_data.py`, `1b_preprocess_data.py --run_mode full`, `2_train_models.py` and `3_predicted_prices.py`, each with `timeout 1h`;
+   - uploads to Odoo with `odoo_api_price_suggestion.py --run_mode full` (line 167; safe order since F2, see [Re-uploading suggestions](#re-uploading-suggestions)).
+4. Partial (`run_pipeline.sh:171-212`). Still in the code, but since e25e2c9 stage 1 always writes `run_mode.txt=full`, so it is not reached:
+   - if `wayakit_new_products_temp.csv` does not exist, exits 1 (since F2); if it has 1 line or fewer, it does nothing;
+   - otherwise, it generates `scraper/analysis-odoo_partial.csv`, scrapes in `append` mode with `timeout 4h` and continues like the full run, but with `--run_mode partial`.
+5. Any other value in `run_mode.txt` → exit 1 (since F2; before, it logged the error and exited with 0).
+6. Exits and the instance shuts down.
 
-In stage 2, **the steps do not have `|| exit 1`**: if one fails, the following ones run anyway with whatever files exist. See [Known issues](#known-issues).
+Since F2, **every step has `|| exit 1`**: a step that fails, or a `timeout` that expires (exit 124), stops the run before the following steps and before the Odoo upload; the `trap EXIT` still shuts the instance down. The Odoo and ML scripts exit with code 1 on any error (no more `exit()` with code 0 or `except` blocks that only log), and an Odoo read that returns 0 records is an error. Before F2 the stage 2 steps had no `|| exit 1` and a failing step let the following ones run with whatever files existed (Nov 13–15, 2026 run).
 
 The branch `origin/server-improvement` (e25e2c9) disables partial mode and changes training and prediction. The instance runs **`server-improvement`** (verified in F1, 2026-11-17), and `pi-improvements` contains e25e2c9 with no production changes since, so the line numbers in this document are from that commit.
 
@@ -106,13 +107,17 @@ Everything lives **only on the instance's disk** (volume without snapshots). Pat
 | `ml_model/wayakit_new_products_temp.csv` | `filter_new_products.py` (partial only) | 1 |
 | `scraper/analysis-odoo.csv` (versioned in git) | `odoo_api_connection_products.py` (full only) | 1 |
 | `scraper/analysis-odoo_partial.csv` | `odoo_api_connection_products.py` (partial only) | 2 |
-| `scraper/competitors_complete.csv` | `scraper/main.py` | 2 |
+| `scraper/competitors_complete.csv` | `scraper/main.py` (replaced only when the run succeeds, since F2) | 2 |
+| `scraper/competitors_complete.tmp.csv` | `scraper/main.py` while it runs; left behind on failure for diagnosis (since F2) | 2 |
+| `scraper/coverage_report.csv` | `scraper/main.py`, at the end of every run, also on error (since F2; see [Coverage report](#coverage-report)) | 2 |
 | `ml_model/wayakit_cotizations.csv` | `odoo_api_cotizations.py` | 2 |
 | `ml_model/competitor_products_from_odoo.csv` | `odoo_api_competitor_products.py` | 2 |
 | `ml_model/competitor_volumetric_processed.csv`, `competitor_unit_processed.csv` | `1a_preprocess_data.py` | 2 |
 | `ml_model/wayakit_products_to_predict_odoo.csv` | `1b_preprocess_data.py` | 2 |
 | `ml_model/trained_models/*.joblib` (models, columns and `*_market_stats.joblib`) | `2_train_models.py:110-111,171-178` | 2 |
 | `ml_model/wayakit_prediction_report.csv` | `3_predicted_prices.py` (uploaded by `odoo_api_price_suggestion.py`) | 2 |
+| `logs/odoo_previous_suggestion_ids.json` | `odoo_api_price_suggestion.py --run_mode full` (since F2): IDs of the previous suggestions until they are archived and deleted; it only stays behind if that cleanup failed | 2 |
+| `ml_model/price_suggestion_dry_run.csv` | `odoo_api_price_suggestion.py --dry-run` (since F2), by hand only | — |
 
 There are no CloudWatch Logs groups or S3 bucket for PI. The "before" snapshot (CSVs from the Nov 13–15, 2026 run) was copied on 2026-11-17 to `data/f1_before_2026-11-15/` in the local repo, ignored by git; the `.joblib` models remain in the disk snapshot. Planned (F3): bucket `price-intelligence-<account>` with `data/`, `models/`, `state/`, `logs/` and `releases/`.
 
@@ -122,7 +127,7 @@ There are no alerts or emails today. Planned (F3): SNS notification from the exi
 
 1. **Without starting the instance:** in Odoo (KSA company, see [Reviewing results in Odoo](#reviewing-results-in-odoo)), check the creation date of the `product.price.suggestion` records. If it matches the last full run, the upload happened.
 2. **CloudTrail** (eu-north-1): `StartInstances` events on Thursdays and Fridays at 21:50 CDMX confirm that the schedules fired. They do not say whether the pipeline finished successfully.
-3. **With the instance running** (see [Running by hand](#running-by-hand)): read the full `logs/pipeline_execution.log`. **Searching for `Success` (`Éxito` in logs written before the English translation reaches the instance) is not enough**: several scripts exit with code 0 even when they fail.
+3. **With the instance running** (see [Running by hand](#running-by-hand)): read the full `logs/pipeline_execution.log`. With the pre-F2 code on the instance, **searching for `Success` (`Éxito` in logs written before the English translation reaches the instance) is not enough**: several scripts exit with code 0 even when they fail. Since F2 the last line says `Pipeline finished (code=N)`: `code=0` means every step succeeded; any other code means the run stopped at the step logged just before with `ERROR: ... failed`, and nothing after it ran. Also check `scraper/coverage_report.csv` (since F2) for sites or keywords with 0 results.
 
 ---
 
@@ -132,16 +137,16 @@ How it works today (only in **full** runs):
 
 1. Stage 1 (Thursday) regenerates `scraper/analysis-odoo.csv` on the instance's disk and logs that the file is ready for manual review (`run_pipeline.sh:93`).
 2. Before stage 2 (Friday 21:50 CDMX), someone reviews the search list (column `Search Modifiers`), commits `scraper/analysis-odoo.csv` to `main` and, for the change to last, also `scraper/modifiers_mapping.csv`. The history has "weekly analysis-odoo edition" commits (6be62f5 and 7a5b506). Some were made from the server (author "Ubuntu", November 2025).
-3. Stage 2 runs `git pull` and uses the reviewed list.
+3. Before F2, stage 2 ran `git pull` and used the reviewed list. **Since F2 there is no `git pull` in stage 2**: a reviewed list only reaches the instance if someone pulls it by hand through SSM before stage 2 (see [Deploy and rollback](#deploy-and-rollback)); otherwise stage 2 uses the list stage 1 generated on the disk.
 
 Who reviews today and how is an open question (plan question 2).
 
 Risks:
 
-- Stage 1 **rewrites a versioned file on the instance**. If someone pushed their review, `git pull` fails with "local changes would be overwritten", the error is not checked and stage 2 continues with the **unreviewed** list.
+- Stage 1 **rewrites a versioned file on the instance**. With the pre-F2 code, if someone pushed their review, `git pull` fails with "local changes would be overwritten", the error is not checked and stage 2 continues with the **unreviewed** list. For a manual pull (since F2), first `git checkout -- scraper/analysis-odoo.csv` on the instance.
 - Edits made only in `analysis-odoo.csv` are lost on the next full run, because that file is regenerated from `modifiers_mapping.csv`.
 - In **partial** runs (disabled since e25e2c9) there was no review: `analysis-odoo_partial.csv` is generated inside stage 2 (`run_pipeline.sh:187`).
-- The `git pull` also brings in any code change on the checked-out branch (`server-improvement`), in the middle of the run.
+- Before F2, the `git pull` also brought in any code change on the checked-out branch (`server-improvement`), in the middle of the run.
 - Verified in F1: the instance has no stored git credentials (no `credential.helper` and no `~/.git-credentials`).
 
 Mafer confirmed that **the keyword review is needed** (the sites do not find some products by their generic name). The new design, which must not hold up the monthly run, is under review (`plan.md`, section 6).
@@ -189,8 +194,8 @@ Mafer confirmed that **the keyword review is needed** (the sites do not find som
    # Stage 1
    python ml_model/odoo_api_products.py
    python scraper/odoo_api_connection_products.py --input_odoo_products_file ml_model/wayakit_products.csv --output_analysis_file scraper/analysis-odoo.csv
-   # Stage 2 (back up the competitor CSV first: overwrite mode replaces it)
-   cp scraper/competitors_complete.csv scraper/competitors_complete.bak.csv
+   # Stage 2 (since F2 the competitor CSV is only replaced if scraping succeeds; with the pre-F2 code, back it up first:
+   # cp scraper/competitors_complete.csv scraper/competitors_complete.bak.csv)
    timeout 30h python scraper/main.py --analysis_file scraper/analysis-odoo.csv --output_mode overwrite --output_file scraper/competitors_complete.csv
    python ml_model/odoo_api_cotizations.py
    python ml_model/odoo_api_competitor_products.py
@@ -198,11 +203,13 @@ Mafer confirmed that **the keyword review is needed** (the sites do not find som
    python ml_model/1b_preprocess_data.py --run_mode full
    python ml_model/2_train_models.py
    python ml_model/3_predicted_prices.py
+   # Check the records without touching Odoo (since F2): no secrets, no connection
+   python ml_model/odoo_api_price_suggestion.py --run_mode full --dry-run
    # Upload to Odoo: only with Mafer's OK and the KSA company confirmed (see "Re-uploading suggestions")
    python ml_model/odoo_api_price_suggestion.py --run_mode full
    ```
-   - To test **without writing to Odoo**, stop after `3_predicted_prices.py` and review `ml_model/wayakit_prediction_report.csv`. There is no `--dry-run` today. Planned (F2).
-   - After each step, check the end of `../logs/wayakit_app.log`: a step can exit with code 0 even if it failed.
+   - To test **without writing to Odoo**, stop after `3_predicted_prices.py` and review `ml_model/wayakit_prediction_report.csv`, or (since F2) run the upload with `--dry-run`, which writes the exact records it would send to `ml_model/price_suggestion_dry_run.csv`.
+   - After each step, check `echo $?` (since F2 any error gives a code other than 0) and the end of `../logs/wayakit_app.log`. With the pre-F2 code a step can exit with code 0 even if it failed.
    - The full scraping takes up to 30 h. If the session drops, the process dies: run it with `nohup … > <file>.log 2>&1 &` (or in `tmux`, if installed).
    - Running the steps by hand does **not** update `logs/last_full_run.txt` or `logs/run_mode.txt`. Since e25e2c9 it does not matter for the mode: stage 1 always writes `run_mode.txt=full`.
    - Stage 1 rewrites `scraper/analysis-odoo.csv`, which is versioned: `git status` will show it as modified.
@@ -224,21 +231,21 @@ aws scheduler get-schedule --group-name default --name Wayakit-Start-Thursday-Ni
 ```
 
 - Do not touch the schedules in the `voz-del-cliente` group: they belong to VdC.
-- If a run in progress has to be stopped: connect through SSM, stop the process and check whether the upload to Odoo has already started (step 9 in the log). If it is stopped in the middle of a full-mode upload, the suggestions table may end up empty (see [Re-uploading suggestions](#re-uploading-suggestions)).
+- If a run in progress has to be stopped: connect through SSM, stop the process and check whether the upload to Odoo has already started (step 9 in the log). With the pre-F2 code, if it is stopped in the middle of a full-mode upload, the suggestions table may end up empty. Since F2 it can end up with old and new rows at the same time, never empty: finish it with `--cleanup-previous` (see [Re-uploading suggestions](#re-uploading-suggestions)).
 - Planned (F3): `python infra/schedule.py --disable` / `python infra/schedule.py`, as in VdC. The two `default` schedules are retired with the `RETIRED` list.
 
 ---
 
 ## Reviewing results in Odoo
 
-> **Confirm the company before reading or writing.** PI belongs to **KSA** (prices in SAR, scrapers for .sa sites), but **today no query filters by company**: no domain uses `company_id` or `allowed_company_ids`. It is unknown whether the `prod/wayakit-app` database is KSA-only or shared with MX, or which company the API user belongs to (plan question 4). When querying Odoo, by hand or with the Odoo connector from Claude, first confirm that it is the KSA company.
+> **Confirm the company before reading or writing.** PI belongs to **KSA** (prices in SAR, scrapers for .sa sites) and the database it uses is KSA only (Mafer, 2026-11-17), but **no read filters by company**: no domain uses `company_id` or `allowed_company_ids`. Since F2 the upload refuses to write if the API user sees more than one company. When querying Odoo, by hand or with the Odoo connector from Claude, first confirm that it is the KSA company.
 
 What PI writes:
 
 | Model | What it stores |
 |---|---|
-| `product.price.suggestion` | The current suggestion per product: `product_id_str`, `product_name`, `product_type`, `generic_product_type`, `subindustry`, `industry`, `volume_units`, `production_cost`, `suggested_price`, `profit`, `predicted_price_per_unit`, `model_confidence`, `market_min_found`, `market_max_found`, `competitors_count` (`odoo_api_price_suggestion.py:86-102`) |
-| `product.price.suggestion.history` | Copy of the previous suggestions, with `original_create_date`, archived before each full upload (`odoo_api_price_suggestion.py:111-146`) |
+| `product.price.suggestion` | The current suggestion per product: `product_id_str`, `product_name`, `product_type`, `generic_product_type`, `subindustry`, `industry`, `volume_units`, `production_cost`, `suggested_price`, `profit`, `predicted_price_per_unit`, `model_confidence`, `market_min_found`, `market_max_found`, `competitors_count` (`row_to_record()` in `odoo_api_price_suggestion.py`) |
+| `product.price.suggestion.history` | Copy of the previous suggestions, with `original_create_date`. Since F2 they are archived **after** the new batch is created (`archive_and_unlink()`) |
 
 What to check:
 
@@ -249,31 +256,41 @@ What to check:
 - A low `competitors_count` (1 or 2) means the suggestion relies on very little data and that the clip to the market range was not applied.
 - The report also includes `clamped_to_market` and `volume_outside_market` (`3_predicted_prices.py:150-151`), but `odoo_api_price_suggestion.py` does not upload them: they are only visible in `ml_model/wayakit_prediction_report.csv`.
 
-What PI reads from Odoo: `product.master` (active), `sale.order.line` (confirmed sales, **fixed to 2025**) and `competitor.product` (all records).
+What PI reads from Odoo: `product.master` (active), `sale.order.line` (confirmed sales; since F2 the **last 12 rolling months** up to the run date, before fixed to 2025), `competitor.product` (all records) and, before writing, `res.company` (since F2).
 
 ---
 
 ## Re-uploading suggestions
 
-Uploads the contents of `ml_model/wayakit_prediction_report.csv` to `product.price.suggestion`. It is run inside the instance, from the repo root, with `wayakit_env` active. **It writes to Odoo: only with Mafer's OK and with the KSA company confirmed.**
+Uploads the contents of `ml_model/wayakit_prediction_report.csv` to `product.price.suggestion`. It is run inside the instance, from the repo root, with `wayakit_env` active. **It writes to Odoo: only with Mafer's OK and with the KSA company confirmed.** This section describes the F2 script; the pre-F2 behavior (still on the instance) is at the end.
 
 ```bash
-python ml_model/odoo_api_price_suggestion.py --run_mode full
+python ml_model/odoo_api_price_suggestion.py --run_mode full --dry-run   # 1. check: no secrets, no Odoo
+python ml_model/odoo_api_price_suggestion.py --run_mode full             # 2. upload (Mafer's OK)
+python ml_model/odoo_api_price_suggestion.py --cleanup-previous          # 3. only if step 2 says the cleanup failed
 ```
 
 | Mode | What it does |
 |---|---|
-| `--run_mode full` | Reads **all** `product.price.suggestion` records (domain `id != 0`, no company filter), copies them to `product.price.suggestion.history`, runs `unlink` on all of them and then a bulk `create` with the CSV (`odoo_api_price_suggestion.py:110-182`) |
-| `--run_mode partial` (or **without** `--run_mode`: it is the default value, line 68) | Only runs `create`, without deleting. If there were already suggestions, they end up duplicated |
+| `--dry-run` | Builds the records and writes them to `ml_model/price_suggestion_dry_run.csv` (change it with `--dry-run-output`). Reads no secret and connects to nothing. Exits 0, or 1 if the report is missing or broken (see below). With `--cleanup-previous` it only says how many IDs the file has |
+| `--run_mode full` | (1) Checks the company. (2) Reads the IDs of the current suggestions and saves them to `logs/odoo_previous_suggestion_ids.json`. (3) Creates the new batch in one call (Odoo creates all or none). (4) Copies **only the saved IDs** to `product.price.suggestion.history` and deletes **only those IDs**. (5) Deletes the JSON file |
+| `--run_mode partial` (or **without** `--run_mode`: it is the default value) | Checks the company and only runs `create`, without deleting. If there were already suggestions, they end up duplicated |
+| `--cleanup-previous` | Finishes step 4 of a full upload from `logs/odoo_previous_suggestion_ids.json` (skips the archive if the file says it was already done, so the history is not copied twice), then deletes the file. Uploads nothing |
 
-Today's risks:
+Other options: `--input` (report, default `ml_model/wayakit_prediction_report.csv`) and `--ids-file` (default `logs/odoo_previous_suggestion_ids.json`).
 
-- In full mode it **deletes first and creates afterwards**. If the `create` fails, `product.price.suggestion` is left **empty** (the history is kept), and the script only logs it: it exits with code 0 (lines 179-181).
-- If archiving or the `unlink` fails, the script exits with `exit(1)` without creating anything (lines 158-161); if the history was already created, retrying copies it again.
-- To recover an empty table with the same CSV: run with `--run_mode partial` (create only).
-- If the CSV does not exist or has no valid rows, the script ends with `exit()` (code 0) without uploading anything (lines 78 and 109).
+What can happen and what to do:
 
-Planned (F2): first `create` the new batch and, only if it succeeds, `unlink` the previous one by stored IDs (retryable), with `--dry-run` and a filter for the KSA company. XML-RPC is not transactional: there will be a few seconds with duplicates, and if the `unlink` fails, it is retried with the stored IDs.
+| Log message (exit 1 in every case) | State of Odoo | What to do |
+|---|---|---|
+| `Expected exactly 1 company visible to the Odoo user, found N` | Untouched | The API user sees more than one company: a company filter is needed in the code. Do not upload; tell Mafer |
+| `No valid records to upload` or `N of M rows could not be parsed (more than 5%)` | Untouched | The report is broken (missing columns, NaN prices, unreadable `volume`). Rerun `3_predicted_prices.py` and check it. Each skipped row is logged as `Skipping row N (Product ID: …)`. Below 5 % the bad rows are skipped with a warning and the rest is uploaded |
+| `… exists: a previous full upload did not finish its cleanup` | Old and new rows from the previous upload | Run `--cleanup-previous` first, then the full upload again |
+| `Creating the new suggestions failed … the previous suggestions are untouched` | Untouched (the JSON file is removed) | Fix the cause (Odoo down, field error in the log) and rerun |
+| `… archiving/deleting the previous ones failed … retry with … --cleanup-previous` | **Old and new rows at the same time** (never empty) | Run `--cleanup-previous` |
+
+- XML-RPC is not transactional across calls: between steps 3 and 4 there are a few seconds with old and new rows.
+- Before F2 (still on the instance until it is deployed): full mode **deleted first and created afterwards** (domain `id != 0`); if the `create` failed, the table was left **empty** and the script exited with code 0. To recover an empty table with the same CSV: `--run_mode partial`. If the CSV did not exist or had no valid rows, it exited with code 0 without uploading anything.
 
 ---
 
@@ -303,9 +320,23 @@ scripts/verify.sh full    # + e2e + differential against origin/server-improveme
 
 ### Today
 
-- There is no CI/CD or deploy. Code reaches the instance through the `git pull` at the start of stage 2 (`run_pipeline.sh:133`): the checked-out branch (`server-improvement`), without a pinned version and without checking the result.
-- A push to `server-improvement` arrives on the next scheduled stage 2 (Friday), if the pull does not fail.
-- **Rollback today:** `git revert` of the commit on `server-improvement` and push; the next stage 2 brings it in. Do not run `git checkout <sha>` inside the instance without Mafer's OK: it leaves the instance off the branch and the following `git pull` runs fail silently.
+- There is no CI/CD or deploy. With the pre-F2 code still on the instance, code reaches it through the `git pull` at the start of stage 2 (`run_pipeline.sh:133` in e25e2c9): the checked-out branch (`server-improvement`), without a pinned version and without checking the result (the instance has no stored git credentials, so with a private repo that pull fails silently).
+- **Since F2 there is no `git pull` in the pipeline. Until F4, deploy by hand through SSM**, with Mafer's OK and with the schedules paused (see [Pausing the run](#pausing-the-run)) so the pull does not happen while a stage is running:
+  ```bash
+  # inside the instance (SSM session, user ec2-user), from the repo root, with no stage running
+  ps aux | grep -E "run_pipeline|python" | grep -v grep     # must print nothing
+  git status                                               # stage 1 leaves scraper/analysis-odoo.csv modified
+  git checkout -- scraper/analysis-odoo.csv                # only if that is the only local change
+  git pull --ff-only origin server-improvement
+  git log -1 --oneline                                     # note the SHA in the change's PR
+  ```
+  The pull needs read access to the repo and the instance has no stored git credentials; how to authenticate it until F4 is still to be decided with Mafer. Never store a token in the repo, the logs or the shell history. Then re-enable the schedules.
+- **Rollback today:** `git revert` of the commit on `server-improvement`, push, and the same manual pull. Do not run `git checkout <sha>` inside the instance without Mafer's OK: it leaves the instance off the branch.
+
+### F2 is not on the instance yet
+
+- The F2 relevance AI uses Bedrock with the instance role, which **has no `bedrock:InvokeModel` until F3**: with the F2 code, stage 2 stops at the Bedrock preflight (exit 1, nothing uploaded). Do not deploy F2 to the instance before F3 creates that permission.
+- While the instance runs the pre-F2 `run_pipeline.sh`, its stage 2 `git pull` could bring F2 in by itself once it is merged into `server-improvement`, rewriting `run_pipeline.sh` while bash is running it. Until F3: either do not merge F2 into `server-improvement`, or pause the schedules and comment out the crontab (decision pending, `decisions.md`, Pending, question 16).
 
 ### Planned (F4): pull-on-boot
 
@@ -334,6 +365,48 @@ Both runs were done on 2026-11-16 from Mafer's Mac, with her approval. The resul
 
 ---
 
+## Relevance AI (Bedrock)
+
+Since F2 (not yet on the instance; see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)).
+
+- `scraper/services/ai_service.py` calls Amazon Bedrock (Converse API, eu-north-1) with the **instance role**; it reads no secret. Primary model `deepseek.v3.2` (DeepSeek V3.2, on-demand); fallback `eu.anthropic.claude-haiku-4-5-20251001-v1:0` (Claude Haiku 4.5, EU cross-region inference profile). To switch models without a code change (e.g. to application inference profile ARNs after F3), set `PI_RELEVANCE_PRIMARY_MODEL` and `PI_RELEVANCE_FALLBACK_MODEL`.
+- Every call: temperature 0, JSON forced with `outputConfig` (JSON schema; no `toolConfig`), up to 25 titles per call (the Selenium scrapers send 1 title per call through the same batch path), read timeout 120 s (the first call with a new schema compiles the grammar, up to ~90 s).
+- Retries: botocore adaptive retries (3 attempts) plus exponential backoff with jitter (3 attempts, 2 s base, 60 s cap) on `ThrottlingException`, `ServiceUnavailableException`, `ModelNotReadyException`, `ModelTimeoutException`, `InternalServerException` and network timeouts; then the fallback model. Invalid JSON, or an answer that does not cover every title exactly once, goes straight to the fallback. Answers are cached per (keyword, title), and per title for wipes, during the run.
+- Before scraping starts, `scraper/main.py` makes one tiny preflight call. Missing credentials, `AccessDeniedException`, an unknown model ID (`ResourceNotFoundException`) or an unexpected error stop the run at once with exit 1, before Chrome starts. The log shows only the model ID, the exception class and the AWS error code, never the AWS message (it can contain ARNs).
+- A title for which both models fail counts as an **AI failure** (treated as not relevant; wipes count 0). At the end, if AI failures exceed 5 % of the titles asked (relevance and wipes together), `scraper/main.py` exits 1 and does not replace `competitors_complete.csv`. The log line `Relevance AI: N titles evaluated, R relevant, F failures (rate X %)` gives the numbers.
+
+## Scraper: fail loudly and temp file
+
+Since F2 (`scraper/main.py`).
+
+- The scraper writes to a temporary file next to the output (`scraper/competitors_complete.tmp.csv`) and only replaces `scraper/competitors_complete.csv` (`os.replace`, atomic on the same filesystem) when the run succeeds. In `append` mode the existing CSV is copied to the temp file first. If the run fails, the previous `competitors_complete.csv` is untouched and the partial rows stay in the `.tmp.csv` for diagnosis (ignored by git; the next run overwrites it).
+- Exit 1 when: the instructions file is missing or unreadable; ChromeDriver cannot be installed; the Bedrock client or preflight fails; a fatal AI error happens during scraping; any unexpected error in the main loop; zero rows were scraped in total; AI failures > 5 %. An exception in one site/keyword search does not abort the run: it is logged and appears in the `error` column of the coverage report.
+- `timeout 30h` sends SIGTERM: `main.py` turns it into an exit (code 143 internally; `timeout` returns 124), Chrome is closed by the scrapers' `finally` and the coverage report is still written. The previous CSV is untouched and `run_pipeline.sh` stops before training.
+- New flag: `--coverage_file` (default `scraper/coverage_report.csv`).
+
+## Coverage report
+
+`scraper/coverage_report.csv` (since F2). Written at the end of every scraper run, also when it exits with an error (best effort; it shows how far the run got). Ignored by git (`*.csv`). One row per subindustry × type of product × site × keyword actually searched (sites skipped because a B2B site has no specific keyword, and subindustries missing from `TARGET_MAP`, do not appear).
+
+| Column | Meaning |
+|---|---|
+| `subindustry`, `type_of_product`, `site`, `keyword` | What was searched; `keyword` is the exact search term used on that site |
+| `found` | Product titles the relevance AI evaluated during that search (for AeroSense, which does not use the AI, = rows written) |
+| `relevant` | Titles the AI accepted |
+| `rows_written` | Rows added to `competitors_complete.csv` |
+| `ai_failures` | Titles where both models failed (relevance + wipes) |
+| `error` | Exception class if the search failed (e.g. `TimeoutException`, `RelevanceAgentFatalError`), empty otherwise |
+
+How to read it:
+
+- `found` 0 with no error: the site returned nothing for that keyword. Try another keyword for that site (the recall problem in `plan.md`, section 6).
+- `found` > 0 and `relevant` 0: the site has results but none match (keyword too generic, or the product is not sold there).
+- `relevant` > `rows_written`: possible when the scraper's own limit stops early.
+- `ai_failures` > 0: Bedrock problems in that search.
+- The log ends with the list of pairs with 0 relevant results.
+
+---
+
 ## Changing a key
 
 All PI credentials are in the secret `prod/wayakit-app` (eu-north-1), as key/value pairs. Keys never go through chat, the repo, a file or Notion.
@@ -342,8 +415,8 @@ All PI credentials are in the secret `prod/wayakit-app` (eu-north-1), as key/val
 2. Change only the value of the relevant key. **Do not delete the other rows.** → **Save**.
 3. If it was a replacement, revoke the old key in its service.
 
-- Today there are 6 copies of `get_secret()` with the secret name and region hard-coded. Planned (F2): a single module, `pi_secrets.py`, and the Apify key in the same secret.
-- Planned (after F2): once the switch to Bedrock is done, remove `GEMINI_API_KEY` from the secret, revoke the key and clean the logs (see Known issues, *Security*).
+- Since F2 the secret is read only by `pi_secrets.py` (`get_secret()`, `get_odoo_credentials()`; name and region in `SECRET_NAME` and `REGION_NAME`). If an Odoo key is missing or empty, the scripts exit 1 with the **names** of the missing keys, never their values. Planned (F6): the Apify key in the same secret.
+- After the first successful Bedrock run on the instance: remove `GEMINI_API_KEY` from the secret (the F2 code no longer reads it), revoke the key and clean the logs (see Known issues, *Security*).
 
 ---
 
@@ -355,12 +428,14 @@ Errors that have already appeared or that are visible in the code, and what to d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The log says `Success` for a step that failed | Several scripts end with `exit()`, which returns 0: `odoo_api_products.py:48,54,67,126`, `odoo_api_cotizations.py:49,55,66,101`, `odoo_api_price_suggestion.py:52,56,65,78,109`. Others catch the exception and continue (`1a_preprocess_data.py:87-90`, `2_train_models.py:182-183`) | Read the full log, not just `Success`. Planned (F2): `sys.exit(1)` |
-| Stage 2 trains and uploads to Odoo even though scraping failed | The stage 2 steps do not have `\|\| exit 1` (`run_pipeline.sh:154-167,187-201`), and the full run deletes `competitors_complete.csv` before scraping (line 151) | Check the log before trusting the suggestions. Planned (F2): `\|\| exit 1` per step and write the new CSV to a temporary file |
-| Stage 2 used the unreviewed list or old code | `git pull` failed ("local changes would be overwritten") because stage 1 rewrites `scraper/analysis-odoo.csv`, and nobody checks the result (`run_pipeline.sh:133`) | See [Manual review between stages](#manual-review-between-stages). Planned (F2): remove `git pull` |
+| The log says `Success` for a step that failed (pre-F2 code) | Several scripts end with `exit()`, which returns 0: `odoo_api_products.py:48,54,67,126`, `odoo_api_cotizations.py:49,55,66,101`, `odoo_api_price_suggestion.py:52,56,65,78,109`. Others catch the exception and continue (`1a_preprocess_data.py:87-90`, `2_train_models.py:182-183`) | Read the full log, not just `Success`. **Fixed in F2**: every error exits with code 1 |
+| Stage 2 trains and uploads to Odoo even though scraping failed (pre-F2 code) | The stage 2 steps do not have `\|\| exit 1` (`run_pipeline.sh:154-167,187-201` in e25e2c9), and the full run deletes `competitors_complete.csv` before scraping (line 151) | Check the log before trusting the suggestions. **Fixed in F2**: `\|\| exit 1` per step and the new CSV is written to a temporary file |
+| Stage 2 used the unreviewed list or old code (pre-F2 code) | `git pull` failed ("local changes would be overwritten") because stage 1 rewrites `scraper/analysis-odoo.csv`, and nobody checks the result (`run_pipeline.sh:133` in e25e2c9) | See [Manual review between stages](#manual-review-between-stages). **Fixed in F2**: no `git pull` in the pipeline; deploy by hand (see [Deploy and rollback](#deploy-and-rollback)) |
 | Stage 1 and stage 2 run at the same time (possible, not observed) | The stage 2 cron is at a fixed time (Saturday 04:00 UTC) and does not check whether stage 1 is still running | Check `logs/pipeline_execution.log`. Planned (F3): a single monthly schedule |
-| **The Nov 13–15, 2026 run uploaded suggestions to Odoo with failed scraping** | Scraping hit the `timeout 30h` and exited with an error, but `competitors_complete.csv` only had 53 rows (SACO Automotive 36, AeroSense 14, Fine Airports 3; nothing from Amazon, Home or Pets). The following steps do not check the error: it trained, uploaded in full mode (deleted the previous ones) and ended with code 0 | The current suggestions in Odoo come almost entirely from `competitor.product`. Planned (F2): `\|\| exit 1` per step, minimum rows per source and safe upload |
-| `wayakit_app.log` is not in the repo's `logs/` | `log_config.py:7` goes up one level from the repo root | Look for it at `../logs/wayakit_app.log` |
+| **The Nov 13–15, 2026 run uploaded suggestions to Odoo with failed scraping** | Scraping hit the `timeout 30h` and exited with an error, but `competitors_complete.csv` only had 53 rows (SACO Automotive 36, AeroSense 14, Fine Airports 3; nothing from Amazon, Home or Pets). The following steps do not check the error: it trained, uploaded in full mode (deleted the previous ones) and ended with code 0 | The current suggestions in Odoo come almost entirely from `competitor.product`. **F2**: `\|\| exit 1` per step, the CSV is only replaced on success, and safe upload. Still pending: a minimum of rows per source (the coverage report shows the counts) |
+| `wayakit_app.log` is not in the repo's `logs/` | `log_config.py:7` goes up one level from the repo root | Look for it at `../logs/wayakit_app.log`. Whether to move it is pending (`decisions.md`, Pending, question 17) |
+| A stage 2 run stops at `2. Run scraping` with `AccessDeniedException` (F2 code) | The instance role has no `bedrock:InvokeModel` (planned for F3) | Expected until F3; nothing was uploaded. See [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet) |
+| The upload exits 1 with `… exists: a previous full upload did not finish its cleanup` (F2 code) | A previous full upload created the new batch but failed to archive/delete the old one | Run `python ml_model/odoo_api_price_suggestion.py --cleanup-previous` (see [Re-uploading suggestions](#re-uploading-suggestions)) |
 | A `.joblib` does not load after updating packages | `requirements.txt` does not pin versions of pandas, numpy or scikit-learn | Do not update packages in `wayakit_env` by hand. `environment.yml` (2026-11-17) pins the instance's versions (Python 3.10.20, scikit-learn 1.7.2, pandas 2.3.3, numpy 2.2.6). To recreate it on the instance: `conda env create -f environment.yml -n wayakit_env` |
 | The local run gives different prices than the production report | With the frozen data in `data/f1_before_2026-11-15/`, the local run changes 520 of 738 `predicted_price` values (up to 51.86 SAR), even though the processed files come out identical. Cause under investigation: CPU/BLAS, scikit-learn or numpy versions, or that run not being e25e2c9 | Do not compare local outputs against production. The differential tests compare base against the new version on the same machine (`scripts/verify.sh full`). See `plan.md`, finding 13 |
 
@@ -368,8 +443,8 @@ Errors that have already appeared or that are visible in the code, and what to d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| The run ends with 0 products and no error | `GEMINI_API_KEY` is missing from `prod/wayakit-app` or could not be read: `is_relevant` returns `False` for everything (`scraper/services/ai_service.py:138-139`) and the only trace is the "API KEY not found" warning | Check that the key exists in the secret (without printing the value). Planned (F2): Bedrock and fail if AI errors exceed 5 % |
-| Products are silently discarded | On a 429, Gemini waits 60 s; on the third attempt it returns `False` (`ai_service.py:151-154`) | Search for "RATE LIMIT HIT" in `wayakit_app.log`. Planned (F2): Bedrock in batches |
+| The run ends with 0 products and no error (pre-F2 code) | `GEMINI_API_KEY` is missing from `prod/wayakit-app` or could not be read: `is_relevant` returns `False` for everything (`scraper/services/ai_service.py:138-139`) and the only trace is the "API KEY not found" warning | Check that the key exists in the secret (without printing the value). **Fixed in F2**: Bedrock, preflight call, 0 rows → exit 1 and AI failures > 5 % → exit 1 |
+| Products are silently discarded (pre-F2 code) | On a 429, Gemini waits 60 s; on the third attempt it returns `False` (`ai_service.py:151-154`) | Search for "RATE LIMIT HIT" in `wayakit_app.log`. **F2**: Bedrock with backoff and fallback; failures are counted (`ai_failures` in the coverage report) |
 | Land transportation has no competitor data | `config.py:19` says `'Land Transportation'` and `analysis-odoo.csv` says `Land transportation` (31 rows). The comparison is case-sensitive (`main.py:333`) and gives no warning | Pending: fix the key in `scraper/config.py:19` (code change, with Mafer's OK) |
 | 4 SACO exclusions are not applied | Missing commas in `SACO_EXCLUSIONS` (`config.py:65,70`): Python concatenates the strings | Pending: add the commas |
 | GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
@@ -382,11 +457,11 @@ Errors that have already appeared or that are visible in the code, and what to d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 2026 sales do not influence the suggestions | Dates fixed from 2025-01-01 to 2025-12-31 (`odoo_api_cotizations.py:75-76`) | Planned (F2): rolling last 12 months |
+| 2026 sales do not influence the suggestions (pre-F2 code) | Dates fixed from 2025-01-01 to 2025-12-31 (`odoo_api_cotizations.py:75-76` in e25e2c9) | **Fixed in F2**: last 12 rolling months (`sales_window()`) |
 | Rows with price 0 or products in `kg` with odd prices | `0.00` rows are not discarded and `kg` is not in `volumetric_units`, so it falls into price per piece (`1a_preprocess_data.py:55-57,79`) | Planned (F7): small fixes |
-| `product.price.suggestion` empty | In full mode `unlink` runs first and then `create`; if the `create` failed, the table is left empty (`odoo_api_price_suggestion.py:148-182`) | Re-upload with `--run_mode partial` (see [Re-uploading suggestions](#re-uploading-suggestions)). Planned (F2): `create` and then `unlink` |
+| `product.price.suggestion` empty (pre-F2 code) | In full mode `unlink` runs first and then `create`; if the `create` failed, the table is left empty (`odoo_api_price_suggestion.py:148-182` in e25e2c9) | Re-upload with `--run_mode partial` (see [Re-uploading suggestions](#re-uploading-suggestions)). **Fixed in F2**: `create` first, then `unlink` of the previous IDs only |
 | Duplicate suggestions | `odoo_api_price_suggestion.py` was run without `--run_mode` (defaults to `partial`) or twice in partial | Re-upload with `--run_mode full`, only if `wayakit_prediction_report.csv` is from a full run (the partial one only contains new products) |
-| Data from another company in sales or suggestions | No query filters by company (`ml_model/odoo_api_*.py`) | Confirm the KSA company before reading or writing. Planned (F2): company filter |
+| Data from another company in sales or suggestions | No read filters by company (`ml_model/odoo_api_*.py`); the database is KSA only (Mafer, 2026-11-17) | Confirm the KSA company before reading or writing. **F2**: the upload exits 1 if the API user sees more than one company; reads would need a `company_id` filter if a second company ever appears |
 
 ### Apify (Planned, F6; seen in the calibration)
 
@@ -400,5 +475,5 @@ Errors that have already appeared or that are visible in the code, and what to d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **The Gemini key is in plain text** in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance (confirmed in F1). It does not appear in `~/logs/wayakit_app.log*` | The key goes in the URL (`ai_service.py:54-55`) and `requests.exceptions.HTTPError` exceptions are logged with the full URL | Do not copy or print those logs without redacting `key=`. **Revoke or rotate the key in Google now**, clean up or delete the logs and notify IT (Mafer). Planned (F2): Bedrock and remove the key from `prod/wayakit-app` |
+| **The Gemini key is in plain text** in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance (confirmed in F1). It does not appear in `~/logs/wayakit_app.log*` | The key goes in the URL (`ai_service.py:54-55`) and `requests.exceptions.HTTPError` exceptions are logged with the full URL | Do not copy or print those logs without redacting `key=`. **Revoke or rotate the key in Google now**, clean up or delete the logs and notify IT (Mafer). F2 removes Gemini from the code; after the first Bedrock run on the instance, remove the key from `prod/wayakit-app` |
 | The instance role can read and write every secret in the account, including `voz-del-cliente/api-keys` | `Wayakit-EC2-Secrets-Role` has `SecretsManagerReadWrite` | Notify IT. Planned (F3): `instance_role.py` with least privilege |

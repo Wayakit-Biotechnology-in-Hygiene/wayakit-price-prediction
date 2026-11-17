@@ -13,20 +13,16 @@ def load_artifacts():
     logger.info("--- 1. Loading trained models and columns ---")
     model_dir = 'ml_model/trained_models'
     
-    try:
-        model_vol = joblib.load(os.path.join(model_dir, 'volumetric_model.joblib'))
-        model_unit = joblib.load(os.path.join(model_dir, 'unit_model.joblib'))
-        vol_cols = joblib.load(os.path.join(model_dir, 'volumetric_model_columns.joblib'))
-        unit_cols = joblib.load(os.path.join(model_dir, 'unit_model_columns.joblib'))
-        vol_stats = joblib.load(os.path.join(model_dir, 'vol_market_stats.joblib'))
-        unit_stats = joblib.load(os.path.join(model_dir, 'unit_market_stats.joblib'))
-        
-        logger.info("✅ Models and columns loaded successfully.")
-        return model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats
-    except FileNotFoundError:
-        logger.error(f"❌ ERROR: Model files not found in folder '{model_dir}'.")
-        logger.warning("➡️ Solution: Make sure you have run '2_train_models.py' first.")
-        return None, None, None, None, None, None
+    # A missing file raises FileNotFoundError (run 2_train_models.py first); it is not swallowed.
+    model_vol = joblib.load(os.path.join(model_dir, 'volumetric_model.joblib'))
+    model_unit = joblib.load(os.path.join(model_dir, 'unit_model.joblib'))
+    vol_cols = joblib.load(os.path.join(model_dir, 'volumetric_model_columns.joblib'))
+    unit_cols = joblib.load(os.path.join(model_dir, 'unit_model_columns.joblib'))
+    vol_stats = joblib.load(os.path.join(model_dir, 'vol_market_stats.joblib'))
+    unit_stats = joblib.load(os.path.join(model_dir, 'unit_market_stats.joblib'))
+
+    logger.info("✅ Models and columns loaded successfully.")
+    return model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats
 
 def prepare_prediction_data():
     """Loads Wayakit products, cleans them and enriches with past quotation data."""
@@ -160,9 +156,6 @@ def main():
     logger.info("="*60)
     
     artifacts = load_artifacts()
-    if artifacts[0] is None: 
-        return
-        
     model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats = artifacts
     
     df_to_predict = prepare_prediction_data()
@@ -182,4 +175,8 @@ def main():
     logger.info("\n🎉 Prediction process completed successfully.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Price prediction failed.")
+        sys.exit(1)

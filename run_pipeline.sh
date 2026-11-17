@@ -127,44 +127,44 @@ if [ "$STAGE" == "2" ]; then
     RUN_MODE=$(cat "$RUN_MODE_FILE")
     log_message "Continuation mode detected: $RUN_MODE"
     
-    # Make sure the manual Git changes are applied
-    log_message "Updating project from Git..."
+    # No 'git pull' here (F2): it ran unchecked mid-pipeline and clashed with
+    # scraper/analysis-odoo.csv, which stage 1 rewrites. Code reaches the instance by a manual
+    # pull via SSM until F4 (docs/runbook.md, "Deploying").
     cd "$PROJECT_DIR" || { log_message "ERROR: Could not access $PROJECT_DIR"; exit 1; }
-    git pull
-    
+
     log_message "Initializing Conda..."
     source "${CONDA_BASE_PATH}/etc/profile.d/conda.sh" || { log_message "ERROR: Could not initialize Conda"; exit 1; }
 
     log_message "Activating Conda environment: $CONDA_ENV_NAME"
     conda activate "$CONDA_ENV_NAME" || { log_message "ERROR: Could not activate the environment $CONDA_ENV_NAME"; exit 1; }
     log_message "Conda environment activated."
-    
-    
+
+    # Every step ends in '|| exit 1': a failed step or an expired 'timeout' (exit 124) stops the
+    # run before the Odoo upload (Nov 13-15, 2026 run: 53 rows and it still uploaded). The EXIT
+    # trap still shuts the instance down.
+
     # --- START: FULL RUN Flow (Stage 2) ---
     if [ "$RUN_MODE" == "full" ]; then
         log_message "Continuing with FULL flow..."
         ANALYSIS_FILE_TO_USE="$ANALYSIS_FILE_FULL"
         SCRAPER_OUTPUT_MODE="overwrite"
-        
-        if [ -f "$COMPETITORS_FILE" ]; then
-            log_message "Cleaning existing competitors file."
-            rm "$COMPETITORS_FILE"
-        fi
-        
-        run_command "timeout 30h python scraper/main.py --analysis_file '$ANALYSIS_FILE_TO_USE' --output_mode '$SCRAPER_OUTPUT_MODE' --output_file '$COMPETITORS_FILE'" "2. Run scraping (Mode: $SCRAPER_OUTPUT_MODE)"
-        run_command "python ml_model/odoo_api_cotizations.py" "3a. Fetch quotations from Odoo"
-        run_command "python ml_model/odoo_api_competitor_products.py" "3b. Fetch competitor products from Odoo"
+
+        # The previous competitors file is NOT deleted: scraper/main.py writes to a temporary
+        # file and replaces it only when the scraping succeeds (C02).
+        run_command "timeout 30h python scraper/main.py --analysis_file '$ANALYSIS_FILE_TO_USE' --output_mode '$SCRAPER_OUTPUT_MODE' --output_file '$COMPETITORS_FILE'" "2. Run scraping (Mode: $SCRAPER_OUTPUT_MODE)" || exit 1
+        run_command "python ml_model/odoo_api_cotizations.py" "3a. Fetch quotations from Odoo" || exit 1
+        run_command "python ml_model/odoo_api_competitor_products.py" "3b. Fetch competitor products from Odoo" || exit 1
         
         if [ ! -f "$ODOO_PRODUCTS_FILE" ]; then
-            run_command "python ml_model/odoo_api_products.py" "4. (Re)Fetch products from Odoo"
+            run_command "python ml_model/odoo_api_products.py" "4. (Re)Fetch products from Odoo" || exit 1
         fi
 
         # --- CHANGE: Added 'timeout 1h' (1 hour) to the ML scripts ---
-        run_command "timeout 1h python ml_model/1a_preprocess_data.py" "5. Preprocess competitor data"
-        run_command "timeout 1h python ml_model/1b_preprocess_data.py --run_mode full" "6. Prepare Wayakit data (Mode: full)"
-        run_command "timeout 1h python ml_model/2_train_models.py" "7. Train ML models"
-        run_command "timeout 1h python ml_model/3_predicted_prices.py" "8. Generate predictions"
-        run_command "timeout 1h python ml_model/odoo_api_price_suggestion.py --run_mode full" "9. Upload suggestions to Odoo (Mode: full)"
+        run_command "timeout 1h python ml_model/1a_preprocess_data.py" "5. Preprocess competitor data" || exit 1
+        run_command "timeout 1h python ml_model/1b_preprocess_data.py --run_mode full" "6. Prepare Wayakit data (Mode: full)" || exit 1
+        run_command "timeout 1h python ml_model/2_train_models.py" "7. Train ML models" || exit 1
+        run_command "timeout 1h python ml_model/3_predicted_prices.py" "8. Generate predictions" || exit 1
+        run_command "timeout 1h python ml_model/odoo_api_price_suggestion.py --run_mode full" "9. Upload suggestions to Odoo (Mode: full)" || exit 1
 
     # --- END: FULL RUN Flow (Stage 2) ---
 
@@ -173,7 +173,11 @@ if [ "$STAGE" == "2" ]; then
 
         log_message "Continuing with PARTIAL flow..."
         log_message "Checking for new products in '$NEW_PRODUCTS_TEMP_FILE'..."
-        LINE_COUNT=$(wc -l < "$NEW_PRODUCTS_TEMP_FILE" | xargs) 
+        if [ ! -f "$NEW_PRODUCTS_TEMP_FILE" ]; then
+            log_message "ERROR: File '$NEW_PRODUCTS_TEMP_FILE' not found."
+            exit 1
+        fi
+        LINE_COUNT=$(wc -l < "$NEW_PRODUCTS_TEMP_FILE" | xargs)
 
         if [ "$LINE_COUNT" -le 1 ]; then
             log_message "No new products found ($LINE_COUNT lines). No run required."
@@ -184,25 +188,26 @@ if [ "$STAGE" == "2" ]; then
             ANALYSIS_FILE_TO_USE="$ANALYSIS_FILE_PARTIAL"
             SCRAPER_OUTPUT_MODE="append"
             # --- CHANGE: Added 'timeout 4h' (4 hours) to the partial scraping ---
-            run_command "python scraper/odoo_api_connection_products.py --input_odoo_products_file '$NEW_PRODUCTS_TEMP_FILE' --output_analysis_file '$ANALYSIS_FILE_PARTIAL'" "1c. Generate PARTIAL scraping list (post-review)"
-            run_command "timeout 4h python scraper/main.py --analysis_file '$ANALYSIS_FILE_TO_USE' --output_mode '$SCRAPER_OUTPUT_MODE' --output_file '$COMPETITORS_FILE'" "2. Run scraping (Mode: $SCRAPER_OUTPUT_MODE)"
-            run_command "python ml_model/odoo_api_cotizations.py" "3a. Fetch quotations from Odoo"
-            run_command "python ml_model/odoo_api_competitor_products.py" "3b. Fetch competitor products from Odoo"
+            run_command "python scraper/odoo_api_connection_products.py --input_odoo_products_file '$NEW_PRODUCTS_TEMP_FILE' --output_analysis_file '$ANALYSIS_FILE_PARTIAL'" "1c. Generate PARTIAL scraping list (post-review)" || exit 1
+            run_command "timeout 4h python scraper/main.py --analysis_file '$ANALYSIS_FILE_TO_USE' --output_mode '$SCRAPER_OUTPUT_MODE' --output_file '$COMPETITORS_FILE'" "2. Run scraping (Mode: $SCRAPER_OUTPUT_MODE)" || exit 1
+            run_command "python ml_model/odoo_api_cotizations.py" "3a. Fetch quotations from Odoo" || exit 1
+            run_command "python ml_model/odoo_api_competitor_products.py" "3b. Fetch competitor products from Odoo" || exit 1
 
             if [ ! -f "$ODOO_PRODUCTS_FILE" ]; then
-                run_command "python ml_model/odoo_api_products.py" "4. (Re)Fetch products from Odoo"
+                run_command "python ml_model/odoo_api_products.py" "4. (Re)Fetch products from Odoo" || exit 1
             fi
             
             # --- CHANGE: Added 'timeout 1h' (1 hour) to the ML scripts ---
-            run_command "timeout 1h python ml_model/1a_preprocess_data.py" "5. Preprocess competitor data"
-            run_command "timeout 1h python ml_model/1b_preprocess_data.py --run_mode partial" "6. Prepare Wayakit data (Mode: partial)"
-            run_command "timeout 1h python ml_model/2_train_models.py" "7. Train ML models"
-            run_command "timeout 1h python ml_model/3_predicted_prices.py" "8. Generate predictions"
-            run_command "timeout 1h python ml_model/odoo_api_price_suggestion.py --run_mode partial" "9. Upload suggestions to Odoo (Mode: partial)"
+            run_command "timeout 1h python ml_model/1a_preprocess_data.py" "5. Preprocess competitor data" || exit 1
+            run_command "timeout 1h python ml_model/1b_preprocess_data.py --run_mode partial" "6. Prepare Wayakit data (Mode: partial)" || exit 1
+            run_command "timeout 1h python ml_model/2_train_models.py" "7. Train ML models" || exit 1
+            run_command "timeout 1h python ml_model/3_predicted_prices.py" "8. Generate predictions" || exit 1
+            run_command "timeout 1h python ml_model/odoo_api_price_suggestion.py --run_mode partial" "9. Upload suggestions to Odoo (Mode: partial)" || exit 1
         fi
     
     else
         log_message "ERROR: Unknown run mode '$RUN_MODE'."
+        exit 1
     fi
     # --- END: PARTIAL RUN Flow (Stage 2) ---
 

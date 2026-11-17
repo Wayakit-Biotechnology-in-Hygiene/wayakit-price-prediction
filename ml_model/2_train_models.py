@@ -115,72 +115,72 @@ def save_market_stats(df_vol, df_unit, model_dir):
 def main():
     """
     Orchestrates the entire training process: loading, preparation,
-    training and saving models.
+    training and saving models. Errors propagate: the `__main__` block logs them and exits with 1.
     """
-    try:
-        # Data loading
-        df_quotes, df_products, df_vol_comp, df_unit_comp = load_training_data()
+    # Data loading
+    df_quotes, df_products, df_vol_comp, df_unit_comp = load_training_data()
 
-        # Wayakit data preparation
-        df_wayakit_base = prepare_wayakit_training_data(df_quotes, df_products)
+    # Wayakit data preparation
+    df_wayakit_base = prepare_wayakit_training_data(df_quotes, df_products)
 
-        # **HERE IS YOUR PERCENTILE LOGIC, INTACT**
-        df_vol_comp_cleaned = filter_outliers_with_percentiles(df_vol_comp, 'price_per_liter')
-        df_unit_comp_cleaned = filter_outliers_with_percentiles(df_unit_comp, 'price_per_item')
+    # **HERE IS YOUR PERCENTILE LOGIC, INTACT**
+    df_vol_comp_cleaned = filter_outliers_with_percentiles(df_vol_comp, 'price_per_liter')
+    df_unit_comp_cleaned = filter_outliers_with_percentiles(df_unit_comp, 'price_per_item')
 
-        # --- Data transformation and combination (your original logic) ---
-        logger.info("--- 4. Combining Wayakit and competitor data for training ---")
-        cols_vol = ['industry', 'subindustry', 'type_of_product', 'generic_product_type', 'price_sar', 'company', 'unit_of_measurement', 'channel', 'volume_liters', 'price_per_liter', 'approved_quote_price']
-        cols_unit = ['industry', 'subindustry', 'type_of_product', 'generic_product_type', 'price_sar', 'company', 'unit_of_measurement', 'total_quantity', 'channel', 'price_per_item', 'approved_quote_price']
+    # --- Data transformation and combination (your original logic) ---
+    logger.info("--- 4. Combining Wayakit and competitor data for training ---")
+    cols_vol = ['industry', 'subindustry', 'type_of_product', 'generic_product_type', 'price_sar', 'company', 'unit_of_measurement', 'channel', 'volume_liters', 'price_per_liter', 'approved_quote_price']
+    cols_unit = ['industry', 'subindustry', 'type_of_product', 'generic_product_type', 'price_sar', 'company', 'unit_of_measurement', 'total_quantity', 'channel', 'price_per_item', 'approved_quote_price']
 
-        df_wayakit_vol_train = df_wayakit_base[df_wayakit_base['Volume_Liters'] > 0].copy()
-        df_wayakit_vol_train['volume_liters'] = df_wayakit_vol_train['Volume_Liters']
-        df_wayakit_vol_train['price_per_liter'] = df_wayakit_vol_train['approved_quote_price'] / df_wayakit_vol_train['volume_liters']
-        df_wayakit_vol_train['price_sar'] = df_wayakit_vol_train['approved_quote_price']
-        df_wayakit_vol_train['unit_of_measurement'] = np.where(df_wayakit_vol_train['volume_liters'] < 1, 'ml', 'l')
-        df_wayakit_vol_train_final = df_wayakit_vol_train[cols_vol].dropna(subset=['price_per_liter'])
-
-
-        df_wayakit_unit_train = df_wayakit_base[df_wayakit_base['Pack_quantity_Units'] > 0].copy()
-        df_wayakit_unit_train['price_per_item'] = df_wayakit_unit_train['approved_quote_price'] / df_wayakit_unit_train['Pack_quantity_Units']
-        df_wayakit_unit_train['price_sar'] = df_wayakit_unit_train['approved_quote_price']
-        df_wayakit_unit_train['total_quantity'] = pd.to_numeric(df_wayakit_unit_train['Pack_quantity_Units'])
-        df_wayakit_unit_train['unit_of_measurement'] = 'units'
-        df_wayakit_unit_train_final = df_wayakit_unit_train[cols_unit].dropna(subset=['price_per_item'])
+    df_wayakit_vol_train = df_wayakit_base[df_wayakit_base['Volume_Liters'] > 0].copy()
+    df_wayakit_vol_train['volume_liters'] = df_wayakit_vol_train['Volume_Liters']
+    df_wayakit_vol_train['price_per_liter'] = df_wayakit_vol_train['approved_quote_price'] / df_wayakit_vol_train['volume_liters']
+    df_wayakit_vol_train['price_sar'] = df_wayakit_vol_train['approved_quote_price']
+    df_wayakit_vol_train['unit_of_measurement'] = np.where(df_wayakit_vol_train['volume_liters'] < 1, 'ml', 'l')
+    df_wayakit_vol_train_final = df_wayakit_vol_train[cols_vol].dropna(subset=['price_per_liter'])
 
 
-        df_train_vol = pd.concat([df_vol_comp_cleaned[cols_vol], df_wayakit_vol_train_final], ignore_index=True)
-        df_train_unit = pd.concat([df_unit_comp_cleaned[cols_unit], df_wayakit_unit_train_final], ignore_index=True)
-        
-        logger.info(f"Total data for volumetric training: {len(df_train_vol)} rows.")
-        logger.info(f"Total data for unit training: {len(df_train_unit)} rows.")
+    df_wayakit_unit_train = df_wayakit_base[df_wayakit_base['Pack_quantity_Units'] > 0].copy()
+    df_wayakit_unit_train['price_per_item'] = df_wayakit_unit_train['approved_quote_price'] / df_wayakit_unit_train['Pack_quantity_Units']
+    df_wayakit_unit_train['price_sar'] = df_wayakit_unit_train['approved_quote_price']
+    df_wayakit_unit_train['total_quantity'] = pd.to_numeric(df_wayakit_unit_train['Pack_quantity_Units'])
+    df_wayakit_unit_train['unit_of_measurement'] = 'units'
+    df_wayakit_unit_train_final = df_wayakit_unit_train[cols_unit].dropna(subset=['price_per_item'])
 
-        # --- Model training and saving (your original logic) ---
-        logger.info("--- 5. Training and saving models ---")
-        # approved_quote_price left out of the features: it is the target's numerator in Wayakit rows (leakage)
-        cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
 
-        features_vol = ['volume_liters'] + cat_features
-        X_vol_encoded = pd.get_dummies(df_train_vol[features_vol].fillna('Desconocido'), columns=cat_features, drop_first=True)
-        model_vol = train_and_evaluate(X_vol_encoded, df_train_vol['price_per_liter'], 'volumetric')
+    df_train_vol = pd.concat([df_vol_comp_cleaned[cols_vol], df_wayakit_vol_train_final], ignore_index=True)
+    df_train_unit = pd.concat([df_unit_comp_cleaned[cols_unit], df_wayakit_unit_train_final], ignore_index=True)
+    
+    logger.info(f"Total data for volumetric training: {len(df_train_vol)} rows.")
+    logger.info(f"Total data for unit training: {len(df_train_unit)} rows.")
 
-        features_unit = ['total_quantity'] + cat_features
-        X_unit_encoded = pd.get_dummies(df_train_unit[features_unit].fillna('Desconocido'), columns=cat_features, drop_first=True)
-        model_unit = train_and_evaluate(X_unit_encoded, df_train_unit['price_per_item'], 'unit')
+    # --- Model training and saving (your original logic) ---
+    logger.info("--- 5. Training and saving models ---")
+    # approved_quote_price left out of the features: it is the target's numerator in Wayakit rows (leakage)
+    cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
 
-        model_dir = 'ml_model/trained_models'
-        os.makedirs(model_dir, exist_ok=True)
-        joblib.dump(model_vol, os.path.join(model_dir, 'volumetric_model.joblib'))
-        joblib.dump(X_vol_encoded.columns.tolist(), os.path.join(model_dir, 'volumetric_model_columns.joblib'))
-        joblib.dump(model_unit, os.path.join(model_dir, 'unit_model.joblib'))
-        joblib.dump(X_unit_encoded.columns.tolist(), os.path.join(model_dir, 'unit_model_columns.joblib'))
-        # Market stats from competitors only: the market range must not include Wayakit's own prices
-        save_market_stats(df_vol_comp_cleaned, df_unit_comp_cleaned, model_dir)
-        
-        logger.info("🎉 Models and columns successfully saved.")
+    features_vol = ['volume_liters'] + cat_features
+    X_vol_encoded = pd.get_dummies(df_train_vol[features_vol].fillna('Desconocido'), columns=cat_features, drop_first=True)
+    model_vol = train_and_evaluate(X_vol_encoded, df_train_vol['price_per_liter'], 'volumetric')
 
-    except Exception as e:
-        logger.error("Error occurred in training process", exc_info=True)
+    features_unit = ['total_quantity'] + cat_features
+    X_unit_encoded = pd.get_dummies(df_train_unit[features_unit].fillna('Desconocido'), columns=cat_features, drop_first=True)
+    model_unit = train_and_evaluate(X_unit_encoded, df_train_unit['price_per_item'], 'unit')
+
+    model_dir = 'ml_model/trained_models'
+    os.makedirs(model_dir, exist_ok=True)
+    joblib.dump(model_vol, os.path.join(model_dir, 'volumetric_model.joblib'))
+    joblib.dump(X_vol_encoded.columns.tolist(), os.path.join(model_dir, 'volumetric_model_columns.joblib'))
+    joblib.dump(model_unit, os.path.join(model_dir, 'unit_model.joblib'))
+    joblib.dump(X_unit_encoded.columns.tolist(), os.path.join(model_dir, 'unit_model_columns.joblib'))
+    # Market stats from competitors only: the market range must not include Wayakit's own prices
+    save_market_stats(df_vol_comp_cleaned, df_unit_comp_cleaned, model_dir)
+    
+    logger.info("🎉 Models and columns successfully saved.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Error occurred in training process.")
+        sys.exit(1)

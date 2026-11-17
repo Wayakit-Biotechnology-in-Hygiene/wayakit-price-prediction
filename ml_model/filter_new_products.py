@@ -45,7 +45,7 @@ def filter_new_products(full_products_file, timestamp_file, output_file):
         logger.error("Could not get the timestamp. Exiting the filter script.")
         # Write an empty file to avoid later errors? Or handle it in the bash script.
         # For now, we exit. The bash script should detect the failure.
-        exit(1) # Exit with error
+        sys.exit(1) # Exit with error
 
     try:
         # Read the full CSV, making sure to parse the create_date column
@@ -54,13 +54,13 @@ def filter_new_products(full_products_file, timestamp_file, output_file):
         logger.info(f"Read {len(df_all)} products from {full_products_file}.")
     except FileNotFoundError:
         logger.error(f"Full products file '{full_products_file}' not found.")
-        exit(1)
+        sys.exit(1)
     except KeyError:
         logger.error(f"Column 'create_date' was not found in '{full_products_file}'. Did you run the modified 'odoo_api_products.py'?")
-        exit(1)
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error reading '{full_products_file}': {e}", exc_info=True)
-        exit(1)
+        sys.exit(1)
 
     # Filter products whose creation date is later than the last timestamp
     # Both dates must be in the same time zone (or have no time zone) to be compared
@@ -75,7 +75,7 @@ def filter_new_products(full_products_file, timestamp_file, output_file):
         logger.info(f"File with new products saved to: '{output_file}'")
     except Exception as e:
         logger.error(f"Error saving filtered file '{output_file}': {e}", exc_info=True)
-        exit(1)
+        sys.exit(1)
 
 if __name__ == "__main__":
     # Configure command-line arguments

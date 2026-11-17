@@ -1,6 +1,6 @@
 # Resources
 
-Inventory of what exists for Price Intelligence (PI). Wayakit account, region **eu-north-1** (Stockholm) unless stated otherwise. Updated on **2026-11-16**.
+Inventory of what exists for Price Intelligence (PI). Wayakit account, region **eu-north-1** (Stockholm) unless stated otherwise. Updated on **2026-11-17** (F2 code changes; no AWS resource was created or changed in F2).
 
 `<account>` = Wayakit's AWS account ID (`aws sts get-caller-identity`). It is never written in the repo.
 
@@ -19,7 +19,7 @@ Overall status: **everything that exists today was created by hand** (console or
 | Instance profile / IAM role | `Wayakit-EC2-Secrets-Role`, with the managed policies `SecretsManagerReadWrite` and `AmazonSSMManagedInstanceCore` (the latter added on 2026-11-17, F1, Mafer's OK) | By hand | **Too broad**: it can read and write every secret in the account, including `voz-del-cliente/api-keys`. SSM access enabled | No cost |
 | IAM role (Scheduler) | `Wayakit-EventBridge-Role`, with the managed policy `AmazonEC2FullAccess` | By hand | **Too broad**: it only needs to start one instance | No cost |
 | EventBridge Scheduler | `default` group: `Wayakit-Start-Thursday-Night` (`cron(50 21 ? * 5 *)`) and `Wayakit-Start-Friday-Night` (`cron(50 21 ? * 6 *)`), America/Mexico_City time zone. Target `ec2:startInstances` on `wayakit-app-server` | By hand | Active (paused during the F1 inventory and re-enabled on 2026-11-17). They only start the instance; inside, the `ec2-user` crontab launches `run_pipeline.sh` at 04:00 UTC (22:00 Mexico City) | No cost (free tier) |
-| Secret | `prod/wayakit-app`. Keys: `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` (`ml_model/odoo_api_products.py:41-44`) and `GEMINI_API_KEY` (`scraper/services/ai_service.py:41`) | By hand | Active, no rotation. The name and region are hard-coded in 6 copies of `get_secret()`. Only PI uses it (Mafer, 2026-11-17). **The Gemini key leaked into the instance logs** (see Gemini) | ~USD 0.40 / month |
+| Secret | `prod/wayakit-app`. Keys: `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` (read only through `pi_secrets.py`, since F2) and `GEMINI_API_KEY` (no longer read by the F2 code; still read by the pre-F2 code the instance runs) | By hand | Active, no rotation. Since F2 the name and region live only in `pi_secrets.py` (`SECRET_NAME`, `REGION_NAME`). Only PI uses it (Mafer, 2026-11-17). **The Gemini key leaked into the instance logs** (see Gemini) | ~USD 0.40 / month |
 | Leftovers in **me-south-1** | Roles `EC2WayakitSecretsAccessRole` and `EventBridge-EC2-Wayakit-Role`; secret `wayakit/test/credentials` (the one used before 2026-04-05) | By hand | **Not inventoried**: the region endpoint did not respond. The roles were last used in March 2026. What to do with them is question 10 of the plan | Unknown |
 
 What **does not exist** today (verified read-only, except where noted):
@@ -46,13 +46,13 @@ Nothing in this table exists yet. Each script is run with Mafer's OK, will be id
 | EventBridge Scheduler | `price-intelligence` group with a monthly schedule, **last Thursday of each month**: `cron(50 21 ? * 5L *)`. Time and time zone pending (today Mexico City; Asia/Riyadh?). The two `default` schedules are retired with the `RETIRED` list | `infra/schedule.py` | Planned (F3) | No cost (free tier) |
 | Scheduler role | To be defined. Only `ec2:StartInstances` on this instance. Replaces `Wayakit-EventBridge-Role` | `infra/scheduler_role.py` | Planned (F3) | No cost |
 | GitHub OIDC provider + deploy role | Role to be defined, with trust limited to `repo:<org>/wayakit-price-prediction:ref:refs/heads/main`. Used by `deploy.yml` (no long-lived keys) | `infra/deploy_role.py` | Planned (F3, used in F4). Still need to know who is admin of the GitHub organization (question 8) | No cost |
-| Bedrock access | `bedrock:InvokeModel` on `deepseek.v3.2` (on-demand in eu-north-1, primary) and on the `eu.` profile of Claude Haiku 4.5 (fallback), or on custom application profiles with the `project = price-intelligence` tag | `infra/instance_role.py` (+ `infra/bedrock_profile.py` if application profiles are used) | Planned (F2). See the note below | Per use; see "External services" |
+| Bedrock access | `bedrock:InvokeModel` (Converse needs nothing else; no streaming) on `arn:aws:bedrock:eu-north-1::foundation-model/deepseek.v3.2` (primary), on the Haiku 4.5 inference profile `arn:aws:bedrock:eu-north-1:<account>:inference-profile/eu.anthropic.claude-haiku-4-5-20251001-v1:0` and on the Haiku foundation model in the EU regions that profile routes to (`arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0`, restricted to EU regions); or on application inference profiles with the `project = price-intelligence` tag if `infra/bedrock_profile.py` creates them | `infra/instance_role.py` (+ `infra/bedrock_profile.py` if application profiles are used) | Planned (F3). **Required before the F2 code runs on the instance**: without it, stage 2 stops at the Bedrock preflight (exit 1, nothing uploaded). See the note below | Per use; see "External services" |
 | Apify key | A new key inside `prod/wayakit-app` (key name to be defined) | Manual step (value in the console, by Mafer) | Planned (F6) | No additional cost |
 | End-of-run notification | SNS topic published from the `trap EXIT` (name to be defined) | To be defined | Planned (F3) | No cost (first 1,000 emails) |
 | Verification | Read-only check (`[OK]`, `[FAIL]`, `[WARN]`); covers the test "change a schedule from code and see it in AWS" | `infra/check_pi.py` | Planned (F3) | — |
 | Alarms and budget | — | `infra/alarms.py`, `infra/budget.py` | Outside the tickets' timeframe; meanwhile, the SNS notification | — |
 
-Note on Bedrock: the current decision (2026-11-16) is DeepSeek V3.2 as primary and Haiku 4.5 as fallback. In F2 it is verified whether Bedrock allows creating tagged application profiles on DeepSeek; if not, cost is split by modelId. Whatever is decided is recorded in `docs/decisions.md`.
+Note on Bedrock: the current decision (2026-11-16) is DeepSeek V3.2 as primary and Haiku 4.5 as fallback, implemented in F2 (`scraper/services/ai_service.py`). The model IDs can be switched to application inference profiles without a code change with the environment variables `PI_RELEVANCE_PRIMARY_MODEL` and `PI_RELEVANCE_FALLBACK_MODEL`. Whether Bedrock allows tagged application profiles on DeepSeek is still to be verified (F3); if not, cost is split by modelId. Whatever is decided is recorded in `docs/decisions.md`.
 
 Outside the scripts (manual steps):
 
@@ -69,18 +69,20 @@ Outside the scripts (manual steps):
 
 ### Odoo (KSA)
 
-**Confirm the company before reading or writing.** Today no query filters by `company_id` or passes `allowed_company_ids`: that everything is KSA is inferred (prices in SAR, `.sa` scrapers, the Mexico version lives in other branches), but **it is not enforced in the code**. It is still to be confirmed whether the `prod/wayakit-app` database is KSA only or shared with MX, and which company the API user belongs to (question 4). Filtering by the KSA company is part of F2.
+**Confirm the company before reading or writing.** The database PI uses is KSA only (Mafer, 2026-11-17). No read filters by `company_id`; since F2 the upload checks, before any write, that the API user sees exactly one company (`res.company`) and exits 1 if it sees more (`pi_odoo.get_single_company()`).
 
-Connection: XML-RPC with an API token, credentials in `prod/wayakit-app`.
+Connection: XML-RPC with an API token, credentials in `prod/wayakit-app` read by `pi_secrets.get_odoo_credentials()`; authentication in `pi_odoo.connect()` (exits 1 if Odoo returns no uid).
 
 | Operation | Model | Where | Note |
 |---|---|---|---|
-| Reads | `product.master` (active, without Maritime or Defense) | `ml_model/odoo_api_products.py:70` | Wayakit products and costs (`unit_cost_sar`) |
-| Reads | `sale.order.line` (`order_id.state = sale`, `name like '[FP-%'`) | `ml_model/odoo_api_cotizations.py:68` | **Dates hard-coded to 2025** (`:75-76`); becomes a rolling 12 months in F2 |
-| Reads | `competitor.product` (all records) | `ml_model/odoo_api_competitor_products.py:91` | Competitor products loaded in Odoo |
-| Writes | `product.price.suggestion.history` (`create`) | `ml_model/odoo_api_price_suggestion.py:19`, `:144` | Copy of the previous suggestions (full mode only) |
-| Writes | `product.price.suggestion` (in full mode, `unlink` everything and then `create`; in partial mode, only `create`) | `ml_model/odoo_api_price_suggestion.py:18`, `:151`, `:172` | If the `create` fails in full mode, the table is left empty. Planned (F2): first `create`, then `unlink`, with `--dry-run` |
-| Authenticates only | — | `scraper/odoo_api_connection_products.py` | Connects but does not query anything |
+| Reads | `product.master` (active, without Maritime or Defense) | `ml_model/odoo_api_products.py` (`fetch_products`) | Wayakit products and costs (`unit_cost_sar`). 0 records → exit 1 |
+| Reads | `sale.order.line` (`order_id.state = sale`, `name like '[FP-%'`) | `ml_model/odoo_api_cotizations.py` (`fetch_sale_lines`) | Last 12 rolling months up to the run date (`sales_window()`, since F2). 0 lines → exit 1 |
+| Reads | `competitor.product` (all records) | `ml_model/odoo_api_competitor_products.py` (`fetch_competitor_products`) | Competitor products loaded in Odoo. 0 records → exit 1 |
+| Reads | `res.company` (visible companies) | `pi_odoo.get_single_company()`, called by the upload | Company guard before any write (since F2) |
+| Writes | `product.price.suggestion` (`create`; in full mode, then `read` + `unlink` of the previous IDs only) | `ml_model/odoo_api_price_suggestion.py` (`upload`, `archive_and_unlink`) | Since F2: create first, then delete the previous IDs saved in `logs/odoo_previous_suggestion_ids.json`; `--dry-run` and `--cleanup-previous`. See `docs/runbook.md`, *Re-uploading suggestions* |
+| Writes | `product.price.suggestion.history` (`create`) | `ml_model/odoo_api_price_suggestion.py` (`archive_and_unlink`) | Copy of the previous suggestions (full mode and `--cleanup-previous` only) |
+
+`scraper/odoo_api_connection_products.py` no longer connects to Odoo (since F2): it only reads `ml_model/wayakit_products.csv`.
 
 The final Pets upload is reviewed by Puya and Luisa before writing to Odoo KSA (F8).
 
@@ -105,7 +107,7 @@ Note: PI shares the account's monthly spending limit with VdC. The account limit
 | Primary | DeepSeek V3.2 (`deepseek.v3.2`) | eu-north-1, on-demand | 0.74 / 2.22 | ~USD 4 |
 | Fallback (only if DeepSeek fails or returns invalid JSON) | Claude Haiku 4.5 (`eu.` profile) | EU inference profile | 1.10 / 5.50 | ~USD 6.3 if used for everything |
 
-Status: **planned (F2)**. Converse with `temperature=0`, JSON output forced with `outputConfig` (JSON schema), batches of 25 titles and a 120 s timeout. Quota in eu-north-1: 10,000 requests/min per model. Details of the comparison test in section 5 of [plan.md](plan.md).
+Status: **implemented in the code (F2), not yet on the instance** (it needs the F3 permission). Converse with `temperature=0`, JSON output forced with `outputConfig` (JSON schema, no `toolConfig`), batches of up to 25 titles and a 120 s read timeout, with the instance role (no key in the secret). No new resource was created in F2: DeepSeek's EULA was accepted in the 2026-11-16 test and the Haiku `eu.` profile was already enabled for VdC. Quota in eu-north-1: 10,000 requests/min per model. Details of the comparison test in section 5 of [plan.md](plan.md).
 
 ### Gemini (being retired)
 
@@ -115,13 +117,13 @@ Status: **planned (F2)**. Converse with `temperature=0`, JSON output forced with
 | Credential | `GEMINI_API_KEY` in `prod/wayakit-app` |
 | Risk | **Confirmed (F1):** the key is in plain text in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance, because it goes in the URL and HTTP errors are logged with it. It does not appear in `~/logs/wayakit_app.log*`. Revoke or rotate now and notify IT |
 | Cost | Not documented (pending: identify the Google project and its billing) |
-| Status | Replaced by Bedrock in F2. Afterwards: **revoke the key**, remove `GEMINI_API_KEY` from the secret and clean the logs |
+| Status | Removed from the code in F2 (Bedrock). Still used by the pre-F2 code on the instance until F2 is deployed. Afterwards: **revoke the key**, remove `GEMINI_API_KEY` from the secret and clean the logs |
 
 ## Permissions by role
 
 | Role | Today | Planned |
 |---|---|---|
-| Instance role | `Wayakit-EC2-Secrets-Role`: `SecretsManagerReadWrite` (every secret in the account, read and write) and `AmazonSSMManagedInstanceCore` (since 2026-11-17) | (F3) `secretsmanager:GetSecretValue` only on the ARN of `prod/wayakit-app`; the PI bucket; `AmazonSSMManagedInstanceCore`; `cloudwatch:PutMetricData`; publish to the notification SNS topic. (F2) `bedrock:InvokeModel` on DeepSeek V3.2 and Haiku 4.5 |
+| Instance role | `Wayakit-EC2-Secrets-Role`: `SecretsManagerReadWrite` (every secret in the account, read and write) and `AmazonSSMManagedInstanceCore` (since 2026-11-17) | (F3) `secretsmanager:GetSecretValue` only on the ARN of `prod/wayakit-app`; the PI bucket; `AmazonSSMManagedInstanceCore`; `cloudwatch:PutMetricData`; publish to the notification SNS topic. `bedrock:InvokeModel` on DeepSeek V3.2 and Haiku 4.5 (see *Bedrock access*; F3, required before deploying F2) |
 | Scheduler role | `Wayakit-EventBridge-Role`: `AmazonEC2FullAccess` | (F3) Only `ec2:StartInstances` on this instance |
 | Deploy role (GitHub Actions) | Does not exist | (F3/F4) OIDC trust only for `main` of the repo; publish to the bucket's `releases/`, move the `current` pointer and start the instance in "deploy only" mode. Exact scope to be defined in `infra/deploy_role.py` |
 | Roles in me-south-1 | `EC2WayakitSecretsAccessRole`, `EventBridge-EC2-Wayakit-Role`: permissions not inventoried | To be decided (question 10) |

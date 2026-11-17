@@ -1,183 +1,357 @@
-import xmlrpc.client
-from botocore.exceptions import ClientError
-import pandas as pd
-import os
-from datetime import datetime
-import boto3
+"""Uploads the price suggestions (ml_model/wayakit_prediction_report.csv) to Odoo
+(`product.price.suggestion`). WRITES TO ODOO: only run for real with Mafer's OK.
+
+Modes:
+- `--dry-run`: builds the records and writes them to a CSV (default
+  ml_model/price_suggestion_dry_run.csv). Reads no secrets and connects to nothing.
+- `--run_mode partial` (default): creates the new records; deletes nothing.
+- `--run_mode full`: replaces the table without ever leaving it empty:
+    1. reads the IDs of the current suggestions and saves them to
+       logs/odoo_previous_suggestion_ids.json;
+    2. creates the new batch (one call: Odoo creates all or none). If it fails, exit 1 and the
+       previous suggestions are untouched;
+    3. archives the PREVIOUS IDs only (read + create in `product.price.suggestion.history`) and
+       unlinks the PREVIOUS IDs only. If this fails, exit 1: the table has old and new rows,
+       and the old IDs stay in the JSON file for `--cleanup-previous`.
+- `--cleanup-previous`: finishes step 3 from the JSON file (skips the archive if it was
+  already done), then deletes the file.
+
+Before any write the script checks that the Odoo user sees exactly one company (the PI
+database is KSA only); if it sees more, it exits 1: a company filter is needed, not a guess.
+
+Importing this module does not read secrets or connect to Odoo. The functions take an
+`OdooSession` (pi_odoo) so tests can pass a fake `models`.
+"""
+import argparse
 import json
-import base64
+import math
+import os
 import sys
-import argparse 
-from datetime import datetime
+from datetime import datetime, timezone
+
+import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from log_config import get_logger
+# pi_odoo / pi_secrets are imported only where Odoo is used, so `--dry-run` works in a copy that
+# has only ml_model/ and log_config.py (the E2E harness) and never loads the secrets code.
 
 logger = get_logger()
 
 MODEL_NAME = 'product.price.suggestion'
 HISTORY_MODEL_NAME = 'product.price.suggestion.history'
 
-def get_secret(secret_name, region_name="eu-north-1"):
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager',
-        region_name=region_name
-    )
-    try:
-        get_secret_value_response = client.get_secret_value(
-            SecretId=secret_name
+REPORT_FILE = 'ml_model/wayakit_prediction_report.csv'
+DRY_RUN_FILE = 'ml_model/price_suggestion_dry_run.csv'
+# <project>/logs, next to logs/pipeline_execution.log (log_config.LOG_DIR is <project>/../logs).
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PREVIOUS_IDS_FILE = os.path.join(PROJECT_DIR, 'logs', 'odoo_previous_suggestion_ids.json')
+
+# More unparseable rows than this means a broken report, not a few bad products.
+MAX_SKIPPED_FRACTION = 0.05
+
+FIELDS_TO_ARCHIVE = [
+    'product_id_str', 'product_type', 'generic_product_type',
+    'subindustry', 'industry', 'volume_units',
+    'production_cost', 'suggested_price', 'profit', 'create_date',
+    'product_name', 'predicted_price_per_unit', 'model_confidence',
+    'market_min_found', 'market_max_found', 'competitors_count'
+]
+
+# Odoo field -> report column, by type.
+TEXT_FIELDS = {
+    'product_type': 'product_type',
+    'generic_product_type': 'generic_product_type',
+    'subindustry': 'subindustry',
+    'industry': 'industry',
+    'product_name': 'product_name',
+}
+FLOAT_FIELDS = {
+    'production_cost': 'cost_per_unit',
+    'suggested_price': 'predicted_price',
+    'profit': 'porcentaje_de_ganancia',
+    'predicted_price_per_unit': 'predicted_price_per_unit',
+    'model_confidence': 'model_confidence',
+    'market_min_found': 'market_min_found',
+    'market_max_found': 'market_max_found',
+}
+
+
+class UploadError(RuntimeError):
+    """The upload cannot go on safely. The message says what state Odoo was left in."""
+
+
+# --- Records (pure) ---------------------------------------------------------------------------
+
+def _finite_float(value, column: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"'{column}' is not a finite number: {value!r}")
+    return number
+
+
+def row_to_record(row) -> dict:
+    """One report row -> one `product.price.suggestion` record. Pure: no I/O.
+
+    Raises (ValueError, TypeError, KeyError) if the row cannot be uploaded: missing column,
+    empty `Product_ID`, non-numeric or non-finite number, `volume` not starting with a number
+    ("0.5 L", "12 units"). Empty text fields become False (Odoo's empty value) instead of NaN.
+    """
+    product_id = row['Product_ID']
+    if product_id is None or (isinstance(product_id, float) and math.isnan(product_id)) \
+            or not str(product_id).strip():
+        raise ValueError("'Product_ID' is empty")
+
+    record = {
+        'product_id_str': str(product_id),
+        'volume_units': _finite_float(str(row['volume']).split(' ')[0], 'volume'),
+    }
+    for field, column in TEXT_FIELDS.items():
+        value = row[column]
+        record[field] = False if pd.isna(value) else value
+    for field, column in FLOAT_FIELDS.items():
+        record[field] = _finite_float(row[column], column)
+    competitors = _finite_float(row['competitors_count'], 'competitors_count')
+    if competitors != int(competitors):
+        raise ValueError(f"'competitors_count' is not an integer: {row['competitors_count']!r}")
+    record['competitors_count'] = int(competitors)
+    return record
+
+
+def build_records(df: pd.DataFrame) -> tuple:
+    """Report -> `(records, skipped)`. Pure apart from one warning log per skipped row.
+
+    `records` keeps the order of `df`; `skipped` is a list of `(row_number, product_id, reason)`
+    (1-based row number) for rows `row_to_record` rejected. `len(records) + len(skipped)
+    == len(df)` always.
+    """
+    records, skipped = [], []
+    for position, (_, row) in enumerate(df.iterrows(), start=1):
+        try:
+            records.append(row_to_record(row))
+        except (ValueError, TypeError, KeyError) as e:
+            product_id = row.get('Product_ID', 'N/A')
+            skipped.append((position, product_id, str(e)))
+            logger.warning(f"Skipping row {position} (Product ID: {product_id}): {e}")
+    return records, skipped
+
+
+def check_parse_quality(records: list, skipped: list,
+                        max_skipped_fraction: float = MAX_SKIPPED_FRACTION) -> None:
+    """Raises `UploadError` if there is nothing to upload or more than `max_skipped_fraction`
+    of the rows were skipped. Pure."""
+    total = len(records) + len(skipped)
+    if not records:
+        raise UploadError(f"No valid records to upload ({len(skipped)} rows skipped of {total}).")
+    if len(skipped) / total > max_skipped_fraction:
+        raise UploadError(
+            f"{len(skipped)} of {total} rows could not be parsed "
+            f"(more than {max_skipped_fraction:.0%}); the report looks broken. Nothing uploaded."
         )
-    except ClientError as e:
-        logger.error(f"Error getting the secret", exc_info=True)
-        raise e 
-    else:
-        if 'SecretString' in get_secret_value_response:
-            secret = get_secret_value_response['SecretString']
-            return json.loads(secret)
-        else:
-            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
-            return json.loads(decoded_binary_secret)
 
-SECRET_NAME = "prod/wayakit-app" 
-AWS_REGION = "eu-north-1" 
-try:
-    secrets = get_secret(SECRET_NAME, AWS_REGION)
-    ODOO_URL = secrets.get('ODOO_URL')
-    ODOO_DB = secrets.get('ODOO_DB')
-    ODOO_USERNAME = secrets.get('ODOO_USERNAME')
-    API_TOKEN = secrets.get('ODOO_API_TOKEN')
-    if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, API_TOKEN]):
-        logger.error("ERROR: Essential Odoo secrets are missing.")
-        exit()
-    logger.info(f"Secrets loaded successfully for DB: {ODOO_DB}")
-except Exception as e:
-    logger.error(f"CRITICAL ERROR: The secrets could not be loaded.", exc_info=True)
-    exit()
 
-try:
-    common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
-    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, API_TOKEN, {})
-    models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
-    logger.info(f"Authentication successful. User ID (uid): {uid}")
-except Exception as e:
-    logger.error(f"Authentication ERROR", exc_info=True)
-    exit()
+def history_records(old_records: list) -> list:
+    """Records read from `product.price.suggestion` -> records for the history model. Pure.
 
-parser = argparse.ArgumentParser(description="Uploads price suggestions to Odoo.")
-parser.add_argument('--run_mode', default='partial', choices=['partial', 'full'],
-                    help="Sets the run mode: 'partial' (only adds) or 'full' (archives, deletes and adds).")
-args = parser.parse_args()
+    Drops `id` and renames `create_date` to `original_create_date`; does not modify the input.
+    """
+    result = []
+    for record in old_records:
+        new = {k: v for k, v in record.items() if k != 'id'}
+        if 'create_date' in new:
+            new['original_create_date'] = new.pop('create_date')
+        result.append(new)
+    return result
 
-csv_file_path = 'ml_model/wayakit_prediction_report.csv'
-try:
-    df_results = pd.read_csv(csv_file_path)
-    logger.info(f"CSV file '{csv_file_path}' loaded. Found {len(df_results)} rows.")
-except FileNotFoundError:
-    logger.error(f"ERROR: The file '{csv_file_path}' was not found. Nothing will be uploaded to Odoo.")
-    exit()
 
-all_records_data = []
-for index, row in df_results.iterrows():
+# --- Previous IDs file ------------------------------------------------------------------------
+
+def save_previous_ids(path: str, ids: list, archived: bool = False) -> None:
+    """Writes the pending-cleanup file atomically (temp file + rename)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    payload = {
+        'model': MODEL_NAME,
+        'saved_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'archived': archived,
+        'ids': sorted(int(i) for i in ids),
+    }
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=1)
+    os.replace(tmp, path)
+
+
+def load_previous_ids(path: str) -> dict:
+    with open(path, encoding='utf-8') as f:
+        payload = json.load(f)
+    if payload.get('model') != MODEL_NAME or not isinstance(payload.get('ids'), list):
+        raise UploadError(f"'{path}' is not a previous-suggestions file for '{MODEL_NAME}'.")
+    return payload
+
+
+# --- Odoo steps -------------------------------------------------------------------------------
+
+def confirm_company(session: 'OdooSession') -> str:
+    """Company guard before any write (see module docstring). Returns the company name."""
+    from pi_odoo import get_single_company
+    company_id, company_name = get_single_company(session)
+    logger.info(f"Odoo company confirmed: '{company_name}' (id {company_id}), the only one visible.")
+    return company_name
+
+
+def archive_and_unlink(session: 'OdooSession', previous_ids: list, ids_file: str,
+                       already_archived: bool = False) -> int:
+    """Archives (unless `already_archived`) and unlinks ONLY `previous_ids`. Returns how many
+    records were removed. Updates `ids_file` after archiving so a retry does not archive twice,
+    and deletes it when done."""
+    old_records = session.execute(MODEL_NAME, 'read', list(previous_ids), fields=FIELDS_TO_ARCHIVE)
+    existing_ids = sorted(r['id'] for r in old_records)
+    if len(existing_ids) != len(previous_ids):
+        logger.warning(f"{len(previous_ids) - len(existing_ids)} of the previous IDs no longer exist in "
+                       f"'{MODEL_NAME}'; only the {len(existing_ids)} that exist are archived and deleted.")
+
+    if existing_ids and not already_archived:
+        logger.info(f"Archiving {len(old_records)} previous records to '{HISTORY_MODEL_NAME}'...")
+        session.execute(HISTORY_MODEL_NAME, 'create', history_records(old_records))
+        save_previous_ids(ids_file, existing_ids, archived=True)
+        logger.info("Previous records archived.")
+
+    if existing_ids:
+        logger.info(f"Deleting {len(existing_ids)} previous records from '{MODEL_NAME}'...")
+        session.execute(MODEL_NAME, 'unlink', existing_ids)
+        logger.info("Previous records deleted.")
+
+    os.remove(ids_file)
+    return len(existing_ids)
+
+
+def upload(session: 'OdooSession', records: list, run_mode: str,
+           ids_file: str = PREVIOUS_IDS_FILE) -> list:
+    """Company guard, then the partial or full flow described in the module docstring.
+
+    Returns the IDs of the created records. Raises `UploadError` (or the Odoo exception) on any
+    failure; the message says what state Odoo was left in.
+    """
+    if run_mode not in ('partial', 'full'):
+        raise UploadError(f"Unknown run mode '{run_mode}'.")
+    confirm_company(session)
+
+    previous_ids = []
+    if run_mode == 'full':
+        if os.path.exists(ids_file):
+            raise UploadError(
+                f"'{ids_file}' exists: a previous full upload did not finish its cleanup. Run "
+                f"'python ml_model/odoo_api_price_suggestion.py --cleanup-previous' first. Nothing uploaded."
+            )
+        previous_ids = session.execute(MODEL_NAME, 'search', [])
+        logger.info(f"Found {len(previous_ids)} current suggestions in '{MODEL_NAME}'.")
+        if previous_ids:
+            save_previous_ids(ids_file, previous_ids)
+            logger.info(f"Previous IDs saved to '{ids_file}'.")
+
+    logger.info(f"Creating {len(records)} new records in '{MODEL_NAME}' (one call)...")
     try:
-        volume_str = str(row['volume']).split(' ')[0]
-        volume_float = float(volume_str)
-
-        record_data = {
-            'product_id_str': row['Product_ID'],
-            'product_type': row['product_type'],
-            'generic_product_type': row['generic_product_type'],
-            'subindustry': row['subindustry'],
-            'industry': row['industry'],
-            'volume_units': volume_float,
-            'production_cost': float(row['cost_per_unit']),
-            'suggested_price': float(row['predicted_price']),
-            'profit': float(row['porcentaje_de_ganancia']),
-            'product_name': row['product_name'],
-            'predicted_price_per_unit': float(row['predicted_price_per_unit']),
-            'model_confidence': float(row['model_confidence']),
-            'market_min_found': float(row['market_min_found']),
-            'market_max_found': float(row['market_max_found']),
-            'competitors_count': int(row['competitors_count']),
-        }
-        all_records_data.append(record_data)
+        new_ids = session.execute(MODEL_NAME, 'create', records)
     except Exception as e:
-        logger.warning(f"Error processing row {index+1} (Product ID: {row.get('Product_ID', 'N/A')}). Skipping record.", exc_info=True)
+        if previous_ids:
+            os.remove(ids_file)  # nothing to clean up: the old records are still the only ones
+        raise UploadError(
+            f"Creating the new suggestions failed ({type(e).__name__}). No record was created and "
+            f"the previous suggestions are untouched."
+        ) from e
+    new_ids = new_ids if isinstance(new_ids, list) else [new_ids]
+    logger.info(f"Created {len(new_ids)} new records.")
 
-if not all_records_data:
-    logger.warning("There are no valid records to upload from the CSV. Process finished.")
-    exit()
-if args.run_mode == 'full':
-    logger.info("--- RUN MODE: FULL ---")
-    logger.info(f"Starting archiving from '{MODEL_NAME}' to '{HISTORY_MODEL_NAME}'...")
+    if run_mode == 'full' and previous_ids:
+        if set(new_ids) & set(previous_ids):
+            raise UploadError("New and previous IDs overlap; refusing to delete anything.")
+        try:
+            removed = archive_and_unlink(session, previous_ids, ids_file)
+        except Exception as e:
+            raise UploadError(
+                f"The new suggestions were created, but archiving/deleting the previous ones failed "
+                f"({type(e).__name__}). The table has old and new rows. The previous IDs are in "
+                f"'{ids_file}'; retry with 'python ml_model/odoo_api_price_suggestion.py --cleanup-previous'."
+            ) from e
+        logger.info(f"Replaced {removed} previous suggestions with {len(new_ids)} new ones.")
+    return new_ids
+
+
+def cleanup_previous(session: 'OdooSession', ids_file: str = PREVIOUS_IDS_FILE) -> int:
+    """`--cleanup-previous`: archives and unlinks the IDs stored by a failed full upload."""
+    payload = load_previous_ids(ids_file)
+    confirm_company(session)
+    logger.info(f"Cleaning up {len(payload['ids'])} previous suggestions from '{ids_file}' "
+                f"(already archived: {payload.get('archived', False)}).")
+    return archive_and_unlink(session, payload['ids'], ids_file,
+                              already_archived=bool(payload.get('archived', False)))
+
+
+# --- Entry point ------------------------------------------------------------------------------
+
+def _connect() -> 'OdooSession':
+    """Reads the Odoo credentials from Secrets Manager and authenticates. Only for real writes."""
+    from pi_odoo import connect
+    from pi_secrets import get_odoo_credentials
+    return connect(get_odoo_credentials())
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Uploads price suggestions to Odoo (KSA).")
+    parser.add_argument('--run_mode', default='partial', choices=['partial', 'full'],
+                        help="'partial' only adds; 'full' creates the new batch, then archives and "
+                             "deletes the previous one.")
+    parser.add_argument('--dry-run', action='store_true',
+                        help="Build the records and write them to --dry-run-output. No secrets, no Odoo.")
+    parser.add_argument('--dry-run-output', default=DRY_RUN_FILE,
+                        help=f"CSV written by --dry-run (default: {DRY_RUN_FILE}).")
+    parser.add_argument('--cleanup-previous', action='store_true',
+                        help="Archive and delete the previous suggestions stored in --ids-file by a "
+                             "full upload whose cleanup failed. Uploads nothing.")
+    parser.add_argument('--input', default=REPORT_FILE, help=f"Prediction report (default: {REPORT_FILE}).")
+    parser.add_argument('--ids-file', default=PREVIOUS_IDS_FILE,
+                        help="Where full mode stores the previous IDs until they are deleted.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, session: 'OdooSession' = None) -> int:
+    """Returns the exit code. `session` is injected by tests; otherwise it is created from
+    Secrets Manager, and only when the run actually writes."""
+    args = parse_args(argv)
     try:
-        existing_ids = models.execute_kw(
-            ODOO_DB, uid, API_TOKEN,
-            MODEL_NAME, 'search', [[('id', '!=', 0)]] 
-        )
-        
-        if existing_ids:
-            logger.info(f"Found {len(existing_ids)} records to archive.")
-            
-            fields_to_archive = [
-                'product_id_str', 'product_type', 'generic_product_type', 
-                'subindustry', 'industry', 'volume_units', 
-                'production_cost', 'suggested_price', 'profit', 'create_date',
-                'product_name', 'predicted_price_per_unit', 'model_confidence',
-                'market_min_found', 'market_max_found', 'competitors_count'
-            ]
-            old_records = models.execute_kw(
-                ODOO_DB, uid, API_TOKEN,
-                MODEL_NAME, 'read', [existing_ids], {'fields': fields_to_archive}
-            )
-            
-            records_to_create_in_history = []
-            for record in old_records:
-                record.pop('id', None)
-                if 'create_date' in record:
-                    record['original_create_date'] = record.pop('create_date')
-                records_to_create_in_history.append(record)
-            
-            logger.info(f"Creating {len(records_to_create_in_history)} records in history '{HISTORY_MODEL_NAME}'...")
-            models.execute_kw(
-                ODOO_DB, uid, API_TOKEN,
-                HISTORY_MODEL_NAME, 'create', [records_to_create_in_history]
-            )
-            logger.info("Records archived to history successfully!")
+        if args.cleanup_previous:
+            if args.dry_run:
+                payload = load_previous_ids(args.ids_file)
+                logger.info(f"DRY RUN: would archive and delete {len(payload['ids'])} previous "
+                            f"suggestions listed in '{args.ids_file}'. Odoo not contacted.")
+                return 0
+            if session is None:
+                session = _connect()
+            cleanup_previous(session, args.ids_file)
+            return 0
 
-            logger.info(f"Deleting {len(existing_ids)} old records from '{MODEL_NAME}'...")
-            models.execute_kw(
-                ODOO_DB, uid, API_TOKEN,
-                MODEL_NAME, 'unlink', [existing_ids]
-            )
-            logger.info("Old records deleted successfully!")
+        df_results = pd.read_csv(args.input)
+        logger.info(f"Report '{args.input}' loaded: {len(df_results)} rows.")
+        records, skipped = build_records(df_results)
+        check_parse_quality(records, skipped)
+        logger.info(f"{len(records)} records ready ({len(skipped)} rows skipped).")
 
-        else:
-            logger.info("No existing records found. No archiving required.")
+        if args.dry_run:
+            pd.DataFrame(records).to_csv(args.dry_run_output, index=False)
+            logger.info(f"DRY RUN ({args.run_mode}): {len(records)} records written to "
+                        f"'{args.dry_run_output}'. Odoo not contacted.")
+            return 0
 
-    except Exception as e:
-        logger.error(f"CRITICAL ERROR during archiving/deletion.", exc_info=True)
-        logger.error("Aborting to prevent a duplicate upload. The suggestions table may not be clean.")
-        exit(1)
+        logger.info(f"--- RUN MODE: {args.run_mode.upper()} ---")
+        if session is None:
+            session = _connect()
+        upload(session, records, args.run_mode, args.ids_file)
+        logger.info("Upload finished.")
+        return 0
+    except Exception:
+        logger.exception("CRITICAL ERROR in the price suggestion upload.")
+        return 1
 
-else:
-    logger.info("--- RUN MODE: PARTIAL ---")
-    logger.info("Only the new records will be added (without deleting).")
 
-logger.info(f"\n🚀 Sending {len(all_records_data)} new records to '{MODEL_NAME}' in a single call...")
-try:
-    new_record_ids = models.execute_kw(
-        ODOO_DB, uid, API_TOKEN,
-        MODEL_NAME,
-        'create',
-        [all_records_data]
-    )
-    
-    logger.info(f"Bulk upload completed successfully!")
-    logger.info(f"   Created {len(new_record_ids)} new records.")
-
-except Exception as e:
-    logger.error(f"CRITICAL ERROR during the bulk upload", exc_info=True)
-    logger.error("   The operation failed. No record was created in this batch.")
-    
-logger.info("\nProcess finished.")
+if __name__ == "__main__":
+    sys.exit(main())

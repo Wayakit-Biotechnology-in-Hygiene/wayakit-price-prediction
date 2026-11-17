@@ -73,21 +73,20 @@ def process_unit_data(df):
     logger.info("✅ File 'competitor_unit_processed.csv' saved.")
 
 def main():
-    try:
-        competitor_data = load_and_clean_raw_data()
-        
-        volumetric_units = ['ml', 'l', 'fl oz', 'g']
-        is_volumetric = competitor_data['unit_of_measurement'].str.lower().isin(volumetric_units)
-        
-        process_volumetric_data(competitor_data[is_volumetric].copy())
-        process_unit_data(competitor_data[~is_volumetric].copy())
-        
-        logger.info("🎉 Competitor data preprocessing completed.")
-        
-    except FileNotFoundError as e:
-        logger.error("Required file not found", exc_info=True)
-    except Exception as e:
-        logger.error("Unexpected error occurred during preprocessing", exc_info=True)
+    """Errors propagate (no swallowing): the `__main__` block logs them and exits with 1."""
+    competitor_data = load_and_clean_raw_data()
+
+    volumetric_units = ['ml', 'l', 'fl oz', 'g']
+    is_volumetric = competitor_data['unit_of_measurement'].str.lower().isin(volumetric_units)
+
+    process_volumetric_data(competitor_data[is_volumetric].copy())
+    process_unit_data(competitor_data[~is_volumetric].copy())
+
+    logger.info("🎉 Competitor data preprocessing completed.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Competitor data preprocessing failed.")
+        sys.exit(1)

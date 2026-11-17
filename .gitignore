@@ -189,3 +189,6 @@ chrome_profile_ml/
 data/
 .claude/state/
 .claude/settings.local.json
+
+# Pipeline state on the instance (run mode, previous Odoo suggestion IDs); never in the repo
+logs/

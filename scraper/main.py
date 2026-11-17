@@ -183,236 +183,465 @@
 #         logger.error(f"[FATAL] Unhandled exception", exc_info=True)
 #         traceback.print_exc()
 
-# scraper/main.py (Modifications + Arguments)
-import pandas as pd
-import time
-import csv
-import os  
-import sys
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-     sys.path.insert(0, project_root)
-import re
-import config
+# scraper/main.py: competitor scraping. Writes to a temporary CSV and replaces the final one only
+# when the run succeeds; exits with 1 on any fatal error; always writes a coverage report.
 import argparse
+import csv
+import os
+import shutil
+import signal
+import sys
+import time
+
+import pandas as pd
+
+SCRAPER_DIR = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(SCRAPER_DIR, '..'))
+# Same order as "python scraper/main.py" (repo root first, then scraper/), also when imported
+# from the tests.
+if SCRAPER_DIR not in sys.path:
+    sys.path.insert(0, SCRAPER_DIR)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+import config
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from services.ai_service import RelevanceAgent
+from services.ai_service import RelevanceAgent, RelevanceAgentError, RelevanceAgentFatalError
 from scrapers.amazon_scraper import AmazonScraper
 from scrapers.mumzworld_scraper import MumzworldScraper
 from scrapers.saco_scraper import SacoScraper
 from scrapers.fine_scraper import FineScraper
-from scrapers.gogreen_scraper import GoGreenScraper 
+from scrapers.gogreen_scraper import GoGreenScraper
 from scrapers.officesupply_scraper import OfficeSupplyScraper
 from scrapers.aerosense_scraper import AeroSenseScraper
 from log_config import get_logger
 
-logger = get_logger() # <-- ADDED
+logger = get_logger()
 
-# --- Arguments --- ADDED ---
-parser = argparse.ArgumentParser(description="Runs the scraping of competitor prices.")
-parser.add_argument('--analysis_file', default=config.INSTRUCTIONS_FILE,
-                    help=f"CSV file with scraping instructions (default: {config.INSTRUCTIONS_FILE})")
-parser.add_argument('--output_mode', default='overwrite', choices=['overwrite', 'append'],
-                    help="Write mode for the output file ('overwrite' or 'append', default: overwrite)")
-parser.add_argument('--output_file', default=config.OUTPUT_CSV_FILE,
-                    help=f"Output CSV file for the results (default: {config.OUTPUT_CSV_FILE})")
-args = parser.parse_args()
-# --- END Arguments ---
+DEFAULT_COVERAGE_FILE = 'scraper/coverage_report.csv'
+COVERAGE_COLUMNS = [
+    'subindustry', 'type_of_product', 'site', 'keyword',
+    'found', 'relevant', 'rows_written', 'ai_failures', 'error',
+]
+B2C_SUBINDUSTRIES = ['home', 'automotive', 'pets']  # compared in lowercase
+# B2B sites are only searched with a site-specific keyword or general modifiers.
+KEYWORD_REQUIRED_SITES = ['fine', 'gogreen', 'officesupply', 'aerosense']
+UNITS_MODE_KEYWORDS = ['wipes', 'rags', 'microfiber', 'brush']
+# Scrapers that do not use the relevance agent: everything they return counts as found and relevant.
+SITES_WITHOUT_AI = {'aerosense'}
+SECONDS_BETWEEN_SUBINDUSTRIES = 5
 
-# --- Rename argument and config variables --- ADDED ---
-INPUT_ANALYSIS_FILE = args.analysis_file
-OUTPUT_MODE = args.output_mode
-OUTPUT_SCRAPING_FILE = args.output_file
-# --- END Rename ---
 
-def main():
-    logger.info(f"Starting scraping. Output mode: {OUTPUT_MODE}")
-    logger.info(f"Using instructions file: {INPUT_ANALYSIS_FILE}")
-    logger.info(f"Output file: {OUTPUT_SCRAPING_FILE}")
+class ScrapingAborted(Exception):
+    """A fatal error (relevance AI) that must stop the whole run."""
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Runs the scraping of competitor prices.")
+    parser.add_argument('--analysis_file', default=config.INSTRUCTIONS_FILE,
+                        help=f"CSV file with scraping instructions (default: {config.INSTRUCTIONS_FILE})")
+    parser.add_argument('--output_mode', default='overwrite', choices=['overwrite', 'append'],
+                        help="Write mode for the output file ('overwrite' or 'append', default: overwrite)")
+    parser.add_argument('--output_file', default=config.OUTPUT_CSV_FILE,
+                        help=f"Output CSV file for the results (default: {config.OUTPUT_CSV_FILE})")
+    parser.add_argument('--coverage_file', default=DEFAULT_COVERAGE_FILE,
+                        help=f"Coverage report per product, site and keyword (default: {DEFAULT_COVERAGE_FILE})")
+    return parser.parse_args(argv)
+
+
+# --- Pure helpers (no I/O) -----------------------------------------------------------------
+
+def parse_instruction(row):
+    """Search plan for one instructions row (a pandas Series or a dict). Same rules as before:
+    base keyword after the first '-', 'site:keyword' modifiers per site, the rest appended to
+    the keyword, and units mode for wipes, rags, microfiber and brushes."""
+    original_type_of_product = str(row['Type of product'])
+    original_type_of_product_lower = original_type_of_product.lower()
 
     try:
-        # Use the analysis file passed as an argument
-        df_instructions = pd.read_csv(INPUT_ANALYSIS_FILE)
+        base_keyword = original_type_of_product_lower.split('-', 1)[1].strip()
+    except IndexError:
+        base_keyword = original_type_of_product_lower.strip()
+
+    search_modifiers_val = row.get('Search Modifiers')
+    site_specific_keywords = {}
+    general_modifiers = []
+
+    if pd.notna(search_modifiers_val):
+        modifiers = str(search_modifiers_val).split(';')
+        for mod in modifiers:
+            mod = mod.strip()
+            if ':' in mod:
+                site, keyword = mod.split(':', 1)
+                site = site.strip().lower()
+                keyword = keyword.strip()
+                site_specific_keywords.setdefault(site, []).append(keyword)
+            elif mod:
+                general_modifiers.append(mod)
+
+    general_modifiers_text = " ".join(general_modifiers)
+    search_keyword = f"{base_keyword} {general_modifiers_text}".strip()
+    search_mode = 'units' if any(kw in original_type_of_product_lower for kw in UNITS_MODE_KEYWORDS) else 'volume'
+    return {
+        'type_of_product': original_type_of_product,
+        'generic_product_type': str(row['Generic product type']),
+        'base_keyword': base_keyword,
+        'search_keyword': search_keyword,
+        'site_specific_keywords': site_specific_keywords,
+        'general_modifiers': general_modifiers,
+        'search_mode': search_mode,
+    }
+
+
+def sites_for(sub_industry, base_keyword):
+    """Sites to scrape for a subindustry, minus the Mumzworld and SACO exclusions.
+    The TARGET_MAP lookup is case-sensitive on purpose (C06 is a separate decision)."""
+    sites_to_scrape = config.TARGET_MAP.get(sub_industry, []).copy()
+    if base_keyword in config.MUMZWORLD_EXCLUSIONS and 'mumzworld' in sites_to_scrape:
+        sites_to_scrape.remove('mumzworld')
+    if base_keyword in config.SACO_EXCLUSIONS and 'saco' in sites_to_scrape:
+        sites_to_scrape.remove('saco')
+    return sites_to_scrape
+
+
+def channel_for(sub_industry):
+    return 'B2C' if sub_industry.lower() in B2C_SUBINDUSTRIES else 'B2B'
+
+
+def build_row_data(product, industry, sub_industry, type_of_product, generic_type_of_product,
+                   site_name, channel, date):
+    """One output row; keys are exactly ``config.CSV_COLUMNS`` (DictWriter raises on extras).
+
+    NUL characters are removed from text values: the csv module cannot write them and one
+    scraped title with a NUL would otherwise abort the whole run. Any other value is unchanged.
+    """
+    row = {
+        'date': date,
+        'industry': industry,
+        'subindustry': sub_industry,
+        'type_of_product': type_of_product,
+        'generic_product_type': generic_type_of_product,
+        'product': product.get('Product'),
+        'price_sar': product.get('Price_SAR'),
+        'company': product.get('Company'),
+        'source': site_name,
+        'url': product.get('URL'),
+        'unit_of_measurement': product.get('Unit of measurement'),
+        'total_quantity': product.get('Total quantity'),
+        'channel': channel,
+    }
+    return {key: strip_nul(value) for key, value in row.items()}
+
+
+def strip_nul(value):
+    """``value`` without '\\x00' if it is a string; any other type is returned as is."""
+    return value.replace('\x00', '') if isinstance(value, str) else value
+
+
+def stats_delta(before, after):
+    """Counter increments between two ``RelevanceAgent.stats()`` snapshots."""
+    return {key: after.get(key, 0) - before.get(key, 0) for key in after}
+
+
+def coverage_entry(subindustry, type_of_product, site, keyword, delta, rows_written, error='',
+                   uses_ai=True):
+    """Coverage of one ``scrape()`` call. ``found`` and ``relevant`` are the titles the AI
+    evaluated and accepted during the call; for a site without AI both equal ``rows_written``.
+    ``ai_failures`` adds relevance and wipes failures."""
+    if uses_ai:
+        found = delta.get('evaluated', 0)
+        relevant = delta.get('relevant', 0)
+    else:
+        found = relevant = rows_written
+    return {
+        'subindustry': subindustry,
+        'type_of_product': type_of_product,
+        'site': site,
+        'keyword': keyword,
+        'found': found,
+        'relevant': relevant,
+        'rows_written': rows_written,
+        'ai_failures': delta.get('failures', 0) + delta.get('wipes_failures', 0),
+        'error': error or '',
+    }
+
+
+def build_coverage_report(entries):
+    """One row per (subindustry, type_of_product, site, keyword), in first-seen order: numeric
+    columns are summed and distinct errors joined with ';'."""
+    numeric = ('found', 'relevant', 'rows_written', 'ai_failures')
+    report = {}
+    for entry in entries:
+        key = (entry['subindustry'], entry['type_of_product'], entry['site'], entry['keyword'])
+        if key not in report:
+            report[key] = {column: entry[column] for column in COVERAGE_COLUMNS}
+            report[key]['error'] = entry['error'] or ''
+            continue
+        row = report[key]
+        for column in numeric:
+            row[column] += entry[column]
+        errors = [e for e in row['error'].split(';') if e]
+        if entry['error'] and entry['error'] not in errors:
+            errors.append(entry['error'])
+        row['error'] = ';'.join(errors)
+    return list(report.values())
+
+
+def zero_relevant_pairs(report):
+    """Report rows with no relevant result: candidates for a better keyword on that site."""
+    return [row for row in report if row['relevant'] == 0]
+
+
+def temp_path_for(output_path):
+    """Temporary file next to the output ('x.csv' -> 'x.tmp.csv'), so ``os.replace`` stays on
+    the same filesystem and the '*.csv' gitignore rule also covers a leftover temp file."""
+    root, ext = os.path.splitext(output_path)
+    return f"{root}.tmp{ext}" if ext else f"{output_path}.tmp"
+
+
+# --- I/O -----------------------------------------------------------------------------------
+
+def write_coverage_report(report, path):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=COVERAGE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(report)
+
+
+def install_chromedriver():
+    return ChromeDriverManager().install()
+
+
+def make_scrapers(driver_path, ai_agent):
+    return {
+        'amazon': AmazonScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'mumzworld': MumzworldScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'saco': SacoScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'fine': FineScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'gogreen': GoGreenScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'officesupply': OfficeSupplyScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'aerosense': AeroSenseScraper(driver_path=driver_path),  # does not use the relevance agent
+    }
+
+
+def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path, coverage_entries,
+                 sleep=time.sleep, file_handle=None):
+    """Scrapes every instruction and writes the rows; returns how many rows were written.
+
+    A failing ``scrape()`` call is logged and recorded in ``coverage_entries`` (one site error
+    must not throw away a 30 h run); a fatal relevance-AI error raises ``ScrapingAborted``.
+    """
+    rows_total = 0
+    for sub_industry_group, df_industry_instructions in df_instructions.groupby('Sub industry'):
+        logger.info(f"\n=================================================")
+        logger.info(f"  PROCESSING SUBINDUSTRY: '{sub_industry_group}'")
+        logger.info(f"=================================================\n")
+
+        if df_industry_instructions.empty:
+            logger.warning(f"There are no instructions for '{sub_industry_group}'.")
+            continue
+
+        scrapers = scraper_factory(driver_path, ai_agent)
+        all_found_products_for_group = []
+
+        for index, row in df_industry_instructions.iterrows():
+            sub_industry = row['Sub industry']
+            plan = parse_instruction(row)
+            base_keyword = plan['base_keyword']
+            search_mode = plan['search_mode']
+            site_specific_keywords = plan['site_specific_keywords']
+
+            logger.info(f">> Searching '{base_keyword}' for '{sub_industry}' (Mode: {search_mode})")
+            for site_name in sites_for(sub_industry, base_keyword):
+                scraper = scrapers.get(site_name)
+                if not scraper:
+                    logger.warning(f"   -> No scraper found for '{site_name}'.")
+                    continue
+                keywords_to_use = site_specific_keywords.get(site_name, [plan['search_keyword']])
+
+                for keyword_to_use in keywords_to_use:
+                    if site_name in KEYWORD_REQUIRED_SITES:
+                        if site_name not in site_specific_keywords and not plan['general_modifiers']:
+                            logger.warning(f"Skipping '{site_name}' for '{base_keyword}' because no specific keyword or general modifier was provided.")
+                            continue
+
+                    logger.info(f"   -> Searching '{site_name}' with keyword: '{keyword_to_use}'")
+                    before = ai_agent.stats()
+                    error = ''
+                    raised_fatal = None
+                    try:
+                        found_products = scraper.scrape(keyword_to_use, search_mode)
+                    except RelevanceAgentFatalError as fatal_error:
+                        raised_fatal = fatal_error
+                        found_products = []
+                    except Exception as scrape_error:
+                        logger.error(f"Error while scraping '{site_name}' with keyword '{keyword_to_use}'.", exc_info=True)
+                        error = type(scrape_error).__name__
+                        found_products = []  # Continue with the next site/keyword
+                    uses_ai = site_name not in SITES_WITHOUT_AI
+                    # The scrapers catch every exception internally, so a fatal AI error is
+                    # detected through the agent, not only through the call above.
+                    fatal = ai_agent.fatal_error or raised_fatal
+                    if fatal is not None:
+                        coverage_entries.append(coverage_entry(
+                            sub_industry, plan['type_of_product'], site_name, keyword_to_use,
+                            stats_delta(before, ai_agent.stats()), 0,
+                            RelevanceAgentFatalError.__name__, uses_ai=uses_ai,
+                        ))
+                        raise ScrapingAborted(str(fatal))
+
+                    channel_value = channel_for(sub_industry)
+                    for product in found_products:
+                        all_found_products_for_group.append(build_row_data(
+                            product,
+                            industry=df_industry_instructions.iloc[0]['Industry'],
+                            sub_industry=sub_industry,
+                            type_of_product=plan['type_of_product'],
+                            generic_type_of_product=plan['generic_product_type'],
+                            site_name=site_name,
+                            channel=channel_value,
+                            date=time.strftime("%Y-%m-%d"),
+                        ))
+                        logger.debug(f"    -> Product added: {product.get('Product', 'N/A')[:60]}...")
+
+                    coverage_entries.append(coverage_entry(
+                        sub_industry, plan['type_of_product'], site_name, keyword_to_use,
+                        stats_delta(before, ai_agent.stats()), len(found_products), error,
+                        uses_ai=uses_ai,
+                    ))
+
+        if all_found_products_for_group:
+            logger.info(f"Writing {len(all_found_products_for_group)} products found for '{sub_industry_group}' to the temporary file...")
+            writer.writerows(all_found_products_for_group)
+            if file_handle is not None:
+                file_handle.flush()
+            rows_total += len(all_found_products_for_group)
+        else:
+            logger.info(f"No products found to save for '{sub_industry_group}'.")
+
+        logger.info(f"Process for '{sub_industry_group}' completed.")
+        logger.info(f"Resting {SECONDS_BETWEEN_SUBINDUSTRIES} seconds before the next subindustry...")
+        sleep(SECONDS_BETWEEN_SUBINDUSTRIES)
+    return rows_total
+
+
+def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep):
+    """The scraping run; returns the exit code. The final CSV is only replaced on success."""
+    try:
+        df_instructions = pd.read_csv(args.analysis_file)
         df_instructions = df_instructions.dropna(subset=['Type of product', 'Sub industry'])
-        logger.info(f"Instructions loaded from '{INPUT_ANALYSIS_FILE}'. {len(df_instructions)} tasks found.")
+        logger.info(f"Instructions loaded from '{args.analysis_file}'. {len(df_instructions)} tasks found.")
     except FileNotFoundError:
-        logger.error(f"Instructions file '{INPUT_ANALYSIS_FILE}' not found.")
-        return
-    except Exception as e:
-        logger.error(f"Error reading '{INPUT_ANALYSIS_FILE}'.", exc_info=True)
-        return
+        logger.error(f"Instructions file '{args.analysis_file}' not found.")
+        return 1
+    except Exception:
+        logger.error(f"Error reading '{args.analysis_file}'.", exc_info=True)
+        return 1
 
-    # --- Determine write mode and header --- MODIFIED ---
-    file_exists = os.path.exists(OUTPUT_SCRAPING_FILE)
-    write_mode = 'w' if OUTPUT_MODE == 'overwrite' else 'a'
-    write_header = (OUTPUT_MODE == 'overwrite') or (not file_exists) # Write the header when overwriting or when the file does not exist in append mode
-
-    # Use 'with open' outside the loop for better file handling
+    logger.info("Downloading and configuring ChromeDriver...")
     try:
-        with open(OUTPUT_SCRAPING_FILE, write_mode, newline='', encoding='utf-8') as f:
+        driver_path = driver_installer()
+        logger.info(f"ChromeDriver ready at: {driver_path}")
+    except Exception:
+        logger.critical("Could not install ChromeDriver.", exc_info=True)
+        return 1
+
+    try:
+        ai_agent = agent_factory()
+        ai_agent.preflight()
+    except RelevanceAgentError as error:
+        logger.critical(f"Relevance AI is not available: {error}")
+        return 1
+
+    output_file = args.output_file
+    temp_file = temp_path_for(output_file)
+    file_exists = os.path.exists(output_file)
+    write_header = (args.output_mode == 'overwrite') or (not file_exists)
+    try:
+        if args.output_mode == 'append' and file_exists:
+            shutil.copyfile(output_file, temp_file)  # append to a copy; the original stays intact
+        write_mode = 'w' if args.output_mode == 'overwrite' else 'a'
+        with open(temp_file, write_mode, newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=config.CSV_COLUMNS)
             if write_header:
                 writer.writeheader()
-                logger.info(f"Writing header to '{OUTPUT_SCRAPING_FILE}'.")
-            # --- END Modification ---
+            rows_written = run_scraping(df_instructions, writer, ai_agent, scraper_factory,
+                                        driver_path, coverage_entries, sleep=sleep, file_handle=f)
+    except ScrapingAborted as aborted:
+        logger.critical(f"Scraping aborted by a fatal relevance-AI error: {aborted}. "
+                        f"'{output_file}' was not modified.")
+        return 1
+    except Exception:
+        logger.critical(f"Unexpected error in the scraping process. '{output_file}' was not modified.",
+                        exc_info=True)
+        return 1
 
-            logger.info("Downloading and configuring ChromeDriver...")
-            try:
-                driver_path = ChromeDriverManager().install()
-                logger.info(f"ChromeDriver ready at: {driver_path}")
-            except Exception as e:
-                logger.critical("Could not install ChromeDriver.", exc_info=True)
-                return # Exit if there is no driver
+    if rows_written == 0:
+        logger.error(f"No competitor rows were scraped. '{output_file}' was not modified.")
+        return 1
 
-            ai_agent = RelevanceAgent() # Assumes RelevanceAgent already uses Secrets Manager internally
+    stats = ai_agent.stats()
+    logger.info(
+        f"Relevance AI: {stats.get('evaluated', 0)} titles evaluated, {stats.get('relevant', 0)} relevant, "
+        f"{stats.get('failures', 0) + stats.get('wipes_failures', 0)} failures "
+        f"(rate {ai_agent.failure_rate():.1%})."
+    )
+    try:
+        ai_agent.check_failure_rate()
+    except RelevanceAgentError as error:
+        logger.error(f"{error}. '{output_file}' was not modified; partial rows are in '{temp_file}'.")
+        return 1
 
-            # Group by subindustry to process the way you did
-            for sub_industry_group, df_industry_instructions in df_instructions.groupby('Sub industry'):
-                logger.info(f"\n=================================================")
-                logger.info(f"  PROCESSING SUBINDUSTRY: '{sub_industry_group}'")
-                logger.info(f"=================================================\n")
-
-                if df_industry_instructions.empty:
-                    logger.warning(f"There are no instructions for '{sub_industry_group}'.")
-                    continue
-
-                # Create scrapers (you can move this outside the loop if you prefer)
-                scrapers = {
-                    'amazon': AmazonScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'mumzworld': MumzworldScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'saco': SacoScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'fine': FineScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'gogreen': GoGreenScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'officesupply': OfficeSupplyScraper(driver_path=driver_path, relevance_agent=ai_agent),
-                    'aerosense': AeroSenseScraper(driver_path=driver_path) # Aerosense does not use the AI agent? Verify
-                }
-
-                all_found_products_for_group = [] # Accumulate products per group
-
-                for index, row in df_industry_instructions.iterrows():
-                    # ... (logic to extract base_keyword, modifiers, search_keyword, search_mode - unchanged) ...
-                    sub_industry = row['Sub industry'] # Make sure sub_industry is defined here
-                    original_type_of_product = str(row['Type of product'])
-                    original_type_of_product_lower = original_type_of_product.lower()
-                    generic_type_of_product = str(row['Generic product type'])
-
-                    try:
-                        base_keyword = original_type_of_product_lower.split('-', 1)[1].strip()
-                    except IndexError:
-                        base_keyword = original_type_of_product_lower.strip()
-
-                    search_modifiers_val = row.get('Search Modifiers')
-                    site_specific_keywords = {}
-                    general_modifiers = []
-
-                    if pd.notna(search_modifiers_val):
-                        search_modifiers_str = str(search_modifiers_val)
-                        modifiers = search_modifiers_str.split(';')
-                        for mod in modifiers:
-                            mod = mod.strip()
-                            if ':' in mod:
-                                site, keyword = mod.split(':', 1)
-                                site = site.strip().lower() # ensure lowercase
-                                keyword = keyword.strip()
-                                if site not in site_specific_keywords:
-                                    site_specific_keywords[site] = []
-                                site_specific_keywords[site].append(keyword)
-                            elif mod:
-                                general_modifiers.append(mod)
-
-                    general_modifiers_text = " ".join(general_modifiers)
-                    search_keyword = f"{base_keyword} {general_modifiers_text}".strip()
-
-                    search_mode = 'units' if any(kw in original_type_of_product_lower for kw in ['wipes', 'rags', 'microfiber', 'brush']) else 'volume'
-                    # ... (end of extraction logic) ...
-
-                    logger.info(f">> Searching '{base_keyword}' for '{sub_industry}' (Mode: {search_mode})")
-                    # ... (logic for sites to scrape, exclusions - unchanged) ...
-                    sites_to_scrape = config.TARGET_MAP.get(sub_industry, []).copy()
-
-                    if base_keyword in config.MUMZWORLD_EXCLUSIONS and 'mumzworld' in sites_to_scrape:
-                        sites_to_scrape.remove('mumzworld')
-                        logger.debug(f"Excluding Mumzworld for '{base_keyword}'")
-
-                    if base_keyword in config.SACO_EXCLUSIONS and 'saco' in sites_to_scrape:
-                        sites_to_scrape.remove('saco')
-                        logger.debug(f"Excluding Saco for '{base_keyword}'")
+    os.replace(temp_file, output_file)
+    logger.info(f"{rows_written} rows written. '{output_file}' replaced.")
+    return 0
 
 
-                    for site_name in sites_to_scrape:
-                        scraper = scrapers.get(site_name)
-                        if scraper:
-                            # Decide which keyword to use: the site-specific one or the general one
-                            keywords_to_use = site_specific_keywords.get(site_name, [search_keyword])
+def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrapers,
+         driver_installer=install_chromedriver, sleep=time.sleep):
+    """Entry point; returns the exit code (0 only if the output CSV was replaced).
 
-                            for keyword_to_use in keywords_to_use:
-                                # Logic for B2B sites that require a specific keyword
-                                if site_name in ['fine', 'gogreen', 'officesupply', 'aerosense']:
-                                     if site_name not in site_specific_keywords and not general_modifiers: # Skip if there is no specific keyword AND NO general modifiers either
-                                        logger.warning(f"Skipping '{site_name}' for '{base_keyword}' because no specific keyword or general modifier was provided.")
-                                        continue
+    Tests inject ``agent_factory`` (no Bedrock), ``scraper_factory(driver_path, agent)``,
+    ``driver_installer`` (no Chrome) and ``sleep``.
+    """
+    args = parse_args(argv)
+    logger.info(f"Starting scraping. Output mode: {args.output_mode}")
+    logger.info(f"Using instructions file: {args.analysis_file}")
+    logger.info(f"Output file: {args.output_file}")
 
-                                logger.info(f"   -> Searching '{site_name}' with keyword: '{keyword_to_use}'")
-                                try:
-                                    found_products = scraper.scrape(keyword_to_use, search_mode)
-                                except Exception as scrape_error:
-                                     logger.error(f"Error while scraping '{site_name}' with keyword '{keyword_to_use}'.", exc_info=True)
-                                     found_products = [] # Continue with the next site/keyword
+    coverage_entries = []
+    exit_code = 1
+    try:
+        exit_code = _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep)
+    finally:
+        # Best effort, also after an error or SIGTERM from "timeout": the report says how far it got.
+        try:
+            report = build_coverage_report(coverage_entries)
+            write_coverage_report(report, args.coverage_file)
+            empty = zero_relevant_pairs(report)
+            logger.info(f"Coverage report: {len(report)} product x site x keyword rows in '{args.coverage_file}'.")
+            if empty:
+                logger.warning(f"{len(empty)} product x site x keyword pairs with 0 relevant results:")
+                for row in empty:
+                    detail = f" (error: {row['error']})" if row['error'] else ""
+                    logger.warning(f"   - {row['subindustry']} | {row['type_of_product']} | "
+                                   f"{row['site']} | '{row['keyword']}'{detail}")
+        except Exception:
+            logger.error(f"Could not write the coverage report '{args.coverage_file}'.", exc_info=True)
+    logger.info(f"\n\n--- SCRAPING PROCESS FINISHED (exit code {exit_code}) ---")
+    return exit_code
 
-                                b2c_subindustries = ['home', 'automotive', 'pets'] # Use lowercase for comparison
-                                channel_value = 'B2C' if sub_industry.lower() in b2c_subindustries else 'B2B'
 
-                                for product in found_products:
-                                    row_data = {
-                                        # ... (data mapping - unchanged) ...
-                                        'date': time.strftime("%Y-%m-%d"),
-                                        'industry': df_industry_instructions.iloc[0]['Industry'], # Get it from the first row of the group
-                                        'subindustry': sub_industry,
-                                        'type_of_product': original_type_of_product,
-                                        'generic_product_type': generic_type_of_product,
-                                        'product': product.get('Product'),
-                                        'price_sar': product.get('Price_SAR'),
-                                        'company': product.get('Company'),
-                                        'source': site_name,
-                                        'url': product.get('URL'),
-                                        'unit_of_measurement': product.get('Unit of measurement'),
-                                        'total_quantity': product.get('Total quantity'),
-                                        'channel': channel_value,
-                                    }
-                                    all_found_products_for_group.append(row_data)
-                                    logger.debug(f"    -> Product added: {product.get('Product', 'N/A')[:60]}...") # Changed to DEBUG for less verbosity
-                        else:
-                            logger.warning(f"   -> No scraper found for '{site_name}'.")
-
-                # Write the results of the current group to the CSV file
-                if all_found_products_for_group:
-                    logger.info(f"Writing {len(all_found_products_for_group)} products found for '{sub_industry_group}' to '{OUTPUT_SCRAPING_FILE}'...")
-                    writer.writerows(all_found_products_for_group)
-                else:
-                    logger.info(f"No products found to save for '{sub_industry_group}'.")
-
-                logger.info(f"Process for '{sub_industry_group}' completed.")
-                logger.info("Resting 5 seconds before the next subindustry...") # Reduced rest time?
-                time.sleep(5)
-
-    except IOError as e:
-        logger.critical(f"Fatal error opening/writing '{OUTPUT_SCRAPING_FILE}'.", exc_info=True)
-    except Exception as e:
-        logger.critical("Unexpected error in the main scraping process.", exc_info=True)
-
-    logger.info("\n\n--- SCRAPING PROCESS COMPLETED ---")
+def _exit_on_sigterm(signum, frame):
+    # "timeout 30h" sends SIGTERM: turn it into SystemExit so the scrapers close Chrome and the
+    # coverage report is still written. The previous CSV is untouched.
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":
-    try:
-        # sys.stdout.reconfigure is no longer needed with properly configured logging
-        main()
-    except Exception as e:
-        # Final catch in case something fails outside main()
-        # logger may not be initialized here if it fails very early
-        print(f"[FATAL] Unhandled exception: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    sys.exit(main())
