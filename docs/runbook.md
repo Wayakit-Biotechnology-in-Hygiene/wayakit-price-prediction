@@ -292,7 +292,7 @@ scripts/verify.sh completo   # + e2e + differential contra origin/server-improve
 - **Sesión de solo checks** (para cambiar checks):
   1. Mafer crea `.claude/settings.local.json` con `{"env": {"PI_EDITAR_CHECKS": "1"}}` (archivo local, ignorado por git). Mientras exista, **no se arma equipo**, porque los compañeros heredarían el permiso.
   2. Se cambian solo checks y docs, sin `scraper/`, `ml_model/` ni `run_pipeline.sh`. Luego `git add`, `verify.sh completo` y commit con su sello.
-  3. Mafer borra `.claude/settings.local.json` al terminar.
+  3. Mafer borra `.claude/settings.local.json` al terminar **y reinicia la sesión de Claude Code**: la variable se queda en el entorno de la sesión que ya está abierta (comprobado el 2026-11-17), así que el candado no vuelve a cerrarse hasta abrir una sesión nueva.
 - **Mientras los checks no estén en la rama base:** el gate de `TaskCompleted` compara contra `merge-base(PI_CHECKS_BASE, HEAD)`. Hasta que el PR de checks entre a `server-improvement`, todo el setup cuenta como "checks cambiados" y el gate bloquearía cualquier tarea que toque producción. Por eso, después del commit de checks y antes de arrancar un equipo, Mafer deja en `.claude/settings.local.json` solo `{"env": {"PI_CHECKS_BASE": "<sha del commit de checks>"}}` (sin `PI_EDITAR_CHECKS`). Los hooks leen el entorno de Claude Code, no el de una terminal. Cuando el PR entra a la base, se quita y vuelve el valor por defecto (`origin/server-improvement`).
 - Si `verify.sh` falla por XPASS, se arregló un bug que tenía `xfail(strict=True)`: hay que quitar ese `xfail` (lo hace `pi-tester`).
 - Si el mismo check falla 3 veces seguidas, parar y escalar a Mafer (regla de las 3 rondas).
