@@ -211,4 +211,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _aws.cli_main(main)

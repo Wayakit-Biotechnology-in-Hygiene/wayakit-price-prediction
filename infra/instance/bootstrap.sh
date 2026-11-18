@@ -19,6 +19,8 @@
 #   previous crontab is saved in the log folder as crontab-ec2-user.<UTC time>.bak). They must
 #   go before the new run_pipeline.sh runs: the old no-argument line would now start a whole run,
 #   and the old `--stage 2` line exits 1, whose EXIT trap shuts down a run already in progress.
+#   So this is the first step, right after the arguments are checked: a later step that fails
+#   (packages, Chrome, conda) still leaves the crontab filtered.
 # The F4 deploy service (pi-deploy.service) and the S3 release layout are not part of F3.
 #
 # It never prints the values of the env file (the topic and profile ARNs contain the account ID),
@@ -279,13 +281,16 @@ main() {
     valid_model "$FALLBACK_MODEL" || die "invalid --fallback-model."
 
     if [ "$DRY_RUN" = 1 ]; then say "DRY RUN: nothing will be changed."; fi
+    # First, before any step that can fail (dnf, Chrome, conda downloads): if the F3 code is
+    # already on the instance, an old crontab line left behind by a failed bootstrap would start a
+    # whole run (Friday line) or shut the instance down mid-run (`--stage 2`). It only needs LOG_DIR.
+    remove_old_cron_lines
     ensure_ssm_agent
     ensure_packages
     if [ "$skip_chrome" = 1 ]; then say "Chrome: skipped (--skip-chrome)."; else ensure_chrome; fi
     if [ "$skip_conda" = 1 ]; then say "conda: skipped (--skip-conda)."; else ensure_conda; fi
     ensure_env_file
     ensure_service
-    remove_old_cron_lines
     say "done. The pipeline runs on the next scheduled boot (last Thursday of the month, 21:50 America/Mexico_City)."
 }
 

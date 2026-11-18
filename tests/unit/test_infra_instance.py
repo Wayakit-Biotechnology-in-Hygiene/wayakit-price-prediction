@@ -992,7 +992,9 @@ def test_service_unit_keys():
     service = dict(unit["Service"])
     repo = ec2i.REPO_DIR
     assert service == {
-        "Type": "oneshot",
+        # exec, not oneshot (F3 review): the boot finishes instead of staying "starting" for the
+        # whole run; ExecCondition (the boot guard) still decides whether ExecStart runs.
+        "Type": "exec",
         "User": "ec2-user",
         "Group": "ec2-user",
         "WorkingDirectory": repo,
@@ -1409,6 +1411,84 @@ def test_ensure_service_installs_and_enables_but_never_starts(box):
     assert box.calls("systemctl") == ["is-enabled --quiet pi-pipeline.service"]
     every = " ".join(box.calls("systemctl"))
     assert "start" not in every and "--now" not in every
+
+
+# --- bootstrap.sh main(): the old crontab lines go first (F3 review) ---------------------------
+def _main_box(box, *, failing=None):
+    """Lets `main` run in the box: a fake `id` (root), `dirname` for the repo-path check, and the
+    SSM agent already active. `failing` = "chrome" makes `dnf install <chrome rpm>` fail; "conda"
+    makes the Miniforge download (curl) fail."""
+    (box.shims / "id").write_text("#!/bin/sh\necho 0\n")
+    (box.shims / "id").chmod(0o755)
+    (box.utils / "dirname").symlink_to(next(Path(d) / "dirname" for d in ("/usr/bin", "/bin")
+                                            if (Path(d) / "dirname").exists()))
+    (box.state / "active-amazon-ssm-agent").write_text("")
+    record = 'printf "%s\\t%s\\n" "${0##*/}" "$*" >> "$SHIM_CALLS"\n'
+    if failing == "chrome":
+        (box.shims / "google-chrome").unlink()
+        (box.shims / "dnf").write_text('#!/bin/sh\n' + record
+                                       + 'case "$*" in *google-chrome*) exit 1 ;; esac\nexit 0\n')
+    elif failing == "conda":
+        (box.shims / "curl").write_text("#!/bin/sh\n" + record + "exit 22\n")
+
+
+def _main_snippet(box, *args):
+    """`main` with the box's paths: the repo is expected where this test file's repo is."""
+    quoted = " ".join(f"'{a}'" for a in args)
+    return (f'REPO_DIR_EXPECTED="{REPO_ROOT}"; ENV_FILE="{box.root}/price-intelligence.env"; '
+            f'SERVICE_DST="{box.root}/systemd/pi-pipeline.service"; CONDA_DIR="{box.root}/miniconda"; '
+            f'main --log-dir "{box.root}/logs" {quoted}')
+
+
+def _assert_crontab_filtered_first(box):
+    assert box.crontab.read_text() == OLD_CRONTAB_FILTERED
+    backups = list((box.root / "logs").glob("crontab-ec2-user.*.bak"))
+    assert len(backups) == 1 and backups[0].read_text() == OLD_CRONTAB
+    names = [name for name, _ in box.calls()]
+    last_crontab = max(i for i, n in enumerate(names) if n == "crontab")
+    later = {"dnf", "curl", "runuser", "systemctl", "google-chrome", "sha256sum"}
+    assert not later & set(names[:last_crontab]), names
+
+
+@pytest.mark.parametrize("failing, args", [("chrome", ["--skip-conda"]), ("conda", ["--skip-chrome"])])
+def test_main_failing_chrome_or_conda_still_leaves_the_crontab_filtered(box, failing, args):
+    """The old crontab lines are removed before any step that can fail: a failed Chrome or conda
+    install aborts `main` (set -e) but the old Friday and `--stage 2` lines are already gone."""
+    box.crontab.write_text(OLD_CRONTAB)
+    _main_box(box, failing=failing)
+    rc, out, err = box.run(_main_snippet(box, *args))
+    assert rc != 0, out + err
+    assert "bootstrap: done." not in out
+    _assert_crontab_filtered_first(box)
+    assert not (box.root / "systemd" / "pi-pipeline.service").exists()  # ensure_service never ran
+    assert "command not found" not in err, err
+
+
+def test_main_success_removes_the_crontab_lines_before_everything_else(box):
+    box.crontab.write_text(OLD_CRONTAB)
+    _main_box(box)
+    (box.root / "systemd").mkdir()
+    rc, out, err = box.run(_main_snippet(box, "--skip-chrome", "--skip-conda"))
+    assert rc == 0, out + err
+    assert out.rstrip().endswith("bootstrap: done. The pipeline runs on the next scheduled boot "
+                                 "(last Thursday of the month, 21:50 America/Mexico_City).")
+    _assert_crontab_filtered_first(box)
+    lines = out.splitlines()
+    first_cron = next(i for i, line in enumerate(lines) if "crontab of ec2-user" in line)
+    assert first_cron < next(i for i, line in enumerate(lines) if line.startswith("bootstrap: SSM agent"))
+    assert all("crontab" not in line for line in lines[first_cron + 2:-1]), "cron step runs once"
+
+
+def test_main_dry_run_reports_the_crontab_step_first_and_changes_nothing(box):
+    box.crontab.write_text(OLD_CRONTAB)
+    _main_box(box)
+    rc, out, err = box.run(_main_snippet(box, "--dry-run", "--skip-chrome", "--skip-conda"))
+    assert rc == 0, out + err
+    lines = out.splitlines()
+    assert lines[0] == "bootstrap: DRY RUN: nothing will be changed."
+    assert lines[1].startswith("bootstrap: crontab of ec2-user: removing 2 run_pipeline.sh line(s)")
+    assert box.crontab.read_text() == OLD_CRONTAB
+    assert box.calls("crontab") == ["-u ec2-user -l"]
 
 
 def test_every_step_in_dry_run_changes_nothing(box):

@@ -5,6 +5,8 @@
   `PutPiMetrics` and always with the namespace condition; every other wildcard is one of the
   documented ones; every ARN is in eu-north-1 and this account, or is a Bedrock foundation model
   (no account) in the EU.
+- S3 objects: Get/Put/Delete only under data/, models/, state/ and logs/; releases/ is
+  read-only; nothing elsewhere in the bucket (evaluated with `check_pi.allows`).
 - Validation: every account-scoped builder rejects any account that is not 12 ASCII digits
   (Unicode digits, `*`, empty, ints, 11 or 13 digits); the instance-scoped builders reject any
   string that is not one instance ID;
@@ -28,7 +30,7 @@ import pytest
 from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
-from infra import _aws, deploy_role, instance_role, scheduler_role
+from infra import _aws, check_pi, deploy_role, instance_role, scheduler_role
 from tests.unit.test_infra_iam import (ACCOUNT, HAIKU_APP, IR, MODULES, OIDC_ARN, OLD_ROLE_ARN, OLD_ROLES,
                                        SR, DR, FakeAws, assume_record, session_record)
 
@@ -103,7 +105,8 @@ def test_every_resource_is_scoped(inputs, instance):
     foundation model; wildcards only in the documented places."""
     account, profiles, models = inputs
     bucket = f"arn:aws:s3:::price-intelligence-{account}"
-    allowed_wild = {"*", f"{bucket}/*", f"{bucket}/releases/*"}
+    # Never the whole bucket (`{bucket}/*`): only the end of a known prefix.
+    allowed_wild = {"*", *(f"{bucket}/{p}/*" for p in ("data", "models", "state", "logs", "releases"))}
     secret = f"arn:aws:secretsmanager:eu-north-1:{account}:secret:prod/wayakit-app-??????"
     for doc in all_policies(account, profiles, models, instance).values():
         for st_ in statements(doc):
@@ -119,6 +122,30 @@ def test_every_resource_is_scoped(inputs, instance):
                         r in models and r.startswith("arn:aws:bedrock:eu-"))
                 else:
                     assert r.startswith("arn:aws:") and r.split(":")[3:5] == ["eu-north-1", account], r
+
+
+object_keys = st.tuples(
+    st.sampled_from(["data/", "models/", "state/", "logs/", "releases/", "", "other/", "data", "releases"]),
+    st.from_regex(r"[A-Za-z0-9._/-]{0,30}", fullmatch=True)).map("".join)
+
+
+@given(instance_inputs(), object_keys)
+@example((ACCOUNT, {}, [f"arn:aws:bedrock:eu-north-1::foundation-model/{HAIKU_MODEL_ID}"]), "releases/current")
+@example((ACCOUNT, {}, [f"arn:aws:bedrock:eu-north-1::foundation-model/{HAIKU_MODEL_ID}"]), "releases/x.tar.gz")
+@example((ACCOUNT, {}, [f"arn:aws:bedrock:eu-north-1::foundation-model/{HAIKU_MODEL_ID}"]), "top-level.txt")
+@example((ACCOUNT, {}, [f"arn:aws:bedrock:eu-north-1::foundation-model/{HAIKU_MODEL_ID}"]), "data/x.csv")
+def test_instance_can_write_only_data_prefixes_and_only_read_releases(inputs, key):
+    """F3 review (Important 2): on any object key of the PI bucket the instance policy grants
+    Get/Put/Delete exactly when the key is under data/, models/, state/ or logs/; under releases/
+    only GetObject; anywhere else nothing. Evaluated with check_pi's IAM matcher."""
+    account, profiles, models = inputs
+    stmts = check_pi.statements(instance_role.instance_policy(account, profiles, models))
+    obj = f"arn:aws:s3:::price-intelligence-{account}/{key}"
+    data = key.startswith(("data/", "models/", "state/", "logs/"))
+    release = key.startswith("releases/")
+    assert check_pi.allows(stmts, "s3:GetObject", obj) == (data or release)
+    assert check_pi.allows(stmts, "s3:PutObject", obj) == data
+    assert check_pi.allows(stmts, "s3:DeleteObject", obj) == data
 
 
 @given(instance_inputs())

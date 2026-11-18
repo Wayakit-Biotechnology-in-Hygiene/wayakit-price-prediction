@@ -29,7 +29,16 @@ What it checks (single run, Mafer 2026-11-18):
   is set, exactly once, before the shutdown, through `timeout 60s`; subject and body name the
   failed step, never a stage; the last 20 log lines with secret values redacted; the topic ARN
   (it holds the account ID) is never printed or logged; a failed publish never blocks the
-  shutdown or changes the exit code.
+  shutdown or changes the exit code. A resource-name host name (`i-<hex>...`) is masked to
+  `<instance-id>` (F3 review), like the IP in the default host name.
+- Signals (F3 review): SIGTERM, SIGINT or SIGHUP to the run's process group in the middle of a
+  step (what `systemctl stop` with KillMode=control-group, an instance stop or Ctrl-C do) ends
+  with 143, 130 or 129; the EXIT trap logs that code, sends the alert (subject and body carry it)
+  when the topic is set, and shuts down exactly once. A second SIGTERM while the alert is being
+  published only kills the publish: the run still logs the warning and shuts down once. The run is
+  started in its own session (`start_new_session=True`) so the signal never reaches pytest; the
+  step blocks on its stdin and reports through a FIFO that it is running, so there is no sleep and
+  no polling.
 
 Removed with the stages (2026-11-18): stage 1/stage 2 order, `run_mode.txt` (full/partial,
 unknown mode), the partial mode (`filter_new_products.py`, `wayakit_new_products_temp.csv`, the
@@ -37,8 +46,12 @@ unknown mode), the partial mode (`filter_new_products.py`, `wayakit_new_products
 """
 from __future__ import annotations
 
+import os
+import queue
 import re
+import signal
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -777,3 +790,175 @@ def test_alert_region_comes_from_the_arn_and_a_bad_arn_still_shuts_down(sandbox,
     assert _option(argv, "--region") == region and _option(argv, "--topic-arn") == topic
     assert topic not in run.stdout + run.stderr + _pipeline_log(run)
     _shutdown_once_and_last(run)
+
+
+# ---------------------------------------------------------------------------------------------
+# Host masking (F3 review): resource-name host names carry the instance ID
+# ---------------------------------------------------------------------------------------------
+FAKE_RESOURCE_HOST = "i-0123456789abcdef0.eu-north-1.compute.internal"
+
+
+@pytest.mark.parametrize("host, shown", [
+    (FAKE_RESOURCE_HOST, "<instance-id>.eu-north-1.compute.internal"),
+    ("i-0abc1234.i-0ABC1235", "<instance-id>.<instance-id>"),
+    ("pi-i-0abc1234-x", "pi-<instance-id>-x"),
+    (FAKE_HOST, "ip-<ip>.eu-north-1.compute.internal"),
+    ("xi-0abc1234", "xi-0abc1234"),  # not a whole token: kept
+], ids=["resource-name", "two-ids", "inside-dashes", "ip-name", "glued"])
+def test_alert_masks_an_instance_id_in_the_host_name(sandbox, host, shown):
+    out = _aws_recorder(sandbox)
+    run = _run_args(sandbox, [], fail={TRAIN: 1}, extra_env=_alert_env(HOSTNAME=host))
+    assert run.returncode == 1, run.trace()
+    message = _alert_message(out, run)
+    assert f"\nHost: {shown}\n" in message, message
+    for iid in ("i-0123456789abcdef0", "i-0abc1234", "i-0ABC1235"):
+        assert iid not in message or shown == "xi-0abc1234", message
+    _shutdown_once_and_last(run)
+    _no_leaks(run)
+
+
+# ---------------------------------------------------------------------------------------------
+# Signals in the middle of a run (F3 review)
+# ---------------------------------------------------------------------------------------------
+READY = "ready"
+
+
+class _Fifo:
+    """A FIFO the blocked shims write `ready` to; a daemon thread reads it into a queue, so the
+    test waits with a timeout and never sleeps or polls."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        os.mkfifo(path)
+        self.lines: queue.Queue[str] = queue.Queue()
+        self.stop = False
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        while not self.stop:
+            with open(self.path, encoding="utf-8") as f:  # blocks until a writer opens it
+                for line in f:
+                    self.lines.put(line.strip())
+
+    def wait(self) -> str:
+        return self.lines.get(timeout=sb.RUN_TIMEOUT_S)
+
+    def close(self) -> None:
+        self.stop = True
+        try:  # wakes the reader if it is waiting in open()
+            os.close(os.open(self.path, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+
+
+def _block_in(sandbox: sb.Sandbox, shim: str, condition: str) -> None:
+    """When `condition` holds, the shim writes `ready` to the FIFO and then waits on its stdin
+    (the test never writes to it), so it is still running when the signal arrives."""
+    _patch_shim(sandbox, shim, f'if {condition}; then echo {READY} > "$PI_TEST_FIFO"; read _ ; fi\n')
+
+
+def _start(sandbox: sb.Sandbox, fifo: _Fifo, extra_env: dict[str, str]) -> subprocess.Popen:
+    """Like `_run_args` (same environment and shim lock) but started in its own session and not
+    waited for. Its process group is the run's alone: signalling it never reaches pytest."""
+    env = sandbox.env()
+    env.update(extra_env, PI_TEST_FIFO=str(fifo.path))
+    sandbox.check_shims(env)
+    sandbox.log.unlink(missing_ok=True)
+    proc = subprocess.Popen([sb.BASH, "--noprofile", "--norc", str(sandbox.project / sb.SCRIPT)],
+                            cwd=sandbox.project, env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    assert os.getpgid(proc.pid) == proc.pid != os.getpgid(0)
+    return proc
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    assert os.getpgid(proc.pid) == proc.pid != os.getpgid(0), "never signal pytest's group"
+    os.killpg(proc.pid, sig)
+
+
+def _finish(sandbox: sb.Sandbox, proc: subprocess.Popen, fifo: _Fifo) -> sb.SandboxRun:
+    try:
+        stdout, stderr = proc.communicate(timeout=sb.RUN_TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        fifo.close()
+    calls = []
+    if sandbox.log.is_file():
+        for line in sandbox.log.read_text(encoding="utf-8").splitlines():
+            command, cwd, args_ = (line.split("\t", 2) + ["", ""])[:3]
+            calls.append(sb.Call(command, cwd, args_))
+    return sb.SandboxRun(proc.returncode, stdout, stderr, calls, sandbox.project)
+
+
+SIGNALS = [(signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)]
+
+
+@pytest.mark.parametrize("sig, code", SIGNALS, ids=["TERM", "INT", "HUP"])
+def test_signal_during_a_step_alerts_with_its_code_and_shuts_down_once(sandbox, sig, code):
+    fifo = _Fifo(sandbox.root / "ready.fifo")
+    _block_in(sandbox, "python", f'[ "$1" = "{SCRAPER}" ]')
+    out = _aws_recorder(sandbox)
+    proc = _start(sandbox, fifo, _alert_env())
+    try:
+        assert fifo.wait() == READY
+        _signal_group(proc, sig)
+    finally:
+        run = _finish(sandbox, proc, fifo)
+    assert run.returncode == code, run.trace()
+    assert run.python_scripts == [PRODUCTS, LIST], "nothing runs after the interrupted step"
+    argvs = _aws_argvs(out)
+    assert len(argvs) == 1 and len(run.of("aws")) == 1, run.trace()
+    assert _option(argvs[0], "--subject") == f"Price Intelligence pipeline failed (exit {code})"
+    message = _option(argvs[0], "--message")
+    assert f"\nFailed step: {DESCRIPTIONS[SCRAPER]}\n" in message
+    assert f"\nExit code: {code}\n" in message
+    log = _pipeline_log(run)
+    assert log.count("Failure alert sent (SNS).") == 1
+    assert f"Pipeline finished (code={code})" in log
+    assert log.index("Failure alert sent (SNS).") < log.index(f"Pipeline finished (code={code})")
+    _shutdown_once_and_last(run)
+    _no_leaks(run)
+
+
+def test_sigterm_without_the_topic_shuts_down_once_with_143(sandbox):
+    fifo = _Fifo(sandbox.root / "ready.fifo")
+    _block_in(sandbox, "python", f'[ "$1" = "{TRAIN}" ]')
+    out = _aws_recorder(sandbox)
+    proc = _start(sandbox, fifo, {"HOSTNAME": FAKE_HOST})
+    try:
+        assert fifo.wait() == READY
+        _signal_group(proc, signal.SIGTERM)
+    finally:
+        run = _finish(sandbox, proc, fifo)
+    assert run.returncode == 143, run.trace()
+    assert _aws_argvs(out) == [] and not run.of("aws"), run.trace()
+    assert UPLOAD not in run.python_scripts
+    assert "Pipeline finished (code=143)" in _pipeline_log(run)
+    _shutdown_once_and_last(run)
+
+
+def test_second_sigterm_during_the_alert_still_shuts_down_once(sandbox):
+    """The second signal only kills the publish (`trap ':'` in on_exit): the warning is logged,
+    the exit code stays 143 and the shutdown happens once."""
+    fifo = _Fifo(sandbox.root / "ready.fifo")
+    _block_in(sandbox, "python", f'[ "$1" = "{SCRAPER}" ]')
+    _aws_recorder(sandbox)
+    _block_in(sandbox, "aws", '[ "$1" = sns ]')
+    proc = _start(sandbox, fifo, _alert_env())
+    try:
+        assert fifo.wait() == READY  # the scraping step is running
+        _signal_group(proc, signal.SIGTERM)
+        assert fifo.wait() == READY  # the alert is being published
+        _signal_group(proc, signal.SIGTERM)
+    finally:
+        run = _finish(sandbox, proc, fifo)
+    assert run.returncode == 143, run.trace()
+    log = _pipeline_log(run)
+    assert "WARNING: could not send the failure alert (SNS). Shutting down anyway." in log
+    assert "Failure alert sent" not in log
+    assert log.count("Pipeline finished (code=143)") == 1
+    _shutdown_once_and_last(run)
+    _no_leaks(run)

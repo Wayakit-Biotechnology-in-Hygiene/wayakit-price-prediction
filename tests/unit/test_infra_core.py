@@ -294,6 +294,23 @@ def test_mask_email(address, masked):
     assert _aws.mask_email(address) == masked
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("arn:aws:iam::123456789012:role/x", "arn:aws:iam::<account>:role/x"),
+    ("i-0123456789abcdef0 and i-0abc1234", "<instance-id> and <instance-id>"),
+    ("i-0abc1234.eu-north-1.compute.internal", "<instance-id>.eu-north-1.compute.internal"),
+    ("xi-0abc1234y", "x<instance-id>y"),               # no word boundaries on instance IDs
+    ("i-123456789012", "<instance-id>"),               # instance first: not "i-<account>"
+    ("i-0123456789abcdef01", "<instance-id>1"),        # 17 hex at most
+    ("12345678901 1234567890123 a123456789012", "12345678901 1234567890123 a123456789012"),
+    ("i-0abc123 i-0ABC12345", "i-0abc123 i-0ABC12345"),  # too short; uppercase is not an EC2 ID
+    ("<account> <instance-id>", "<account> <instance-id>"),
+    (123456789012, "<account>"),                       # str() of anything
+])
+def test_mask_ids(text, expected):
+    assert _aws.mask_ids(text) == expected
+    assert _aws.mask_ids(expected) == expected
+
+
 def test_json_diff():
     assert _aws.json_diff({"a": 1}, {"a": 1}) == ""
     diff = _aws.json_diff({"a": 1}, {"a": 2}, label="lifecycle")

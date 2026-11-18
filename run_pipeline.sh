@@ -113,6 +113,24 @@ redact_secrets() {
     done
 }
 
+# Masks instance IDs in $1 and prints the result: every whole token `i-` + 8 to 17 hex digits
+# (delimited by the start or end of the text or by a character that is not a letter or digit)
+# becomes <instance-id>. EC2 resource-name host names are `i-<hex>.<region>.compute.internal`, and
+# instance IDs never go into messages. A regex loop because ${var//...} cannot count repetitions;
+# each pass consumes the ID, so it always ends. The leftmost match is also the first occurrence of
+# its text, so ${s%%"$m"*} cuts at the right place.
+mask_instance_ids() {
+    local s="$1" out="" m
+    local re='(^|[^0-9A-Za-z])i-[0-9a-fA-F]{8,17}([^0-9A-Za-z]|$)'
+    while [[ $s =~ $re ]]; do
+        m="${BASH_REMATCH[0]}"
+        out+="${s%%"$m"*}${BASH_REMATCH[1]}<instance-id>"
+        # The closing delimiter goes back so it can open the next token (i-a.i-b).
+        s="${BASH_REMATCH[2]}${s#*"$m"}"
+    done
+    printf '%s' "$out$s"
+}
+
 # Publishes a short failure message to SNS (email) when PI_ALERTS_TOPIC_ARN is set (the instance
 # gets it from /etc/price-intelligence.env). Never fails: a broken alert must not block the
 # shutdown. The topic ARN is not logged (it holds the account ID) and neither is the AWS error.
@@ -120,9 +138,11 @@ send_failure_alert() {
     local rc="$1" region subject message recent host
     [ -n "${PI_ALERTS_TOPIC_ARN:-}" ] || return 0
     IFS=: read -r _ _ _ region _ <<< "$PI_ALERTS_TOPIC_ARN"
-    # The default EC2 host name embeds the private IP (ip-a-b-c-d...); no IPs in messages.
+    # The default EC2 host name embeds the private IP (ip-a-b-c-d...) or, with resource-name host
+    # names, the instance ID (i-0abc....compute.internal); neither goes into messages.
     host="${HOSTNAME:-unknown}"
     host="${host//+([0-9])[-.]+([0-9])[-.]+([0-9])[-.]+([0-9])/<ip>}"
+    host=$(mask_instance_ids "$host")
     recent=$(last_lines "$ALERT_LOG_LINES" "$SCRIPT_LOG_FILE" | redact_secrets)
     subject="Price Intelligence pipeline failed (exit $rc)"
     message="The Price Intelligence pipeline failed and the instance is shutting down.
@@ -149,11 +169,22 @@ ${recent:-(log not found)}"
 # The trap does not call exit, so the script keeps the exit code of the step that failed.
 on_exit() {
     local rc="$1"
+    # A second signal while the alert is being sent must not skip the shutdown: from here on the
+    # signals only interrupt the command running (a no-op handler, not '' which children would
+    # inherit as "ignored" and then `timeout` could not stop `aws`).
+    trap ':' TERM INT HUP
     [ "$rc" -ne 0 ] && send_failure_alert "$rc"
     log_message "Pipeline finished (code=$rc). Scheduling shutdown in 1 minute."
     sudo shutdown -h +1
 }
 trap 'on_exit $?' EXIT
+# A stop in the middle of a run (systemctl stop, instance stop or shutdown, Ctrl-C, SSM session
+# closed) ends with the conventional 128+signal code, so the EXIT trap sees a failure: the alert
+# goes out and the log shows the code. Bash runs these after the foreground step returns (under
+# systemd, KillMode=control-group signals the step too, so that is at once).
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
 # --- Single run (Mafer, 2026-11-18: no stages) ---
 # One flow per scheduled boot: Odoo products -> scraping list -> scraping -> Odoo reads -> ML ->

@@ -23,7 +23,6 @@ Usage (from the repo root):
     python -m infra.deploy_role --dry-run
     python -m infra.deploy_role
 """
-import sys
 
 from infra import _aws, config
 from infra.config import check_account
@@ -148,4 +147,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _aws.cli_main(main)

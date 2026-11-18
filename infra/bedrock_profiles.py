@@ -26,7 +26,6 @@ Usage (from the repo root, profile `wayakit-vdc`):
     python -m infra.bedrock_profiles
 """
 import re
-import sys
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -218,4 +217,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _aws.cli_main(main)

@@ -9,16 +9,20 @@ What it provides:
   accepts both and `lower=True` produces the Bedrock shape.
 - Policies: `policy_json`, `policies_equal` (order-insensitive comparison for idempotent updates
   and check_pi).
-- Output: `report` (dry-run aware printer), `json_diff`, `redact_account`, `mask_email`.
+- Output: `report` (dry-run aware printer), `json_diff`, `redact_account`, `mask_email`,
+  `mask_ids` (catch-all for 12-digit numbers and instance IDs).
 - Errors: `error_code(exc)`.
-- CLI: `base_parser(description)` with `--dry-run`.
+- CLI: `base_parser(description)` with `--dry-run`; `cli_main(main)` is the `__main__` entry point
+  of every script (prints the profile, turns AWS errors into a sanitized line and exit 1). Not
+  named `run_*`: `check_pi.py` must only name read-like methods (its source is scanned by a test).
 
-Importing this module does not call AWS; boto3 is imported only when no session is injected.
+Importing this module does not call AWS; boto3 and botocore are imported only when needed.
 """
 import argparse
 import difflib
 import json
 import re
+import sys
 
 from infra import config
 
@@ -145,6 +149,21 @@ def mask_email(address):
     return f"{local[:1]}***@{domain}"
 
 
+# Catch-alls, applied after the specific replacements (known account, known instance): any other
+# account ID (e.g. in a CloudTrail record from another account) or instance ID still never
+# reaches the output. No word boundaries on the instance pattern (like `schedule.py`): an ID glued
+# to other characters is still masked; over-redacting output is harmless.
+_ANY_ACCOUNT = re.compile(r"\b[0-9]{12}\b")
+_ANY_INSTANCE_ID = re.compile(r"i-[0-9a-f]{8,17}")
+
+
+def mask_ids(text):
+    """Replace every remaining 12-digit number with `<account>` and every instance-ID-shaped
+    token (`i-` + 8 to 17 hex characters) with `<instance-id>`. Idempotent."""
+    text = _ANY_INSTANCE_ID.sub("<instance-id>", str(text))
+    return _ANY_ACCOUNT.sub("<account>", text)
+
+
 def report(message, *, dry_run=False, account=None):
     """Print one action line. In dry-run mode it is prefixed with `[dry-run] would`; the account
     ID is always redacted. Returns the printed line (for tests)."""
@@ -179,3 +198,54 @@ def base_parser(description):
     parser.add_argument("--dry-run", action="store_true",
                         help="show what would change; only read calls are made")
     return parser
+
+
+def profile_line():
+    """First line every script prints: the AWS profile it uses (never the account), so a stale
+    `AWS_PROFILE` in the shell is visible before anything happens."""
+    return f"Profile: {config.profile()}"
+
+
+# BotoCoreError subclasses that mean "log in again" (expired or missing SSO session, wrong
+# profile). Looked up by name so an older botocore without one of them still works.
+_LOGIN_ERRORS = ("NoCredentialsError", "PartialCredentialsError", "CredentialRetrievalError",
+                 "TokenRetrievalError", "SSOError", "SSOTokenLoadError", "UnauthorizedSSOTokenError",
+                 "ProfileNotFound", "NoAuthTokenError", "LoginTokenLoadError")
+
+
+def cli_main(main, argv=None, **kwargs):
+    """Entry point of every script: `if __name__ == "__main__": _aws.cli_main(main)`.
+
+    Prints `profile_line()`, then calls `main(argv, **kwargs)` (`kwargs` lets tests inject a
+    session) and always ends with SystemExit:
+    - `main` returns an int: that is the exit code; any other return value (None, a summary
+      dict) means success, code 0.
+    - botocore `ClientError`: prints only `AWS error <code> in <operation>` to stderr, code 1.
+      The AWS message is never printed: it can carry the account ID, ARNs or the SSO email.
+    - other botocore errors (`BotoCoreError`: credentials, expired SSO, endpoint): prints only
+      the exception class name to stderr (plus an `aws sso login` hint for login errors), code 1.
+    - SystemExit raised by `main` (its own messages, argparse) and any other exception propagate
+      unchanged. `main(argv, session)` itself keeps raising: only this wrapper sanitizes.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    print(profile_line())
+    try:
+        result = main(argv, **kwargs)
+    except ClientError as exc:
+        code = error_code(exc) or "Unknown"
+        operation = getattr(exc, "operation_name", None) or "AWS call"
+        print(f"AWS error {code} in {operation}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except BotoCoreError as exc:
+        name = type(exc).__name__
+        print(f"AWS client error: {name}", file=sys.stderr)
+        if any(cls.__name__ in _LOGIN_ERRORS for cls in type(exc).__mro__):
+            print(f"If the SSO session expired: aws sso login --profile {config.profile()}",
+                  file=sys.stderr)
+        raise SystemExit(1) from None
+    code = result if isinstance(result, int) and not isinstance(result, bool) else 0
+    raise SystemExit(code)
+
+
+run_cli = cli_main  # the name used in the F3 review notes

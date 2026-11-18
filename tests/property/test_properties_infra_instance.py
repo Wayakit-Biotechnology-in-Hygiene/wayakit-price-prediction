@@ -26,6 +26,10 @@ Rules checked over generated inputs:
   it is idempotent; lines without a secret name come out unchanged apart from the cap; the cap is
   applied after redacting. The function is extracted from the script and run alone (the script
   itself is never sourced: its trap shuts the machine down).
+- `run_pipeline.sh` `mask_instance_ids` (alert host, F3 review): equals a Python reference (every
+  whole token `i-` + 8 to 17 hex digits, either case, bounded by the ends or a character that is
+  not an ASCII letter or digit, becomes `<instance-id>`), in the C and en_US.UTF-8 locales; it is
+  idempotent and leaves no whole instance-ID token; text without one comes back unchanged.
 
 No AWS: the apply loop runs against the stateful `FakeAws` of the unit tests. The bash functions
 run with an empty `PATH` (builtins only).
@@ -511,3 +515,54 @@ def test_text_glued_to_a_quoted_value_is_part_of_the_value(quote, head, tail, qu
     line = f" key={value}"
     once = run_redact([line])
     assert once == [" key=<redacted>"] and run_redact([line], passes=2) == once
+
+
+# --- run_pipeline.sh: mask_instance_ids (alert host, F3 review) ---------------------------------
+def _mask_source():
+    text = RUN_PIPELINE.read_text(encoding="utf-8")
+    block = re.search(r"^mask_instance_ids\(\) \{\n.*?^\}\n", text, re.M | re.S)
+    assert block, "mask_instance_ids() not found in run_pipeline.sh"
+    return block.group(0)
+
+
+MASK_BLOCK = _mask_source()
+REFERENCE_INSTANCE_TOKEN = re.compile(r"(?<![0-9A-Za-z])i-[0-9a-fA-F]{8,17}(?![0-9A-Za-z])")
+
+
+def reference_mask(text: str) -> str:
+    return REFERENCE_INSTANCE_TOKEN.sub("<instance-id>", text)
+
+
+def run_mask(texts, passes=1, locale="C"):
+    """The extracted function over each text (one per line; builtins only)."""
+    body = 'while IFS= read -r l; do ' + 'l=$(mask_instance_ids "$l"); ' * passes + 'printf "%s\\n" "$l"; done'
+    r = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", f"{MASK_BLOCK}\n{body}"],
+                       input="".join(f"{t}\n" for t in texts).encode(),
+                       env={"PATH": "", "LC_ALL": locale}, capture_output=True, timeout=30)
+    assert r.returncode == 0 and r.stderr == b"", r.stderr
+    return r.stdout.decode().split("\n")[:-1]
+
+
+HOST_ALPHABET = "i-.0123456789abcdefABCDEFxyzXYZ_<>: "
+host_texts = st.text(st.sampled_from(HOST_ALPHABET), max_size=60) | st.builds(
+    lambda a, iid, b: a + iid + b,
+    st.text(st.sampled_from(HOST_ALPHABET), max_size=10),
+    st.from_regex(r"i-[0-9a-fA-F]{6,19}", fullmatch=True),
+    st.text(st.sampled_from(HOST_ALPHABET), max_size=10))
+
+
+@given(st.lists(host_texts, min_size=1, max_size=8), st.sampled_from(["C", "en_US.UTF-8"]))
+@example(["i-0123456789abcdef0.eu-north-1.compute.internal", "i-0abc1234.i-0abc1235", "pi-i-0ABC1234-x",
+          "xi-0abc1234", "i-abc", "i-0123456789abcdef01", "i-0abc1234i-0abc1235", ""], "C")
+def test_mask_instance_ids_equals_the_reference_and_is_idempotent(texts, locale):
+    once = run_mask(texts, locale=locale)
+    assert once == [reference_mask(t) for t in texts]
+    assert run_mask(texts, passes=2, locale=locale) == once
+    for out in once:
+        assert not REFERENCE_INSTANCE_TOKEN.search(out), out
+
+
+@given(st.lists(st.text(st.sampled_from("abcdefghjklmnopqrstuvwxyz0123456789.-_ "), max_size=40),
+                min_size=1, max_size=8))
+def test_mask_instance_ids_without_an_i_dash_is_the_identity(texts):
+    assert run_mask(texts) == texts

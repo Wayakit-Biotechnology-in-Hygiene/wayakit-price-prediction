@@ -300,7 +300,7 @@ def ensure_bucket(s3, account, *, dry_run=False):
         if setting in ("policy", "lifecycle", "encryption", "public_access_block"):
             diff = _aws.json_diff(current.get(setting), desired[setting], label=setting)
             if diff:
-                print(_aws.redact_account(diff, account))
+                print(_aws.mask_ids(_aws.redact_account(diff, account)))
 
     actions = ([] if exists else ["create"]) + changes
     if not exists:
@@ -342,4 +342,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _aws.cli_main(main)

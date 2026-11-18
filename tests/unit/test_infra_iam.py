@@ -76,7 +76,10 @@ def expected_instance_policy(profiles=(DEEPSEEK_APP, HAIKU_APP), haiku_app=True)
          "Resource": f"arn:aws:secretsmanager:eu-north-1:{ACCOUNT}:secret:prod/wayakit-app-??????"},
         {"Sid": "ListPiBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": BUCKET},
         {"Sid": "ReadWritePiObjects", "Effect": "Allow",
-         "Action": ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"], "Resource": f"{BUCKET}/*"},
+         "Action": ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
+         "Resource": [f"{BUCKET}/data/*", f"{BUCKET}/models/*", f"{BUCKET}/state/*", f"{BUCKET}/logs/*"]},
+        # F3 review: releases (and the `current` pointer) are written only by the deploy role.
+        {"Sid": "ReadPiReleases", "Effect": "Allow", "Action": "s3:GetObject", "Resource": f"{BUCKET}/releases/*"},
         {"Sid": "PutPiMetrics", "Effect": "Allow", "Action": "cloudwatch:PutMetricData", "Resource": "*",
          "Condition": {"StringEquals": {"cloudwatch:namespace": "PriceIntelligence"}}},
         {"Sid": "PublishPiAlerts", "Effect": "Allow", "Action": "sns:Publish",
@@ -284,10 +287,11 @@ def test_documents_are_allow_only_without_wildcard_actions_or_not_elements(name)
 
 @pytest.mark.parametrize("name", ["instance policy", "scheduler policy", "deploy policy"])
 def test_wildcards_only_where_documented(name):
-    """`*` only as the PutMetricData resource (with the namespace condition), the bucket objects
-    and the releases prefix; `?` only in the secret's 6-character random suffix."""
+    """`*` only as the PutMetricData resource (with the namespace condition) and the end of a
+    bucket prefix (data, models, state, logs, releases): never the whole bucket; `?` only in the
+    secret's 6-character random suffix."""
     secret = f"arn:aws:secretsmanager:eu-north-1:{ACCOUNT}:secret:prod/wayakit-app-??????"
-    allowed = {"*", f"{BUCKET}/*", f"{BUCKET}/releases/*"}
+    allowed = {"*", *(f"{BUCKET}/{p}/*" for p in ("data", "models", "state", "logs", "releases"))}
     for st in ALL_DOCS[name]()["Statement"]:
         resources = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
         for r in resources:
@@ -352,6 +356,21 @@ def test_redact_instance_ids(text, expected):
 
 
 # --- Audit summary (pure) ----------------------------------------------------------------------
+def test_act_and_info_mask_any_account_and_instance_id(capsys):
+    """F3 review: after the known account and the delimited instance IDs, the catch-all masks any
+    other 12-digit number (e.g. another account in a CloudTrail record of the audit) and any
+    instance ID glued to other characters."""
+    text = f"{OLD_ROLE_ARN} used by arn:aws:iam::123456789012:user/x on {INSTANCE} and x{OTHER_INSTANCE}"
+    line = instance_role._info(text, account=ACCOUNT)
+    assert line == ("arn:aws:iam::<account>:role/Wayakit-EC2-Secrets-Role used by arn:aws:iam::<account>:user/x "
+                    "on i-<instance> and x<instance-id>")
+    act = instance_role._act(text, dry_run=True, account=ACCOUNT)
+    assert act == "[dry-run] would " + line
+    out = capsys.readouterr().out
+    assert "123456789012" not in out and ACCOUNT not in out
+    assert INSTANCE not in out and OTHER_INSTANCE not in out
+
+
 def assume_record(session, *, by="ec2.amazonaws.com", event="AssumeRole", eid=None):
     return {"eventID": eid or f"a-{session}-{by}", "eventName": event, "eventSource": "sts.amazonaws.com",
             "userIdentity": {"type": "AWSService", "invokedBy": by},

@@ -5,7 +5,10 @@ What it leaves configured:
   `project=price-intelligence`) with one inline policy, `price-intelligence-instance-access`:
   - `secretsmanager:GetSecretValue` only on `prod/wayakit-app` (ARN pattern
     `prod/wayakit-app-??????`: the 6 characters Secrets Manager appends, nothing more);
-  - S3: `ListBucket` on the PI bucket and `Get/Put/DeleteObject` on its objects;
+  - S3: `ListBucket` on the PI bucket, `Get/Put/DeleteObject` on the data prefixes only
+    (`data/`, `models/`, `state/`, `logs/`) and only `GetObject` on `releases/` (releases and the
+    `releases/current` pointer are written by the deploy role alone, so a compromised or buggy
+    run cannot replace the code the next boot installs);
   - `cloudwatch:PutMetricData` only in the `PriceIntelligence` namespace (the action has no
     resource-level permissions, so its Resource must be `*`; the namespace condition limits it);
   - `sns:Publish` only on the `price-intelligence-alerts` topic (its key is the AWS-managed
@@ -39,7 +42,6 @@ Usage (from the repo root):
 import datetime as dt
 import json
 import re
-import sys
 import urllib.parse
 from collections import Counter
 
@@ -57,6 +59,8 @@ APPLICATION_PROFILES = (config.DEEPSEEK_PROFILE, config.HAIKU_PROFILE)
 # States in which an instance still exists (terminated ones keep their Name tag for a while).
 LIVE_STATES = ("pending", "running", "stopping", "stopped")
 _INSTANCE_ID = re.compile(r"i-[0-9a-f]{8,17}")
+# Prefixes the instance reads and writes (in config order); `releases/` is read-only for it.
+DATA_PREFIXES = tuple(p for p in config.BUCKET_PREFIXES if p != config.RELEASES_PREFIX)
 
 
 # --- Pure builders -----------------------------------------------------------------------------
@@ -131,7 +135,13 @@ def instance_policy(account, profile_arns, haiku_model_arns):
                 "Sid": "ReadWritePiObjects",
                 "Effect": "Allow",
                 "Action": ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
-                "Resource": f"{bucket}/*",
+                "Resource": [f"{bucket}/{prefix}*" for prefix in DATA_PREFIXES],
+            },
+            {
+                "Sid": "ReadPiReleases",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": f"{bucket}/{config.RELEASES_PREFIX}*",
             },
             {
                 "Sid": "PutPiMetrics",
@@ -178,15 +188,22 @@ def redact_instance_ids(text):
     return _INSTANCE_ID_IN_TEXT.sub("i-<instance>", str(text))
 
 
+def _redact(text, account):
+    """Known account and instance IDs first, then the catch-all for any other 12-digit number
+    or instance ID (e.g. another account in a CloudTrail record of the audit)."""
+    return _aws.mask_ids(_aws.redact_account(redact_instance_ids(text), account))
+
+
 def _act(action, *, dry_run, account):
     """Announce an action: `[dry-run] would <action>`, or `-> <action>` just before doing it.
     The account ID and instance IDs are redacted."""
-    action = redact_instance_ids(action)
+    action = _redact(action, account)
     return _aws.report(action if dry_run else f"-> {action}", dry_run=dry_run, account=account)
 
 
 def _info(message, *, account):
-    return _aws.report(redact_instance_ids(message), account=account)
+    """Print one line (also the audit's output helper), redacted like `_act`."""
+    return _aws.report(_redact(message, account), account=account)
 
 
 def _missing(exc):
@@ -531,7 +548,7 @@ def main(argv=None, session=None):
     try:
         policy = instance_policy(account, profile_arns, read_haiku_model_arns(bedrock, profile_arns))
     except ValueError as exc:
-        raise SystemExit(f"Cannot build the instance policy: {exc}") from None
+        raise SystemExit(f"Cannot build the instance policy: {_redact(str(exc), account)}") from None
 
     exists = ensure_role(iam, name=config.INSTANCE_ROLE, trust=trust_policy(), description=DESCRIPTION,
                          policy_name=POLICY_NAME, policy=policy, account=account, dry_run=args.dry_run)
@@ -548,4 +565,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _aws.cli_main(main)

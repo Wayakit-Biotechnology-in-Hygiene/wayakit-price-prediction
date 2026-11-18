@@ -6,7 +6,12 @@
 # over SSM, a manual start) skips ExecStart without marking the unit failed, and the instance
 # stays on. A guard error (exit 255) marks the unit failed and the pipeline does not run.
 # run_pipeline.sh shuts the instance down when it ends (its EXIT trap) and sends the SNS failure
-# alert when PI_ALERTS_TOPIC_ARN is set.
+# alert when PI_ALERTS_TOPIC_ARN is set; stopping the unit or the instance mid-run also counts as
+# a failure (exit 143) and sends it.
+#
+# Type=exec, not oneshot: the unit is "active (running)" as soon as run_pipeline.sh starts, so the
+# boot (multi-user.target) finishes instead of staying "starting" for a run of up to 30 h or more.
+# ExecCondition still runs first and still decides whether ExecStart runs.
 #
 # The code path is fixed: /home/ec2-user/wayakit-price-prediction (F4 turns it into a symlink to
 # the active release). The env file holds no secrets: PI_LOG_DIR, PI_ALERTS_TOPIC_ARN,
@@ -20,7 +25,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
+Type=exec
 User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user/wayakit-price-prediction
@@ -28,7 +33,8 @@ EnvironmentFile=/etc/price-intelligence.env
 ExecCondition=/usr/bin/python3 /home/ec2-user/wayakit-price-prediction/infra/instance/pi_boot_guard.py
 # One run, no arguments (no stages since 2026-11-18): run_pipeline.sh exits 1 on any argument.
 ExecStart=/bin/bash /home/ec2-user/wayakit-price-prediction/run_pipeline.sh
-# A run can take more than 30 h (scraping alone has a 30 h timeout): no start timeout.
+# With Type=exec the start timeout only covers the boot guard and the exec; kept infinite so a
+# slow boot never kills the run. The run itself has no time limit (scraping has its own 30 h).
 TimeoutStartSec=infinity
 # Stopping the unit by hand (systemctl stop) kills the whole run, Chrome included.
 KillMode=control-group

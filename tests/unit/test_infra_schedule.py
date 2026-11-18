@@ -49,6 +49,10 @@ DESCRIBE_FILTERS = [
     {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
 ]
 WHEN = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+# StartDates relative to the real clock, for flows through `main` (which cannot inject `now`):
+# EventBridge Scheduler rejects a StartDate more than ~5 minutes in the past on UpdateSchedule.
+PAST = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc)
 
 # Every operation the script may call. Read-only ones are the only ones allowed in dry-run.
 READ_OPS = {"GetCallerIdentity", "DescribeInstances", "GetRole", "GetScheduleGroup",
@@ -333,15 +337,48 @@ def test_schedule_changes_detects_real_differences(mutate, field):
 
 
 def test_disabled_copy_keeps_everything_but_the_state():
+    """With a StartDate still in the future (`now` injected before it) everything is kept."""
     current = old_schedule(RETIRED[0], StartDate=WHEN, Description="old",
                            KmsKeyArn="arn:aws:kms:eu-north-1:000000000000:key/fake",
                            EndDate=None)
     before = copy.deepcopy(current)
-    out = schedule.disabled_copy(current)
+    out = schedule.disabled_copy(current, now=WHEN - dt.timedelta(days=1))
     assert out == expected_disable(RETIRED[0], StartDate=WHEN, Description="old",
                                    KmsKeyArn="arn:aws:kms:eu-north-1:000000000000:key/fake")
     assert "EndDate" not in out  # None values are not sent
     assert current == before  # input not mutated
+
+
+@pytest.mark.parametrize("start, now, kept", [
+    (WHEN, WHEN + dt.timedelta(days=1), False),               # past: dropped
+    (WHEN, WHEN, False),                                       # at `now`: dropped
+    (WHEN, WHEN - dt.timedelta(seconds=1), True),              # future: kept
+    (WHEN.replace(tzinfo=None), WHEN + dt.timedelta(hours=1), False),  # naive = UTC
+    (WHEN.replace(tzinfo=None), WHEN - dt.timedelta(hours=1), True),
+    ("2026-01-01T00:00:00Z", "2026-06-01T00:00:00+00:00", False),     # ISO text
+    ("2026-01-01T00:00:00+00:00", "2025-12-31T23:59:59Z", True),
+    # Same instant in another time zone: 2026-01-01 01:00+01:00 == WHEN.
+    (dt.datetime(2026, 1, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=1))), WHEN, False),
+    ("not a date", WHEN, True),                                # unparsable: kept as it was
+])
+def test_disabled_copy_drops_only_a_start_date_already_past(start, now, kept):
+    current = old_schedule(RETIRED[0], StartDate=start, Description="old")
+    out = schedule.disabled_copy(current, now=now)
+    expected = expected_disable(RETIRED[0], StartDate=start, Description="old")
+    if not kept:
+        expected.pop("StartDate")
+    assert out == expected
+    assert current["StartDate"] == start  # input not mutated
+    assert schedule.disabled_copy(out, now=now) == out  # idempotent
+
+
+def test_disabled_copy_default_now_is_the_current_time():
+    assert "StartDate" not in schedule.disabled_copy(old_schedule(RETIRED[0], StartDate=PAST))
+    assert schedule.disabled_copy(old_schedule(RETIRED[0], StartDate=FUTURE))["StartDate"] == FUTURE
+
+
+def test_disabled_copy_without_start_date_sends_none():
+    assert "StartDate" not in schedule.disabled_copy(old_schedule(RETIRED[0]), now=WHEN)
 
 
 def test_redact_and_instance_ids():
@@ -631,7 +668,8 @@ def test_untagged_group_in_dry_run_is_not_tagged(capsys):
 
 
 def test_retired_schedules_keep_every_field_when_disabled(capsys):
-    extra = {"StartDate": WHEN, "Description": "old weekly start",
+    # FUTURE, not a past date: a StartDate already past is dropped (next test).
+    extra = {"StartDate": FUTURE, "Description": "old weekly start",
              "KmsKeyArn": "arn:aws:kms:eu-north-1:000000000000:key/fake"}
     s = StubbedSession()
     prelude(s)
@@ -644,6 +682,42 @@ def test_retired_schedules_keep_every_field_when_disabled(capsys):
     summary, _ = run(s, [], capsys)
     assert summary["retired"] == {RETIRED[0]: "disable", RETIRED[1]: "already-disabled"}
     assert "DeleteSchedule" not in s.op_names()
+
+
+def test_retired_schedule_with_a_past_start_date_is_disabled_without_it(capsys):
+    """F3 review: UpdateSchedule rejects a StartDate in the past, so it is not resent; every
+    other field is."""
+    extra = {"StartDate": PAST, "Description": "old weekly start"}
+    s = StubbedSession()
+    prelude(s)
+    group_exists(s)
+    get_monthly(s, as_aws_returns(expected_monthly("DISABLED")))
+    get_retired(s, RETIRED[0], old_schedule(RETIRED[0], **extra))
+    request = expected_disable(RETIRED[0], **extra)
+    request.pop("StartDate")
+    s.sch.add_response("update_schedule", {"ScheduleArn": "arn:x"}, request)
+    get_retired(s, RETIRED[1], old_schedule(RETIRED[1], state="DISABLED", **extra))
+    summary, _ = run(s, [], capsys)
+    assert summary["retired"] == {RETIRED[0]: "disable", RETIRED[1]: "already-disabled"}
+
+
+def test_retire_passes_now_to_disabled_copy():
+    """`retire(..., now=...)` uses the injected time: a StartDate after it is resent."""
+    class Sch:
+        def __init__(self):
+            self.updates = []
+
+        def get_schedule(self, **_):
+            return old_schedule(RETIRED[0], StartDate=WHEN)
+
+        def update_schedule(self, **kw):
+            self.updates.append(kw)
+
+    args = schedule.parse_args([])
+    for now, kept in ((WHEN - dt.timedelta(days=1), True), (WHEN + dt.timedelta(days=1), False)):
+        sch = Sch()
+        assert schedule.retire(sch, RETIRED[0], args, ACCOUNT, now=now) == "disable"
+        assert [("StartDate" in u) for u in sch.updates] == [kept]
 
 
 def test_delete_retired_deletes_them_whatever_their_state(capsys):
@@ -803,11 +877,12 @@ class FakeAws:
     """Stateful fake of STS, EC2, IAM and EventBridge Scheduler. Every request is validated
     against the botocore model; reads return what AWS returns (see `as_aws_returns`)."""
 
-    def __init__(self, retired_state="ENABLED"):
+    def __init__(self, retired_state="ENABLED", **retired_extra):
         self.model = {n: botocore.session.get_session().get_service_model(n) for n in SERVICES}
         self.calls = []
         self.groups = {}
-        self.schedules = {("default", n): old_schedule(n, state=retired_state) for n in RETIRED}
+        self.schedules = {("default", n): old_schedule(n, state=retired_state, **retired_extra)
+                          for n in RETIRED}
 
     def client(self, service, **kwargs):
         assert kwargs == {"region_name": "eu-north-1"}
@@ -868,9 +943,18 @@ class FakeAws:
         self.schedules[key] = as_aws_returns(kw)
         return {"ScheduleArn": "arn:x"}
 
+    @staticmethod
+    def _check_start_date(kw, op):
+        """Like EventBridge Scheduler: a StartDate more than 5 minutes in the past is rejected."""
+        start = kw.get("StartDate")
+        if start is not None and start < dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5):
+            raise ClientError({"Error": {"Code": "ValidationException",
+                                         "Message": "StartDate cannot be earlier than 5 minutes ago"}}, op)
+
     def _scheduler_update_schedule(self, **kw):
         key = (kw.get("GroupName", "default"), kw["Name"])
         assert key in self.schedules
+        self._check_start_date(kw, "UpdateSchedule")
         self.schedules[key] = as_aws_returns(kw)
         return {"ScheduleArn": "arn:x"}
 
@@ -914,6 +998,23 @@ def test_apply_twice_then_enable_then_apply_again(capsys):
 
     out = capsys.readouterr().out
     assert ACCOUNT not in out and INSTANCE not in out
+
+
+@pytest.mark.parametrize("start", [PAST, FUTURE])
+def test_retired_with_a_start_date_apply_twice_second_run_writes_nothing(start, capsys):
+    """The fake rejects a past StartDate like AWS does: the first run disables both retired
+    schedules (a future StartDate is kept, a past one dropped) and the second writes nothing."""
+    aws = FakeAws(StartDate=start)
+    first = schedule.main([], session=aws)
+    assert first["retired"] == {n: "disable" for n in RETIRED}
+    for n in RETIRED:
+        assert aws.schedules[("default", n)]["State"] == "DISABLED"
+        assert aws.schedules[("default", n)].get("StartDate") == (start if start == FUTURE else None)
+    mark = len(aws.calls)
+    second = schedule.main([], session=aws)
+    assert not set(aws.ops(mark)) & WRITE_OPS, aws.ops(mark)
+    assert second["retired"] == {n: "already-disabled" for n in RETIRED}
+    capsys.readouterr()
 
 
 def test_dry_run_on_the_fake_changes_no_state():

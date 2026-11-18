@@ -13,7 +13,9 @@ What it leaves configured, in EventBridge Scheduler (eu-north-1):
   Mafer decides. An existing schedule keeps its current state. `--enable` / `--disable` set it.
 - Retired schedules in the `default` group (`Wayakit-Start-Thursday-Night`,
   `Wayakit-Start-Friday-Night`): DISABLED by default (everything else in them is kept, so
-  re-enabling them in the console is the rollback); `--delete-retired` deletes them instead. The
+  re-enabling them in the console is the rollback; only a StartDate already in the past is
+  dropped, because UpdateSchedule rejects it and it no longer has any effect);
+  `--delete-retired` deletes them instead. The
   old role `Wayakit-EventBridge-Role` is not touched.
 
 WARNING: today the retired schedules are what start the production runs. Without `--enable`,
@@ -37,9 +39,9 @@ Usage (from the repo root; profile `wayakit-vdc`, or `AWS_PROFILE`):
     python -m infra.schedule --disable             # pause it without deleting it
     python -m infra.schedule --delete-retired      # delete the two old schedules instead
 """
+import datetime as dt
 import json
 import re
-import sys
 
 from infra import _aws, config
 
@@ -149,11 +151,30 @@ def retired_action(current, *, delete=False):
     return "already-disabled" if current.get("State") == "DISABLED" else "disable"
 
 
-def disabled_copy(current):
+def _as_utc(value):
+    """`value` (datetime or ISO 8601 text) as an aware UTC datetime; None if it is neither."""
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, dt.datetime):
+        return None
+    return value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None else value
+
+
+def disabled_copy(current, now=None):
     """UpdateSchedule kwargs that keep everything of `current` (a GetSchedule response) except
-    the state, which becomes DISABLED. UpdateSchedule resets omitted fields, so all are resent."""
+    the state, which becomes DISABLED. UpdateSchedule resets omitted fields, so all are resent,
+    except a `StartDate` at or before `now` (default: the current UTC time): EventBridge
+    Scheduler rejects a StartDate more than ~5 minutes in the past, and on a recurring schedule
+    a start date that has passed has no effect. A future (or unparsable) StartDate is kept."""
     kwargs = {k: current[k] for k in UPDATE_FIELDS if current.get(k) is not None}
     kwargs["State"] = "DISABLED"
+    start = _as_utc(kwargs.get("StartDate"))
+    now = _as_utc(now) if now is not None else dt.datetime.now(dt.timezone.utc)
+    if start is not None and now is not None and start <= now:
+        del kwargs["StartDate"]
     return kwargs
 
 
@@ -315,8 +336,9 @@ def ensure_schedule(sch, account, instance_id, args):
     return "updated", state
 
 
-def retire(sch, name, args, account):
-    """Disable (default) or delete one retired schedule in the `default` group."""
+def retire(sch, name, args, account, now=None):
+    """Disable (default) or delete one retired schedule in the `default` group. `now` is passed
+    to `disabled_copy` (tests inject it)."""
     current = _get_or_none(sch.get_schedule, Name=name, GroupName=config.RETIRED_SCHEDULE_GROUP)
     action = retired_action(current, delete=args.delete_retired)
     where = f"{config.RETIRED_SCHEDULE_GROUP}/{name}"
@@ -327,7 +349,7 @@ def retire(sch, name, args, account):
     elif action == "disable":
         _aws.report(f"disable retired schedule {where}", dry_run=args.dry_run, account=account)
         if not args.dry_run:
-            sch.update_schedule(**disabled_copy(current))
+            sch.update_schedule(**disabled_copy(current, now))
     else:
         _aws.report(f"delete retired schedule {where}", dry_run=args.dry_run, account=account)
         if not args.dry_run:
@@ -383,20 +405,9 @@ def main(argv=None, session=None):
 
 
 def _cli():
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        # Only the error code and operation: AWS messages can carry ARNs with the account ID.
-        code = _aws.error_code(exc)
-        if code is None:
-            raise
-        op = getattr(exc, "operation_name", "AWS call")
-        print(f"AWS error {code} in {op}. Nothing after this step was changed.", file=sys.stderr)
-        sys.exit(1)
-    return 0
+    """Kept for callers of the old name: same as `_aws.cli_main(main)` (always SystemExit)."""
+    _aws.cli_main(main)
 
 
 if __name__ == "__main__":
-    sys.exit(_cli())
+    _aws.cli_main(main)

@@ -912,7 +912,27 @@ def test_finding_line_summary_and_redact():
     assert check_pi.summary(fs) == "2 OK, 1 WARN, 1 FAIL"
     text = f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/{IID}"
     assert check_pi.redact(text, ACCOUNT, IID) == f"arn:aws:ec2:{REGION}:<account>:instance/<instance-id>"
-    assert check_pi.redact(text) == text
+    # F3 review: without arguments the catch-all still masks any account or instance ID (it used
+    # to return the text unchanged).
+    assert check_pi.redact(text) == f"arn:aws:ec2:{REGION}:<account>:instance/<instance-id>"
+    assert check_pi.redact("no ids here: 12345678901 1234567890123 i-abc") == \
+        "no ids here: 12345678901 1234567890123 i-abc"
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Another account (e.g. in a trust policy or CloudTrail) after the known one is replaced.
+    (f"arn:aws:iam::{ACCOUNT}:role/a arn:aws:iam::123456789012:role/b",
+     "arn:aws:iam::<account>:role/a arn:aws:iam::<account>:role/b"),
+    # Another instance after the known one, also glued to other characters.
+    (f"{IID} {IID2} x{IID2}y", "<instance-id> <instance-id> x<instance-id>y"),
+    ("i-0abc1234.eu-north-1.compute.internal", "<instance-id>.eu-north-1.compute.internal"),
+    # Not IDs: 11 or 13 digits, 12 digits glued to letters, `i-` with fewer than 8 hex.
+    ("11111111111 2222222222222 a333333333333 i-0abc123", "11111111111 2222222222222 a333333333333 i-0abc123"),
+])
+def test_redact_catch_all_masks_leftover_accounts_and_instance_ids(text, expected):
+    out = check_pi.redact(text, ACCOUNT, IID)
+    assert out == expected
+    assert check_pi.redact(out, ACCOUNT, IID) == out
 
 
 # --- Policy helpers --------------------------------------------------------------------------
@@ -1100,9 +1120,55 @@ INSTANCE_ARN = config.instance_arn(ACCOUNT, IID)
     pytest.param(_add(_instance_policy(), {"Effect": "Deny", "Action": "sns:Publish",
                                            "Resource": config.topic_arn(ACCOUNT)}),
                  {f"{I} required permissions"}, id="publish-denied"),
+    # F3 review (Important 2): the instance only reads releases/; only the deploy role writes them.
+    pytest.param(_replace_resource(_instance_policy(), "ReadWritePiObjects", f"{BUCKET_ARN}/*"),
+                 {f"{I} least privilege"}, id="pre-review-whole-bucket-read-write"),
+    pytest.param(_add(_instance_policy(), {"Effect": "Allow", "Action": "s3:PutObject",
+                                           "Resource": f"{BUCKET_ARN}/{config.RELEASES_PREFIX}*"}),
+                 {f"{I} least privilege"}, id="put-on-releases"),
+    pytest.param(_add(_instance_policy(), {"Effect": "Allow", "Action": "s3:PutObject",
+                                           "Resource": f"{BUCKET_ARN}/{config.RELEASES_CURRENT_KEY}"}),
+                 {f"{I} least privilege"}, id="put-on-current-pointer-only"),
+    pytest.param(_add(_instance_policy(), {"Effect": "Allow", "Action": "s3:DeleteObject",
+                                           "Resource": f"{BUCKET_ARN}/{config.RELEASES_PREFIX}*.tar.gz"}),
+                 {f"{I} least privilege"}, id="delete-release-tarballs"),
+    pytest.param(_replace_resource(_instance_policy(), "ReadPiReleases",
+                                   f"arn:aws:s3:::price-intelligence-*/{config.RELEASES_PREFIX}*"),
+                 {f"{I} least privilege"}, id="releases-on-lookalike-buckets"),
+    pytest.param(_replace_resource(_instance_policy(), "ReadPiReleases", f"{BUCKET_ARN}/other/*"),
+                 {f"{I} required permissions"}, id="releases-not-readable"),
+    pytest.param(_replace_resource(_instance_policy(), "ReadWritePiObjects",
+                                   [f"{BUCKET_ARN}/{p}*" for p in ("data/", "models/", "state/")]),
+                 {f"{I} required permissions"}, id="logs-prefix-not-writable"),
 ])
 def test_instance_role_least_privilege_fails(policy, expected_fails):
     assert set(fails(eval_instance(instance_state(policy)))) == expected_fails
+
+
+def test_instance_expectation_writes_data_prefixes_and_only_reads_releases():
+    """must_allow: Get/Put/Delete on each data prefix, only Get on releases/; must_deny: Put and
+    Delete on `releases/current` and on a release tarball."""
+    exp = check_pi.instance_role_expectation(ACCOUNT, tuple(PROFILE_ARNS.values()), HAIKU_MODELS)
+    obj = f"{BUCKET_ARN}/"
+    allowed_s3 = {(p.action, p.resource) for p in exp.must_allow if p.resource.startswith(obj)}
+    data = {(a, f"{obj}{prefix}probe") for prefix in ("data/", "models/", "state/", "logs/")
+            for a in ("s3:GetObject", "s3:PutObject", "s3:DeleteObject")}
+    releases = {("s3:GetObject", f"{obj}releases/current"), ("s3:GetObject", f"{obj}releases/probe.tar.gz")}
+    assert allowed_s3 == data | releases
+    denied = {(p.action, p.resource) for p in exp.must_deny}
+    assert {(a, f"{obj}releases/{k}") for a in ("s3:PutObject", "s3:DeleteObject")
+            for k in ("current", "probe.tar.gz")} <= denied
+    assert check_pi.DATA_PREFIXES == ("data/", "models/", "state/", "logs/")
+
+
+def test_write_on_releases_names_each_denied_probe():
+    policy = _add(_instance_policy(), {"Effect": "Allow", "Action": ["s3:PutObject", "s3:DeleteObject"],
+                                       "Resource": f"{BUCKET_ARN}/*"})
+    [line] = [f.line() for f in eval_instance(instance_state(policy)) if f.status == check_pi.FAIL]
+    assert line.startswith(f"[FAIL] {I} least privilege: also allows ")
+    for action in ("s3:PutObject", "s3:DeleteObject"):
+        for key in ("releases/current", "releases/probe.tar.gz"):
+            assert f"{action} on {BUCKET_ARN}/{key}" in line
 
 
 def test_bucket_name_prefix_wildcard_is_not_least_privilege():

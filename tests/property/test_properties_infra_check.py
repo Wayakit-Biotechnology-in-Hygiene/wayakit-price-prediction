@@ -7,7 +7,9 @@
   one-element list; adding an Allow never removes a grant; adding a matching Deny without a
   condition always removes it.
 - `broad_grants` flags every Allow with a wildcard action and never a Deny.
-- `redact` never leaves the account or the instance ID; `summary` and `has_failures` agree.
+- `redact` never leaves the account or the instance ID; with or without them it leaves no other
+  12-digit number or instance-ID-shaped token (the catch-all) and is idempotent; `summary` and
+  `has_failures` agree.
 - Check and apply agree for any account and instance: what `instance_role`, `scheduler_role`,
   `deploy_role` and `schedule` build passes with no FAIL, and any other cron or time zone fails.
 - Secret pattern (`prod/wayakit-app-??????`): it matches the secret's ARN for exactly the
@@ -21,6 +23,7 @@ No AWS: only pure functions. Accounts and instance IDs are generated, never real
 from __future__ import annotations
 
 import copy
+import re
 
 import pytest
 from hypothesis import assume, example, given
@@ -169,6 +172,29 @@ def test_redact_never_leaves_the_account_or_instance(text, account, instance_id)
     text = f"{text}{account}{text}{instance_id}{text}"
     out = check_pi.redact(text, account, instance_id)
     assert account not in out and instance_id not in out
+
+
+ANY_ACCOUNT = re.compile(r"\b[0-9]{12}\b")
+ANY_INSTANCE = re.compile(r"i-[0-9a-f]{8,17}")
+
+
+@given(st.text(alphabet="0123456789i-abcdefx <>:/.", max_size=80),
+       st.none() | accounts, st.none() | instances)
+@example("i-123456789012", None, None)
+@example("123456789012i-0abcdef01", None, None)
+@example("000000000000-000000000000 i-0abc1234.i-0abc1235", None, None)
+def test_redact_catch_all_leaves_no_id_and_is_idempotent(text, account, instance_id):
+    out = check_pi.redact(text, account, instance_id)
+    assert not ANY_ACCOUNT.search(out), out
+    assert not ANY_INSTANCE.search(out), out
+    assert check_pi.redact(out, account, instance_id) == out
+
+
+@given(st.text(alphabet="0123456789abcdefxyz .:/", max_size=80))
+def test_redact_without_ids_is_the_identity(text):
+    """Text with no 12-digit run and no `i-` is printed exactly as it is."""
+    assume(not re.search(r"[0-9]{12}", text))
+    assert check_pi.redact(text) == text
 
 
 # --- Check and apply agree for any account and instance ----------------------------------------

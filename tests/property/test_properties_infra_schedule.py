@@ -5,8 +5,9 @@
   `MaximumEventAgeInSeconds`, read-only fields, a missing `ActionAfterCompletion`).
 - Sensitivity: any change to the cron, timezone, state, flexible window, role, target ARN,
   instance or retry attempts is reported, under the right field.
-- `disabled_copy`: State always DISABLED, every other update field kept, only update fields, no
-  None values, idempotent, input not mutated.
+- `disabled_copy`: State always DISABLED, every other update field kept except a StartDate at
+  or before `now` (F3 review: UpdateSchedule rejects a past one), only update fields, no None
+  values, idempotent, input not mutated.
 - `resolve_state`, `retired_action`: equal to an obvious reference over the whole domain.
 - `desired_schedule` invariants (window OFF, retries 0, one instance, PI role, start-instances
   target) and `redact` never leaving the account or any instance ID (tag-resolved or previous,
@@ -156,10 +157,17 @@ get_schedule_responses = st.fixed_dictionaries(
               "ResponseMetadata": st.just({"HTTPStatusCode": 200})})
 
 
-@given(get_schedule_responses)
-def test_disabled_copy_only_flips_the_state(current):
+@given(get_schedule_responses, dates)
+@example({"Name": config.RETIRED_SCHEDULES[0], "GroupName": "default", "ScheduleExpression": "rate(7 days)",
+          "FlexibleTimeWindow": {"Mode": "OFF"},
+          "Target": {"Arn": config.SCHEDULE_TARGET_ARN, "RoleArn": "arn:aws:iam::000000000000:role/r"},
+          "StartDate": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)},
+         dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc))  # StartDate == now: dropped
+def test_disabled_copy_only_flips_the_state(current, now):
+    """Everything but the state is kept; the only other change is a StartDate at or before `now`
+    being left out."""
     before = copy.deepcopy(current)
-    out = schedule.disabled_copy(current)
+    out = schedule.disabled_copy(current, now=now)
     assert current == before
     assert out["State"] == "DISABLED"
     assert set(out) <= set(schedule.UPDATE_FIELDS)
@@ -169,14 +177,16 @@ def test_disabled_copy_only_flips_the_state(current):
             continue
         if current.get(key) is None:
             assert key not in out
+        elif key == "StartDate" and current[key] <= now:
+            assert key not in out
         else:
             assert out[key] == current[key]
 
 
-@given(get_schedule_responses)
-def test_disabled_copy_is_idempotent(current):
-    once = schedule.disabled_copy(current)
-    assert schedule.disabled_copy(once) == once
+@given(get_schedule_responses, st.none() | dates)
+def test_disabled_copy_is_idempotent(current, now):
+    once = schedule.disabled_copy(current, now=now)
+    assert schedule.disabled_copy(once, now=now) == once
 
 
 # --- resolve_state, retired_action ---------------------------------------------------------------

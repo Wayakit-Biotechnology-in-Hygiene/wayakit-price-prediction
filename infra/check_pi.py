@@ -28,7 +28,9 @@ What it checks:
   one whose name starts with PI's, other topic, other model, other instance) must not be, no
   wildcard actions, `Resource: "*"` only for `cloudwatch:PutMetricData` (it has no
   resource-level permissions; it must carry the `cloudwatch:namespace` condition),
-  `ec2:CreateTags` limited to the `pi-mode` tag key. Any action outside the spec is a FAIL. The
+  `ec2:CreateTags` limited to the `pi-mode` tag key, `s3:PutObject`/`s3:DeleteObject` on
+  `releases/` (including `releases/current`) denied to the instance role (it only reads
+  releases). Any action outside the spec is a FAIL. The
   old roles must still exist (rollback).
 - GitHub OIDC provider and the deploy role's trust (only `refs/heads/main`, StringEquals on
   `sub` and `aud`).
@@ -55,7 +57,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 import urllib.parse
 from dataclasses import dataclass, field
 
@@ -73,6 +74,8 @@ ACTIVE_INSTANCE_STATES = ("pending", "running", "stopping", "stopped")
 OTHER_BUCKET = "other-bucket"
 OTHER_INSTANCE_ID = "i-00000000000000000"
 OTHER_MODEL_ID = "amazon.nova-pro-v1:0"
+# Bucket prefixes the instance reads and writes; `releases/` is read-only for it.
+DATA_PREFIXES = tuple(p for p in config.BUCKET_PREFIXES if p != config.RELEASES_PREFIX)
 SECRET_SUFFIX = "AbCdEf"  # config.SECRET_ARN_SUFFIX_LENGTH characters, like the ones Secrets Manager appends
 
 
@@ -119,9 +122,13 @@ def summary(findings):
 
 
 def redact(text, account=None, instance_id=None):
-    """Remove the account ID and the instance ID from a line before it is printed."""
+    """Remove the account ID and the instance ID from a line before it is printed. After those
+    specific replacements, any other 12-digit number becomes `<account>` and any other
+    instance-ID-shaped token `<instance-id>` (`_aws.mask_ids`), e.g. a foreign account in a trust
+    policy or an ID from an error message."""
     text = _aws.redact_account(text, account)
-    return text.replace(instance_id, "<instance-id>") if instance_id else text
+    text = text.replace(instance_id, "<instance-id>") if instance_id else text
+    return _aws.mask_ids(text)
 
 
 # --- Policy helpers (pure) ---------------------------------------------------------------------
@@ -294,11 +301,13 @@ def instance_role_expectation(account, app_profile_arns=(), haiku_model_arns=())
     the Haiku model in REGION is probed."""
     secret = secret_arn(account)
     haiku_models = tuple(haiku_model_arns) or (config.foundation_model_arn(config.HAIKU_MODEL_ID),)
+    release_keys = (config.RELEASES_CURRENT_KEY, f"{config.RELEASES_PREFIX}probe.tar.gz")
     must_allow = [
         Probe("secretsmanager:GetSecretValue", secret),
         Probe("s3:ListBucket", config.bucket_arn(account)),
         *[Probe(a, _object_arn(account, f"{prefix}probe"))
-          for prefix in config.BUCKET_PREFIXES for a in ("s3:GetObject", "s3:PutObject", "s3:DeleteObject")],
+          for prefix in DATA_PREFIXES for a in ("s3:GetObject", "s3:PutObject", "s3:DeleteObject")],
+        *[Probe("s3:GetObject", _object_arn(account, key)) for key in release_keys],
         Probe("cloudwatch:PutMetricData", "*"),
         Probe("sns:Publish", config.topic_arn(account)),
         Probe("bedrock:InvokeModel", config.foundation_model_arn(config.DEEPSEEK_MODEL_ID)),
@@ -312,6 +321,9 @@ def instance_role_expectation(account, app_profile_arns=(), haiku_model_arns=())
           for p in (Probe("s3:ListBucket", f"arn:aws:s3:::{other}"),
                     *[Probe(a, _object_arn(account, f"{prefix}probe", other))
                       for prefix in config.BUCKET_PREFIXES for a in ("s3:GetObject", "s3:PutObject")])],
+        # Releases are written only by the deploy role (F4): the instance only reads them.
+        *[Probe(a, _object_arn(account, key)) for key in release_keys
+          for a in ("s3:PutObject", "s3:DeleteObject")],
         Probe("sns:Publish", config.topic_arn(account, "other-topic")),
         Probe("bedrock:InvokeModel", config.foundation_model_arn(OTHER_MODEL_ID)),
         Probe("bedrock:InvokeModel", config.inference_profile_arn(account, f"eu.{OTHER_MODEL_ID}")),
@@ -1001,4 +1013,4 @@ def main(argv=None, session=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _aws.cli_main(main)
