@@ -40,6 +40,10 @@ from pathlib import Path
 import pytest
 from hypothesis import HealthCheck, settings
 
+# Ignore a PI_LOG_DIR exported in the shell: tests never write to a real log folder
+# (a test that needs it sets it with monkeypatch).
+os.environ.pop("PI_LOG_DIR", None)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 F1_DATA = REPO_ROOT / "data" / "f1_before_2026-11-15"
 
