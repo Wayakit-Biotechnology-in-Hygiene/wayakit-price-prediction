@@ -69,6 +69,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 # Lock: tests must not reach AWS even if someone calls boto3 by mistake.
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+# Lock: tests never write to a developer's real log folder (PI_LOG_DIR, see log_config.py on f2-hardening).
+unset PI_LOG_DIR
 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true
 
 TMP_OUT="$(mktemp -d)"
