@@ -338,7 +338,7 @@ scripts/verify.sh full    # + e2e + differential against origin/server-improveme
 ### F2 is not on the instance yet
 
 - The F2 relevance AI uses Bedrock with the instance role, which **has no `bedrock:InvokeModel` until F3**: with the F2 code, stage 2 stops at the Bedrock preflight (exit 1, nothing uploaded). Do not deploy F2 to the instance before F3 creates that permission.
-- While the instance runs the pre-F2 `run_pipeline.sh`, its stage 2 `git pull` could bring F2 in by itself once it is merged into `server-improvement`, rewriting `run_pipeline.sh` while bash is running it. Until F3: either do not merge F2 into `server-improvement`, or pause the schedules and comment out the crontab (decision pending, `decisions.md`, Pending, question 16).
+- While the instance runs the pre-F2 `run_pipeline.sh`, its stage 2 `git pull` could bring F2 in by itself once it is merged into `server-improvement`, rewriting `run_pipeline.sh` while bash is running it. Decided 2026-11-18: F2 is merged into `server-improvement` only after F3 creates the permission; the schedules and the crontab are not paused.
 
 ### Planned (F4): pull-on-boot
 
