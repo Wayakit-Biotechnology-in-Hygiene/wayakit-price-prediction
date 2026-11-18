@@ -3,7 +3,7 @@
 Practical guide to operating Price Intelligence (PI). Each section solves one concrete task.
 To know *what* exists in AWS, see [resources.md](resources.md). To know *why* it is the way it is, see [decisions.md](decisions.md). The improvement plan is in [plan.md](plan.md).
 
-Status as of 2026-11-18: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory), plus the **F2 changes** (marked "since F2"): they are in the code of this branch but **not yet on the instance**, which still runs the pre-F2 code (see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)). The **F3** `infra/` scripts and the monthly run model (one run, no stages) are written but **not applied**: [Infrastructure as code (F3)](#infrastructure-as-code-f3) is the procedure. Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). Nothing has been created or changed in AWS for the plan. At the end of the project the production branch is **`main`** (Mafer, 2026-11-18); until then the instance runs `server-improvement`.
+Status as of 2026-11-18: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory), plus the **F2 changes** (marked "since F2"): they are in the code of this branch but **not yet on the instance**, which still runs the pre-F2 code (see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)). The **F3** `infra/` scripts are written; steps 1–6 of the [order](#order) were applied on 2026-11-18 (new resources only: bucket, alerts, Bedrock profiles, the three PI roles and the GitHub OIDC provider), the cutover (steps 7–13) and the monthly run model (one run, no stages) are **not applied**: [Infrastructure as code (F3)](#infrastructure-as-code-f3) is the procedure. Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). Production (instance, schedules, old roles) has not been changed. At the end of the project the production branch is **`main`** (Mafer, 2026-11-18); until then the instance runs `server-improvement`.
 
 AWS commands are run from the repo root, on a Mac with AWS CLI v2. Pipeline commands are run inside the EC2 instance.
 
@@ -119,7 +119,7 @@ Everything lives **only on the instance's disk** (volume without snapshots). Pat
 
 Left over from the pre-F3 code (nothing reads them any more; harmless, they can be deleted): `run_mode.txt` and `last_full_run.txt` (in `<repo>/logs` on the instance today), `ml_model/wayakit_new_products_temp.csv` and `scraper/analysis-odoo_partial.csv` (partial mode).
 
-There are no CloudWatch Logs groups or S3 bucket for PI. The "before" snapshot (CSVs from the Nov 13–15, 2026 run) was copied on 2026-11-17 to `data/f1_before_2026-11-15/` in the local repo, ignored by git; the `.joblib` models remain in the disk snapshot. F3 (script ready, not applied): bucket `price-intelligence-<account>` with `data/`, `models/`, `state/`, `logs/` and `releases/` (`infra/bucket.py`); nothing writes to it yet.
+There are no CloudWatch Logs groups or S3 bucket for PI. The "before" snapshot (CSVs from the Nov 13–15, 2026 run) was copied on 2026-11-17 to `data/f1_before_2026-11-15/` in the local repo, ignored by git; the `.joblib` models remain in the disk snapshot. F3 (applied 2026-11-18): bucket `price-intelligence-<account>` with `data/`, `models/`, `state/`, `logs/` and `releases/` (`infra/bucket.py`); nothing writes to it yet.
 
 ### Knowing whether the last run worked
 

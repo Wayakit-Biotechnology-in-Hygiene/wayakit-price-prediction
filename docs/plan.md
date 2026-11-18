@@ -149,7 +149,7 @@ Original plan:
 
 ### F3 · `infra/` (3 days) — each script is run with Mafer's OK
 
-**Status (2026-11-18): scripts written and tested on branch `f3-infra` (no AWS call made), not applied.** Decisions: production branch `main` at the end (deploy role trust); new instance role instead of editing the old one, after a read-only CloudTrail audit; failure alerts by email through SNS (address passed at run time); **one run, no stages** (Mafer), started by the monthly schedule and guarded on boot; schedule created disabled. Next: Mafer approves each script (`--dry-run` first, then apply), then F2 is merged and deployed.
+**Status (2026-11-18): scripts written and tested on branch `f3-infra`; runbook steps 1–6 applied with Mafer's OK (bucket, alerts, Bedrock profiles, instance, scheduler and deploy roles; `check_pi` OK for them). Steps 7–13 (audit, schedule, instance switch, deploy, enable) are pending.** Decisions: production branch `main` at the end (deploy role trust); new instance role instead of editing the old one, after a read-only CloudTrail audit; failure alerts by email through SNS (address passed at run time); **one run, no stages** (Mafer), started by the monthly schedule and guarded on boot; schedule created disabled. Next: Mafer approves each script (`--dry-run` first, then apply), then F2 is merged and deployed.
 
 | Script | What it sets up |
 |---|---|

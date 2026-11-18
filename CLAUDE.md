@@ -10,7 +10,7 @@ Documentation: [docs/runbook.md](docs/runbook.md) (how to operate it and known i
 
 ## Status
 
-Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/plan.md). What is still to be decided: [docs/decisions.md#pending](docs/decisions.md#pending). Nothing new has been created in AWS for PI yet; anything marked "Planned (F#)" does not exist.
+Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/plan.md). What is still to be decided: [docs/decisions.md#pending](docs/decisions.md#pending). In AWS, F3 steps 1–6 were applied on 2026-11-18 with Mafer's OK (bucket, SNS alerts, Bedrock profiles, the instance, scheduler and deploy roles, the GitHub OIDC provider); the schedule, the instance switch and the deploy (steps 8–13) are not. Anything marked "Planned (F#)" does not exist.
 
 ## Rules that are never broken
 
@@ -48,7 +48,7 @@ Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/pl
 - **Inconsistent sizes in Apify:** in `junglee`, `Item Volume`, `Unit Count` and `Size` often do not match; keep the 2-out-of-3-sources rule.
 - **Wayakit products show up in the results** (Amazon and Noon). Today nothing excludes them; the Apify adapters must discard the Wayakit brand and seller.
 
-## `infra/` conventions (F3, branch `f3-infra`; scripts written and tested, **not applied** until Mafer's OK)
+## `infra/` conventions (F3, branch `f3-infra`; steps 1–6 applied 2026-11-18, steps 8–13 still need Mafer's OK)
 
 - One script per resource, with boto3. Each one can be run more than once (if the resource exists, it updates it; it never duplicates it), accepts `--dry-run` and has a docstring in English that says what it leaves configured and how to use it.
 - Shared configuration in `infra/config.py` (profile, region, tag, names, cron). Do not duplicate constants.
