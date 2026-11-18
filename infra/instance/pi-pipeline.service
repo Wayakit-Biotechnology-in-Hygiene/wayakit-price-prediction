@@ -1,0 +1,37 @@
+# Price Intelligence monthly pipeline (F3). Installed and enabled by infra/instance/bootstrap.sh
+# as /etc/systemd/system/pi-pipeline.service; it replaces the ec2-user crontab lines.
+#
+# Runs on every boot, but ExecCondition (pi_boot_guard.py) only lets it through on the scheduled
+# boot (last Thursday of the month, 21:40-23:00 America/Mexico_City). Any other boot (maintenance
+# over SSM, a manual start) skips ExecStart without marking the unit failed, and the instance
+# stays on. A guard error (exit 255) marks the unit failed and the pipeline does not run.
+# run_pipeline.sh shuts the instance down when it ends (its EXIT trap) and sends the SNS failure
+# alert when PI_ALERTS_TOPIC_ARN is set.
+#
+# The code path is fixed: /home/ec2-user/wayakit-price-prediction (F4 turns it into a symlink to
+# the active release). The env file holds no secrets: PI_LOG_DIR, PI_ALERTS_TOPIC_ARN,
+# PI_RELEVANCE_PRIMARY_MODEL and PI_RELEVANCE_FALLBACK_MODEL (written by bootstrap.sh).
+#
+# Check:  systemctl status pi-pipeline.service; journalctl -u pi-pipeline.service -b
+
+[Unit]
+Description=Price Intelligence monthly pipeline (only on the scheduled boot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/wayakit-price-prediction
+EnvironmentFile=/etc/price-intelligence.env
+ExecCondition=/usr/bin/python3 /home/ec2-user/wayakit-price-prediction/infra/instance/pi_boot_guard.py
+# One run, no arguments (no stages since 2026-11-18): run_pipeline.sh exits 1 on any argument.
+ExecStart=/bin/bash /home/ec2-user/wayakit-price-prediction/run_pipeline.sh
+# A run can take more than 30 h (scraping alone has a 30 h timeout): no start timeout.
+TimeoutStartSec=infinity
+# Stopping the unit by hand (systemctl stop) kills the whole run, Chrome included.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

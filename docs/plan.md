@@ -149,6 +149,8 @@ Original plan:
 
 ### F3 · `infra/` (3 days) — each script is run with Mafer's OK
 
+**Status (2026-11-18): scripts written and tested on branch `f3-infra` (no AWS call made), not applied.** Decisions: production branch `main` at the end (deploy role trust); new instance role instead of editing the old one, after a read-only CloudTrail audit; failure alerts by email through SNS (address passed at run time); **one run, no stages** (Mafer), started by the monthly schedule and guarded on boot; schedule created disabled. Next: Mafer approves each script (`--dry-run` first, then apply), then F2 is merged and deployed.
+
 | Script | What it sets up |
 |---|---|
 | `config.py` | Profile, region, tag, names and cron |
@@ -220,7 +222,7 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 ## 4. Open questions (for Mafer)
 
 1. ~~Which branch does the instance run?~~ **Correction (F1):** it runs `server-improvement` (e25e2c9), not `main`. See question 11.
-2. ~~Remove the 2 stages?~~ Mafer wants a monthly run, but **the keyword review is needed**: the sites do not find the product by its generic name (e.g. on SACO you have to search "car cleaner" instead of "car disinfectant"). Pending: choose the design of the review (proposal in section 6).
+2. ~~Remove the 2 stages?~~ Mafer wants a monthly run, but **the keyword review is needed**: the sites do not find the product by its generic name (e.g. on SACO you have to search "car cleaner" instead of "car disinfectant"). Pending: choose the design of the review (proposal in section 6). Since F3 (Mafer, 2026-11-18) the run has no stages, so the review happens outside the run, on the versioned `modifiers_mapping.csv`.
 3. ~~Which day?~~ The last Thursday of each month: `cron(50 21 ? * 5L *)` in EventBridge Scheduler. Time 21:50 in CDMX time (`America/Mexico_City`), confirmed by Mafer on 2026-11-17.
 4. ~~Secret and company?~~ Only PI uses `prod/wayakit-app`. The Odoo database PI uses is KSA only (Mafer, 2026-11-17).
 5. ~~Apify account?~~ VdC's, with a higher-tier plan. Pending: USD cap per run (proposal: USD 20).

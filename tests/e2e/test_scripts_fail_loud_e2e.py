@@ -4,8 +4,9 @@ Each script runs as a subprocess with `cwd` in a temporary copy of the code (`sc
 `ml_model/`, `log_config.py`, as the E2E harness copies it: no `pi_secrets.py`, no `pi_odoo.py`)
 and WITHOUT its input files. Before F2 they logged the error and exited 0, and the pipeline went
 on with stale files. Only scripts that fail before reaching Odoo or AWS are run here: the ML
-stages, the scraping-list builder (it no longer talks to Odoo), `filter_new_products.py` and the
-upload in `--dry-run` (which must not need the secrets code at all).
+stages, the scraping-list builder (it no longer talks to Odoo) and the upload in `--dry-run`
+(which must not need the secrets code at all). `filter_new_products.py` was removed with the
+partial mode (single run, 2026-11-18).
 
 The dry run is also run on the frozen F1 report (skipped only if `data/f1_before_2026-11-15/` is
 missing): one record per report row, nothing written to Odoo, no previous-IDs file.
@@ -28,8 +29,6 @@ NO_INPUT = [
     ("ml_model/1b_preprocess_data.py", "--run_mode", "partial"),
     ("ml_model/2_train_models.py",),
     ("ml_model/3_predicted_prices.py",),
-    ("ml_model/filter_new_products.py", "--input", "ml_model/wayakit_products.csv",
-     "--timestamp", "logs/last_full_run.txt", "--output", "ml_model/wayakit_new_products_temp.csv"),
     ("scraper/odoo_api_connection_products.py", "--input_odoo_products_file", "ml_model/wayakit_products.csv",
      "--output_analysis_file", "scraper/analysis-odoo.csv"),
     ("ml_model/odoo_api_price_suggestion.py", "--dry-run", "--run_mode", "full"),
