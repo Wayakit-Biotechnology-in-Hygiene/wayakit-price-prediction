@@ -24,7 +24,7 @@ flowchart TD
 
 - Each stage is a separate start-up, and when it finishes the instance stops itself (`trap EXIT`, `run_pipeline.sh:52`). They are launched by the `ec2-user` crontab (not in the repo): stage 1 on Friday 04:00 UTC and stage 2 on Saturday 04:00 UTC (Thursday and Friday 22:00 CDMX). Starting the instance at any other time launches nothing.
 - The run is always full: since e25e2c9 partial mode (new products only, in append) is disabled (`run_pipeline.sh:67-68`), although its code is still in the script.
-- All state (CSVs, `.joblib` models, `logs/last_full_run.txt`, logs) lives only on the instance disk. There is a manual snapshot from 2026-11-17 (`pi-f1-antes-inventario`).
+- All state (CSVs, `.joblib` models, logs and state files such as `last_full_run.txt`) lives only on the instance disk. Since F2, logs and state files go to one folder outside the code: `PI_LOG_DIR`, default `<repo>/../logs`. There is a manual snapshot from 2026-11-17 (`pi-f1-antes-inventario`).
 - The instance runs the **`server-improvement`** branch (e25e2c9), one commit ahead of `main`.
 - The last full run (13–15 Nov 2026) failed in scraping (30 h timeout, 53 rows) and still uploaded suggestions to Odoo: today they come almost only from `competitor.product`.
 
@@ -58,7 +58,7 @@ Except what is marked F2 (code only), none of this exists yet; no new resource h
 | `ml_model/` | Odoo reads, preprocessing (`1a`, `1b`), training (`2`), prediction (`3`) and upload (`odoo_api_price_suggestion.py`) |
 | `docs/` | Plan, runbook, AWS inventory, decisions and reliability checklist |
 | `run_pipeline.sh` | 2-stage pipeline that runs on the instance |
-| `log_config.py` | Logging with rotation; writes to `../logs/wayakit_app.log`, outside the repo (`log_config.py:7`) |
+| `log_config.py` | Logging with rotation; writes `wayakit_app.log` to the log folder outside the repo (`PI_LOG_DIR`, default `../logs`) |
 | `pi_secrets.py` | The only reader of the `prod/wayakit-app` secret (`get_secret()`, `get_odoo_credentials()`), since F2 |
 | `pi_odoo.py` | Shared Odoo XML-RPC session (`connect()`, `OdooSession`, `get_single_company()`), since F2 |
 | `requirements.txt` | Dependencies, without pinned versions |

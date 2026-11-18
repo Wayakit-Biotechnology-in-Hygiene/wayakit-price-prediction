@@ -67,7 +67,7 @@ aws sts get-caller-identity --profile wayakit-vdc
 
 ### Stage 1: prepare the search list (`run_pipeline.sh:65-109`)
 
-1. The run is **always full**: since e25e2c9 partial mode is disabled (`IS_FULL_RUN="true"`, `run_pipeline.sh:67-68`). `logs/last_full_run.txt` is still written, but it no longer decides anything.
+1. The run is **always full**: since e25e2c9 partial mode is disabled (`IS_FULL_RUN="true"`, `run_pipeline.sh:67-68`). `last_full_run.txt` (in the [log folder](#files-it-produces)) is still written, but it no longer decides anything.
 2. Activates conda (`wayakit_env`) and runs `ml_model/odoo_api_products.py` → `ml_model/wayakit_products.csv` (`run_pipeline.sh:86`).
 3. `scraper/odoo_api_connection_products.py` generates `scraper/analysis-odoo.csv` from the Odoo products and `scraper/modifiers_mapping.csv`, and writes `run_mode.txt=full` and `last_full_run.txt` (`run_pipeline.sh:90-93`). Since F2 it does not connect to Odoo or read secrets (it only reads the CSV), and a missing or malformed `modifiers_mapping.csv` is an error (exit 1) instead of a warning with empty modifiers.
 4. The partial branch (`ml_model/filter_new_products.py` → `ml_model/wayakit_new_products_temp.csv`, `run_mode.txt=partial`, `run_pipeline.sh:95-100`) is still in the code, but is no longer reached.
@@ -77,7 +77,7 @@ In stage 1, every step has `|| exit 1`: if something fails, the stage ends with 
 
 ### Stage 2: scraping, training and upload to Odoo (`run_pipeline.sh:114-221`)
 
-1. Reads `logs/run_mode.txt`; if it does not exist, exits with an error.
+1. Reads `run_mode.txt` from the [log folder](#files-it-produces); if it does not exist, exits with an error.
 2. Since F2 there is **no `git pull`** (before: `run_pipeline.sh:133` of e25e2c9, without checking the result). Code reaches the instance by hand (see [Deploy and rollback](#deploy-and-rollback)).
 3. Full (`run_pipeline.sh:146-169`):
    - scrapes with `timeout 30h` (line 154). Since F2 the previous `scraper/competitors_complete.csv` is **not deleted**: `scraper/main.py` writes to `scraper/competitors_complete.tmp.csv` and replaces the CSV only if the run succeeds (see [Scraper: fail loudly and temp file](#scraper-fail-loudly-and-temp-file));
@@ -98,11 +98,13 @@ The branch `origin/server-improvement` (e25e2c9) disables partial mode and chang
 
 Everything lives **only on the instance's disk** (volume without snapshots). Paths are relative to the repo root; the scripts assume the working directory is that root.
 
+**Log folder** (since F2): every log and state file goes to one folder **outside the code**, `PI_LOG_DIR` if it is set and non-empty, otherwise `<repo>/../logs` (`/home/ec2-user/logs` on the instance). `log_config.py`, `run_pipeline.sh` and `odoo_api_price_suggestion.py` apply the same rule; `run_pipeline.sh` exports the folder to every step. Use an absolute path in `PI_LOG_DIR`. It is outside the code so a new code folder (F4 releases) does not lose the state. Before F2, `run_pipeline.sh` wrote to `<repo>/logs` and only `wayakit_app.log` was in `<repo>/../logs`.
+
 | File | Written by | Stage |
 |---|---|---|
-| `logs/pipeline_execution.log` | `run_pipeline.sh` (output of every step, line 12) | 1 and 2 |
-| `logs/last_full_run.txt`, `logs/run_mode.txt` | `run_pipeline.sh` (lines 10-11) | 1 |
-| `../logs/wayakit_app.log` (rotation 5 MB × 3) | `log_config.py:7-8,32-34`. Goes up one level from the repo root: it ends up **outside the repo**, in the parent directory | 1 and 2 |
+| `<log folder>/pipeline_execution.log` | `run_pipeline.sh` (output of every step) | 1 and 2 |
+| `<log folder>/last_full_run.txt`, `<log folder>/run_mode.txt` | `run_pipeline.sh` | 1 |
+| `<log folder>/wayakit_app.log` (rotation 5 MB × 3) | `log_config.py` (`LOG_DIR`, `setup_logging()`) | 1 and 2 |
 | `ml_model/wayakit_products.csv` | `odoo_api_products.py` | 1 |
 | `ml_model/wayakit_new_products_temp.csv` | `filter_new_products.py` (partial only) | 1 |
 | `scraper/analysis-odoo.csv` (versioned in git) | `odoo_api_connection_products.py` (full only) | 1 |
@@ -116,7 +118,7 @@ Everything lives **only on the instance's disk** (volume without snapshots). Pat
 | `ml_model/wayakit_products_to_predict_odoo.csv` | `1b_preprocess_data.py` | 2 |
 | `ml_model/trained_models/*.joblib` (models, columns and `*_market_stats.joblib`) | `2_train_models.py:110-111,171-178` | 2 |
 | `ml_model/wayakit_prediction_report.csv` | `3_predicted_prices.py` (uploaded by `odoo_api_price_suggestion.py`) | 2 |
-| `logs/odoo_previous_suggestion_ids.json` | `odoo_api_price_suggestion.py --run_mode full` (since F2): IDs of the previous suggestions (`ids`) and, once the create returns, of the new batch (`created_ids`), until the previous ones are archived and deleted. It only stays behind if the upload failed or was killed | 2 |
+| `<log folder>/odoo_previous_suggestion_ids.json` | `odoo_api_price_suggestion.py --run_mode full` (since F2): IDs of the previous suggestions (`ids`) and, once the create returns, of the new batch (`created_ids`), until the previous ones are archived and deleted. It only stays behind if the upload failed or was killed | 2 |
 | `ml_model/price_suggestion_dry_run.csv` | `odoo_api_price_suggestion.py --dry-run` (since F2), by hand only | — |
 
 There are no CloudWatch Logs groups or S3 bucket for PI. The "before" snapshot (CSVs from the Nov 13–15, 2026 run) was copied on 2026-11-17 to `data/f1_before_2026-11-15/` in the local repo, ignored by git; the `.joblib` models remain in the disk snapshot. Planned (F3): bucket `price-intelligence-<account>` with `data/`, `models/`, `state/`, `logs/` and `releases/`.
@@ -127,7 +129,7 @@ There are no alerts or emails today. Planned (F3): SNS notification from the exi
 
 1. **Without starting the instance:** in Odoo (KSA company, see [Reviewing results in Odoo](#reviewing-results-in-odoo)), check the creation date of the `product.price.suggestion` records. If it matches the last full run, the upload happened.
 2. **CloudTrail** (eu-north-1): `StartInstances` events on Thursdays and Fridays at 21:50 CDMX confirm that the schedules fired. They do not say whether the pipeline finished successfully.
-3. **With the instance running** (see [Running by hand](#running-by-hand)): read the full `logs/pipeline_execution.log`. With the pre-F2 code on the instance, **searching for `Success` (`Éxito` in logs written before the English translation reaches the instance) is not enough**: several scripts exit with code 0 even when they fail. Since F2 the last line says `Pipeline finished (code=N)`: `code=0` means every step succeeded; any other code means the run stopped at the step logged just before with `ERROR: ... failed`, and nothing after it ran. Also check `scraper/coverage_report.csv` (since F2) for sites or keywords with 0 results.
+3. **With the instance running** (see [Running by hand](#running-by-hand)): read the full `pipeline_execution.log` (pre-F2 code: `<repo>/logs/`; since F2: the [log folder](#files-it-produces)). With the pre-F2 code on the instance, **searching for `Success` (`Éxito` in logs written before the English translation reaches the instance) is not enough**: several scripts exit with code 0 even when they fail. Since F2 the last line says `Pipeline finished (code=N)`: `code=0` means every step succeeded; any other code means the run stopped at the step logged just before with `ERROR: ... failed`, and nothing after it ran. Also check `scraper/coverage_report.csv` (since F2) for sites or keywords with 0 results.
 
 ---
 
@@ -209,9 +211,9 @@ Mafer confirmed that **the keyword review is needed** (the sites do not find som
    python ml_model/odoo_api_price_suggestion.py --run_mode full
    ```
    - To test **without writing to Odoo**, stop after `3_predicted_prices.py` and review `ml_model/wayakit_prediction_report.csv`, or (since F2) run the upload with `--dry-run`, which writes the exact records it would send to `ml_model/price_suggestion_dry_run.csv`.
-   - After each step, check `echo $?` (since F2 any error gives a code other than 0) and the end of `../logs/wayakit_app.log`. With the pre-F2 code a step can exit with code 0 even if it failed.
+   - After each step, check `echo $?` (since F2 any error gives a code other than 0) and the end of `wayakit_app.log` in the [log folder](#files-it-produces) (`../logs/` from the repo root unless `PI_LOG_DIR` is set). With the pre-F2 code a step can exit with code 0 even if it failed.
    - The full scraping takes up to 30 h. If the session drops, the process dies: run it with `nohup … > <file>.log 2>&1 &` (or in `tmux`, if installed).
-   - Running the steps by hand does **not** update `logs/last_full_run.txt` or `logs/run_mode.txt`. Since e25e2c9 it does not matter for the mode: stage 1 always writes `run_mode.txt=full`.
+   - Running the steps by hand does **not** update `last_full_run.txt` or `run_mode.txt`. Since e25e2c9 it does not matter for the mode: stage 1 always writes `run_mode.txt=full`.
    - Stage 1 rewrites `scraper/analysis-odoo.csv`, which is versioned: `git status` will show it as modified.
 6. **When done:** close any leftover Chrome processes (`pkill -f chrome`), restore the cron, shut down the instance (`sudo shutdown -h now` or from the console) and re-enable the schedules if applicable.
 
@@ -273,11 +275,11 @@ python ml_model/odoo_api_price_suggestion.py --cleanup-previous          # 3. on
 | Mode | What it does |
 |---|---|
 | `--dry-run` | Builds the records and writes them to `ml_model/price_suggestion_dry_run.csv` (change it with `--dry-run-output`). Reads no secret and connects to nothing. Exits 0, or 1 if the report is missing or broken (see below). With `--cleanup-previous` it only says how many IDs the file has |
-| `--run_mode full` | (1) Checks the company. (2) Reads the IDs of the current suggestions and saves them to `logs/odoo_previous_suggestion_ids.json` (`ids`). (3) Creates the new batch in one call (Odoo creates all or none). (4) Writes the new IDs to the file (`created_ids`) as soon as the create returns. (5) Checks that those new records exist (`search_count`), copies **only the saved previous IDs** to `product.price.suggestion.history` and deletes **only those IDs**. (6) Deletes the JSON file. If the file already exists when it starts: without `created_ids` (an earlier upload was killed before its create was confirmed) it is deleted with a warning and the upload goes on, re-reading every current ID, so whatever that earlier create did is replaced too; with `created_ids` the upload refuses (see below) |
+| `--run_mode full` | (1) Checks the company. (2) Reads the IDs of the current suggestions and saves them to `odoo_previous_suggestion_ids.json` in the [log folder](#files-it-produces) (`ids`). (3) Creates the new batch in one call (Odoo creates all or none). (4) Writes the new IDs to the file (`created_ids`) as soon as the create returns. (5) Checks that those new records exist (`search_count`), copies **only the saved previous IDs** to `product.price.suggestion.history` and deletes **only those IDs**. (6) Deletes the JSON file. If the file already exists when it starts: without `created_ids` (an earlier upload was killed before its create was confirmed) it is deleted with a warning and the upload goes on, re-reading every current ID, so whatever that earlier create did is replaced too; with `created_ids` the upload refuses (see below) |
 | `--run_mode partial` (or **without** `--run_mode`: it is the default value) | Checks the company and only runs `create`, without deleting. If there were already suggestions, they end up duplicated |
-| `--cleanup-previous` | Finishes step 5 of a full upload from `logs/odoo_previous_suggestion_ids.json` (skips the archive if the file says it was already done, so the history is not copied twice), then deletes the file. Uploads nothing. **Refuses (exit 1, deletes nothing) if the file has no `created_ids`, or if those new records do not all exist in Odoo**: then the previous suggestions may be the only ones left |
+| `--cleanup-previous` | Finishes step 5 of a full upload from `odoo_previous_suggestion_ids.json` in the log folder (skips the archive if the file says it was already done, so the history is not copied twice), then deletes the file. Uploads nothing. **Refuses (exit 1, deletes nothing) if the file has no `created_ids`, or if those new records do not all exist in Odoo**: then the previous suggestions may be the only ones left |
 
-Other options: `--input` (report, default `ml_model/wayakit_prediction_report.csv`) and `--ids-file` (default `logs/odoo_previous_suggestion_ids.json`).
+Other options: `--input` (report, default `ml_model/wayakit_prediction_report.csv`) and `--ids-file` (default `odoo_previous_suggestion_ids.json` in the log folder: `$PI_LOG_DIR` or `<repo>/../logs`). A cleanup must run with the same `PI_LOG_DIR` as the upload that left the file (or pass `--ids-file`).
 
 What can happen and what to do:
 
@@ -332,13 +334,15 @@ scripts/verify.sh full    # + e2e + differential against origin/server-improveme
   git pull --ff-only origin server-improvement
   git log -1 --oneline                                     # note the SHA in the change's PR
   ```
-  The pull needs read access to the repo and the instance has no stored git credentials; how to authenticate it until F4 is still to be decided with Mafer. Never store a token in the repo, the logs or the shell history. Then re-enable the schedules.
+  The pull needs no credentials: the GitHub repo is public, so it is anonymous HTTPS (decided 2026-11-18). Never put a personal GitHub account or token on the instance, the repo, the logs or the shell history. If the repo is made private, use a read-only deploy key generated on the instance (Mafer configures it). Then re-enable the schedules.
 - **Rollback today:** `git revert` of the commit on `server-improvement`, push, and the same manual pull. Do not run `git checkout <sha>` inside the instance without Mafer's OK: it leaves the instance off the branch.
 
 ### F2 is not on the instance yet
 
 - The F2 relevance AI uses Bedrock with the instance role, which **has no `bedrock:InvokeModel` until F3**: with the F2 code, stage 2 stops at the Bedrock preflight (exit 1, nothing uploaded). Do not deploy F2 to the instance before F3 creates that permission.
 - While the instance runs the pre-F2 `run_pipeline.sh`, its stage 2 `git pull` could bring F2 in by itself once it is merged into `server-improvement`, rewriting `run_pipeline.sh` while bash is running it. Decided 2026-11-18: F2 is merged into `server-improvement` only after F3 creates the permission; the schedules and the crontab are not paused.
+- **The state files move when F2 is deployed**: from `<repo>/logs` to the [log folder](#files-it-produces), `/home/ec2-user/logs` by default (where `wayakit_app.log` already is). Run stage 1 before the first F2 stage 2 (or copy `run_mode.txt` and `last_full_run.txt` there); otherwise stage 2 stops because `run_mode.txt` is missing. Point the `ec2-user` crontab redirection (`>> .../logs/cron.log`) to the same folder (instance configuration, F3).
+- The old `<repo>/logs/cron.log` and `<repo>/logs/pipeline_execution.log` on the instance still contain the Gemini key: scrub or delete them as already planned (see [Security](#security)); moving the folder does not clean them.
 
 ### Planned (F4): pull-on-boot
 
@@ -434,9 +438,9 @@ Errors that have already appeared or that are visible in the code, and what to d
 | The log says `Success` for a step that failed (pre-F2 code) | Several scripts end with `exit()`, which returns 0: `odoo_api_products.py:48,54,67,126`, `odoo_api_cotizations.py:49,55,66,101`, `odoo_api_price_suggestion.py:52,56,65,78,109`. Others catch the exception and continue (`1a_preprocess_data.py:87-90`, `2_train_models.py:182-183`) | Read the full log, not just `Success`. **Fixed in F2**: every error exits with code 1 |
 | Stage 2 trains and uploads to Odoo even though scraping failed (pre-F2 code) | The stage 2 steps do not have `\|\| exit 1` (`run_pipeline.sh:154-167,187-201` in e25e2c9), and the full run deletes `competitors_complete.csv` before scraping (line 151) | Check the log before trusting the suggestions. **Fixed in F2**: `\|\| exit 1` per step and the new CSV is written to a temporary file |
 | Stage 2 used the unreviewed list or old code (pre-F2 code) | `git pull` failed ("local changes would be overwritten") because stage 1 rewrites `scraper/analysis-odoo.csv`, and nobody checks the result (`run_pipeline.sh:133` in e25e2c9) | See [Manual review between stages](#manual-review-between-stages). **Fixed in F2**: no `git pull` in the pipeline; deploy by hand (see [Deploy and rollback](#deploy-and-rollback)) |
-| Stage 1 and stage 2 run at the same time (possible, not observed) | The stage 2 cron is at a fixed time (Saturday 04:00 UTC) and does not check whether stage 1 is still running | Check `logs/pipeline_execution.log`. Planned (F3): a single monthly schedule |
+| Stage 1 and stage 2 run at the same time (possible, not observed) | The stage 2 cron is at a fixed time (Saturday 04:00 UTC) and does not check whether stage 1 is still running | Check `pipeline_execution.log`. Planned (F3): a single monthly schedule |
 | **The Nov 13–15, 2026 run uploaded suggestions to Odoo with failed scraping** | Scraping hit the `timeout 30h` and exited with an error, but `competitors_complete.csv` only had 53 rows (SACO Automotive 36, AeroSense 14, Fine Airports 3; nothing from Amazon, Home or Pets). The following steps do not check the error: it trained, uploaded in full mode (deleted the previous ones) and ended with code 0 | The current suggestions in Odoo come almost entirely from `competitor.product`. **F2**: `\|\| exit 1` per step, the CSV is only replaced on success, and safe upload. Still pending: a minimum of rows per source (the coverage report shows the counts) |
-| `wayakit_app.log` is not in the repo's `logs/` | `log_config.py:7` goes up one level from the repo root | Look for it at `../logs/wayakit_app.log`. Whether to move it is pending (`decisions.md`, Pending, question 17) |
+| `wayakit_app.log` is not in the repo's `logs/` (pre-F2 code) | `log_config.py` goes up one level from the repo root, while the pre-F2 `run_pipeline.sh` writes to `<repo>/logs` | Look for it at `../logs/wayakit_app.log`. **Since F2** every log and state file is in that one folder (`PI_LOG_DIR`, default `<repo>/../logs`; `decisions.md`, 2026-11-18) |
 | A stage 2 run stops at `2. Run scraping` with `AccessDeniedException` (F2 code) | The instance role has no `bedrock:InvokeModel` (planned for F3) | Expected until F3; nothing was uploaded. See [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet) |
 | The upload exits 1 with `… exists: a previous full upload created its batch but did not finish its cleanup` (F2 code) | A previous full upload created the new batch (`created_ids` in the file) but failed to archive/delete the old one | Run `python ml_model/odoo_api_price_suggestion.py --cleanup-previous` (see [Re-uploading suggestions](#re-uploading-suggestions)). If it refuses, follow its message: never delete suggestions by hand |
 | An Odoo step fails with `TimeoutError` (F2 code) | Every XML-RPC call times out after 300 s (`pi_odoo.XMLRPC_TIMEOUT_S`); before, a hung call blocked until `timeout 1h` killed the process | Check that Odoo responds. A timeout during the upload's create is covered by the rows in [Re-uploading suggestions](#re-uploading-suggestions) |
@@ -479,5 +483,5 @@ Errors that have already appeared or that are visible in the code, and what to d
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **The Gemini key is in plain text** in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance (confirmed in F1). It does not appear in `~/logs/wayakit_app.log*` | The key goes in the URL (`ai_service.py:54-55`) and `requests.exceptions.HTTPError` exceptions are logged with the full URL | Do not copy or print those logs without redacting `key=`. **Revoke or rotate the key in Google now**, clean up or delete the logs and notify IT (Mafer). F2 removes Gemini from the code; after the first Bedrock run on the instance, remove the key from `prod/wayakit-app` |
+| **The Gemini key is in plain text** in `<repo>/logs/cron.log` (72 lines) and `<repo>/logs/pipeline_execution.log` (87 lines) on the instance (confirmed in F1). It does not appear in `~/logs/wayakit_app.log*` | The key goes in the URL (`ai_service.py:54-55`) and `requests.exceptions.HTTPError` exceptions are logged with the full URL | Do not copy or print those logs without redacting `key=`. **Revoke or rotate the key in Google now**, clean up or delete the logs and notify IT (Mafer). F2 removes Gemini from the code; after the first Bedrock run on the instance, remove the key from `prod/wayakit-app` |
 | The instance role can read and write every secret in the account, including `voz-del-cliente/api-keys` | `Wayakit-EC2-Secrets-Role` has `SecretsManagerReadWrite` | Notify IT. Planned (F3): `instance_role.py` with least privilege |

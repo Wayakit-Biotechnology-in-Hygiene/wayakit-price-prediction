@@ -14,17 +14,23 @@ What it proves:
 - `--dry-run` never touches the session and writes the records CSV;
 - `build_records` / `check_parse_quality`: bad rows are skipped one by one, but no valid rows or
   more than 5 % skipped → exit 1.
+- IDs file location (Pending 17, resolved 2026-11-18): without `--ids-file` it lives in the single
+  log folder, `PI_LOG_DIR` if set and non-empty, else `<repo>/../logs` (never inside the code), so a
+  `--cleanup-previous` run in a later process finds the file the failed upload left.
 """
 from __future__ import annotations
 
+import importlib.util
+import itertools
 import json
 import math
+import os
 
 import pandas as pd
 import pytest
 
 from pi_odoo import OdooSession
-from tests.conftest import load_module
+from tests.conftest import REPO_ROOT, load_module
 
 pytestmark = pytest.mark.unit
 
@@ -457,3 +463,76 @@ def test_ids_file_round_trip_and_old_format(tmp_path):
     assert (payload["ids"], payload["archived"], payload["created_ids"]) == ([1, 3], True, [7, 9])
     p.write_text(json.dumps({"model": SUG, "ids": [1], "archived": False}))  # pre-I2 file
     assert up.load_previous_ids(str(p)).get("created_ids") is None
+
+
+# --- IDs file location: the single log folder ---------------------------------------------------
+IDS_NAME = "odoo_previous_suggestion_ids.json"
+_fresh_counter = itertools.count()
+
+
+def _fresh_upload_module():
+    """Imports the upload script again, so PREVIOUS_IDS_FILE is computed from the current env.
+
+    `load_module` caches the module (imported once, with whatever env pytest had); this does not.
+    Importing writes nothing (the file-less log_config stand-in is already in sys.modules).
+    """
+    load_module("ml_model/odoo_api_price_suggestion.py")  # makes sure the stand-in log_config is installed
+    path = REPO_ROOT / "ml_model" / "odoo_api_price_suggestion.py"
+    spec = importlib.util.spec_from_file_location(f"pi_test_upload_fresh_{next(_fresh_counter)}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ids_file_default_is_in_repo_parent_logs_never_inside_the_code(monkeypatch):
+    monkeypatch.delenv("PI_LOG_DIR", raising=False)
+    fresh = _fresh_upload_module()
+    expected = os.path.join(os.path.dirname(str(REPO_ROOT)), "logs", IDS_NAME)
+    assert fresh.PREVIOUS_IDS_FILE == expected
+    assert fresh.parse_args([]).ids_file == expected
+    assert os.path.isabs(expected) and ".." not in expected.split(os.sep)
+    assert not expected.startswith(str(REPO_ROOT) + os.sep), "the IDs file must not live in the code folder"
+
+
+def test_ids_file_empty_pi_log_dir_is_the_default(monkeypatch):
+    monkeypatch.setenv("PI_LOG_DIR", "")
+    fresh = _fresh_upload_module()
+    assert fresh.PREVIOUS_IDS_FILE == os.path.join(os.path.dirname(str(REPO_ROOT)), "logs", IDS_NAME)
+
+
+@pytest.mark.parametrize("value", ["{tmp}/state", "{tmp}/a/../state/", "rel-state"])
+def test_ids_file_default_follows_pi_log_dir(monkeypatch, tmp_path, value):
+    monkeypatch.chdir(tmp_path)  # a relative value is resolved against the current folder
+    monkeypatch.setenv("PI_LOG_DIR", value.format(tmp=tmp_path))
+    fresh = _fresh_upload_module()
+    expected = os.path.join(os.path.abspath(value.format(tmp=tmp_path)), IDS_NAME)
+    assert fresh.PREVIOUS_IDS_FILE == expected
+    assert fresh.parse_args([]).ids_file == expected
+    assert fresh.parse_args(["--ids-file", str(tmp_path / "x.json")]).ids_file == str(tmp_path / "x.json"), \
+        "--ids-file still overrides the default"
+
+
+def test_log_dir_helper_ignores_the_process_env_when_given_one(monkeypatch, tmp_path):
+    monkeypatch.setenv("PI_LOG_DIR", str(tmp_path / "from-process-env"))
+    assert up.log_dir({}, "/srv/pi/releases/abc123") == "/srv/pi/releases/logs"
+    assert up.log_dir({"PI_LOG_DIR": ""}, "/srv/pi/current") == "/srv/pi/logs"
+    assert up.log_dir({"PI_LOG_DIR": "/srv/pi/logs"}, "/srv/pi/releases/abc123") == "/srv/pi/logs"
+
+
+def test_cleanup_previous_in_a_later_process_finds_the_ids_file_in_pi_log_dir(monkeypatch, tmp_path, report):
+    """The point of the single folder: a failed full upload leaves the file there and a later
+    `--cleanup-previous` (new process, new import, no --ids-file) finds it and finishes."""
+    state = tmp_path / "state"
+    monkeypatch.setenv("PI_LOG_DIR", str(state))
+    odoo = FakeOdoo(existing=3, fail={(SUG, "unlink")})
+    old_ids = sorted(odoo.table)
+    path = report([_row(i) for i in range(4)])
+    first = _fresh_upload_module()
+    assert first.main(["--input", str(path), "--run_mode", "full"], session=odoo.session()) == 1
+    assert (state / IDS_NAME).is_file(), "the failed cleanup left its IDs file in PI_LOG_DIR"
+    odoo.fail.clear()
+    later = _fresh_upload_module()
+    assert later.main(["--input", str(path), "--cleanup-previous"], session=odoo.session()) == 0
+    assert not set(odoo.table) & set(old_ids) and len(odoo.table) == 4
+    assert not (state / IDS_NAME).exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["state", "wayakit_prediction_report.csv"]

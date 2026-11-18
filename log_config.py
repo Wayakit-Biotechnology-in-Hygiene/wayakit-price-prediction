@@ -1,10 +1,14 @@
-# scraper/log_config.py
+# log_config.py
 import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs') # logs directory at the project root
+# One folder for every log and state file, outside the code so a new code folder (F4 releases)
+# never loses them: PI_LOG_DIR if set, else <repo>/../logs. run_pipeline.sh and
+# ml_model/odoo_api_price_suggestion.py apply the same rule.
+LOG_DIR = os.path.abspath(os.environ.get('PI_LOG_DIR') or
+                          os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs'))
 LOG_FILENAME = os.path.join(LOG_DIR, 'wayakit_app.log')
 
 def setup_logging(log_level=logging.INFO):

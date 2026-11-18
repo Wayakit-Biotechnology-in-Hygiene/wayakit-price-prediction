@@ -13,7 +13,12 @@ logger = get_logger()
 
 # Default files (can be overridden by arguments)
 DEFAULT_FULL_PRODUCTS_FILE = 'wayakit_products.csv'
-DEFAULT_TIMESTAMP_FILE = 'logs/last_full_run.txt'
+# The single log and state folder (same rule as log_config.LOG_DIR, run_pipeline.sh and
+# odoo_api_price_suggestion.log_dir()): PI_LOG_DIR if set and non-empty, else <repo>/../logs.
+# Outside the code so a new code folder (F4 releases) keeps it; not relative to the cwd.
+DEFAULT_TIMESTAMP_FILE = os.path.join(
+    os.path.abspath(os.environ.get('PI_LOG_DIR') or os.path.join(project_root, '..', 'logs')),
+    'last_full_run.txt')
 DEFAULT_OUTPUT_FILE = 'wayakit_new_products_temp.csv'
 
 def read_last_full_run_timestamp(filepath):

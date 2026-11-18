@@ -4,12 +4,12 @@ set -o pipefail
 # --- CONFIGURATION ---
 PROJECT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 CONDA_ENV_NAME="wayakit_env"
-LOG_DIR="$PROJECT_DIR/logs"
-
+# Logs and state in ONE folder outside the code (F4 releases must not lose them); same rule as log_config.py. Absolute (before the cd) and exported so every step uses it, even via a symlinked code folder.
+LOG_DIR="${PI_LOG_DIR:-$(dirname "$PROJECT_DIR")/logs}"; case "$LOG_DIR" in /*) ;; *) LOG_DIR="$PWD/$LOG_DIR" ;; esac; export PI_LOG_DIR="$LOG_DIR"
 # --- State and Log Files ---
 LAST_FULL_RUN_FILE="$LOG_DIR/last_full_run.txt"
 RUN_MODE_FILE="$LOG_DIR/run_mode.txt" # State file
-SCRIPT_LOG_FILE="$PROJECT_DIR/logs/pipeline_execution.log"
+SCRIPT_LOG_FILE="$LOG_DIR/pipeline_execution.log"
 # --- IMPORTANT CHANGE: Detect user (ubuntu or ec2-user) ---
 if [ -d "/home/ubuntu" ]; then
     CONDA_BASE_PATH=$(conda info --base 2>/dev/null || echo "/home/ubuntu/miniconda3")

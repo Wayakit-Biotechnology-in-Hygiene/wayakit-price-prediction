@@ -62,7 +62,7 @@ Outside the scripts (manual steps):
 | Upgrade the Apify plan (VdC account) | Apify Console | Mafer | Decided; tier and date pending |
 | Apify key value | Secrets Manager, `prod/wayakit-app` | Mafer, console | Planned (F6) |
 | Volume snapshot before starting the instance | EC2 | With Mafer's OK | Done (2026-11-17) |
-| **Revoke or rotate the Gemini key** (leaked in the logs) and clean up `logs/cron.log` and `logs/pipeline_execution.log` on the instance | Google (key's project: pending identification) and instance | IT / Mafer | **Urgent** (confirmed in F1, 2026-11-17). Remove `GEMINI_API_KEY` from the secret when the migration to Bedrock is finished (F2) |
+| **Revoke or rotate the Gemini key** (leaked in the logs) and clean up `<repo>/logs/cron.log` and `<repo>/logs/pipeline_execution.log` on the instance | Google (key's project: pending identification) and instance | IT / Mafer | **Urgent** (confirmed in F1, 2026-11-17). Remove `GEMINI_API_KEY` from the secret when the migration to Bedrock is finished (F2) |
 | GitHub environment and permissions for OIDC | GitHub, Wayakit organization | Mafer (organization admin) | Pending: the repo is in a personal account (question 8) |
 
 ## External services
@@ -79,7 +79,7 @@ Connection: XML-RPC with an API token, credentials in `prod/wayakit-app` read by
 | Reads | `sale.order.line` (`order_id.state = sale`, `name like '[FP-%'`) | `ml_model/odoo_api_cotizations.py` (`fetch_sale_lines`) | Last 12 rolling months up to the run date (`sales_window()`, since F2). 0 lines → exit 1 |
 | Reads | `competitor.product` (all records) | `ml_model/odoo_api_competitor_products.py` (`fetch_competitor_products`) | Competitor products loaded in Odoo. 0 records → exit 1 |
 | Reads | `res.company` (visible companies) | `pi_odoo.get_single_company()`, called by the upload | Company guard before any write (since F2) |
-| Writes | `product.price.suggestion` (`create`; in full mode, then `read` + `unlink` of the previous IDs only) | `ml_model/odoo_api_price_suggestion.py` (`upload`, `archive_and_unlink`) | Since F2: create first, record the new IDs, check they exist (`search_count`), then delete the previous IDs saved in `logs/odoo_previous_suggestion_ids.json`; `--dry-run` and `--cleanup-previous`. XML-RPC calls time out after 300 s. See `docs/runbook.md`, *Re-uploading suggestions* |
+| Writes | `product.price.suggestion` (`create`; in full mode, then `read` + `unlink` of the previous IDs only) | `ml_model/odoo_api_price_suggestion.py` (`upload`, `archive_and_unlink`) | Since F2: create first, record the new IDs, check they exist (`search_count`), then delete the previous IDs saved in `odoo_previous_suggestion_ids.json` in the log folder (`PI_LOG_DIR`, default `<repo>/../logs`); `--dry-run` and `--cleanup-previous`. XML-RPC calls time out after 300 s. See `docs/runbook.md`, *Re-uploading suggestions* |
 | Writes | `product.price.suggestion.history` (`create`) | `ml_model/odoo_api_price_suggestion.py` (`archive_and_unlink`) | Copy of the previous suggestions (full mode and `--cleanup-previous` only) |
 
 `scraper/odoo_api_connection_products.py` no longer connects to Odoo (since F2): it only reads `ml_model/wayakit_products.csv`.
@@ -115,7 +115,7 @@ Status: **implemented in the code (F2), not yet on the instance** (it needs the 
 |---|---|
 | Use today | Relevance (`gemini-2.5-flash-lite`) and wipes unit extraction (`gemini-2.5-pro`), in `scraper/services/ai_service.py:54-55` |
 | Credential | `GEMINI_API_KEY` in `prod/wayakit-app` |
-| Risk | **Confirmed (F1):** the key is in plain text in `logs/cron.log` (72 lines) and `logs/pipeline_execution.log` (87 lines) on the instance, because it goes in the URL and HTTP errors are logged with it. It does not appear in `~/logs/wayakit_app.log*`. Revoke or rotate now and notify IT |
+| Risk | **Confirmed (F1):** the key is in plain text in `<repo>/logs/cron.log` (72 lines) and `<repo>/logs/pipeline_execution.log` (87 lines) on the instance, because it goes in the URL and HTTP errors are logged with it. It does not appear in `~/logs/wayakit_app.log*`. Revoke or rotate now and notify IT |
 | Cost | Not documented (pending: identify the Google project and its billing) |
 | Status | Removed from the code in F2 (Bedrock). Still used by the pre-F2 code on the instance until F2 is deployed. Afterwards: **revoke the key**, remove `GEMINI_API_KEY` from the secret and clean the logs |
 

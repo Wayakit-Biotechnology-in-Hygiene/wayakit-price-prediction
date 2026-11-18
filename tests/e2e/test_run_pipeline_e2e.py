@@ -20,10 +20,19 @@ What it checks:
   writes to a temporary file and replaces the CSV only on success), so a failed run leaves the
   previous CSV in place.
 - An unknown run mode exits with 1 without running anything.
+- Log folder (Pending 17, resolved 2026-11-18): `pipeline_execution.log`, `run_mode.txt` and
+  `last_full_run.txt` live in ONE folder outside the code: `PI_LOG_DIR` if set and non-empty,
+  else `<project>/../logs` (here `<sandbox root>/logs`). Nothing is written under the code folder,
+  stage 2 reads `run_mode.txt` from that same folder, and the folder is exported to the Python
+  steps (`PI_LOG_DIR`) so the upload's IDs file lands next to the other state files.
+
+Note: the harness property `SandboxRun.pipeline_log` still reads the old `<project>/logs` path
+(the harness is a check and is not edited here); these tests read the log through `_pipeline_log`.
 """
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -57,21 +66,40 @@ def sandbox(tmp_path):
     return sb.Sandbox(tmp_path / "pi-run-pipeline")
 
 
-def _stage2_state(sandbox: sb.Sandbox, mode: str) -> None:
+def _default_log_dir(project: Path) -> Path:
+    """The default log folder of run_pipeline.sh: <project>/../logs (= <sandbox root>/logs)."""
+    return project.parent / "logs"
+
+
+def _write_state(sandbox: sb.Sandbox, name: str, text: str, log_dir: Path | None = None) -> Path:
+    """Writes a state file in the log folder (outside the code copy, so not via `sandbox.write`)."""
+    p = (log_dir or _default_log_dir(sandbox.project)) / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _pipeline_log(run: sb.SandboxRun, log_dir: Path | None = None) -> str:
+    """pipeline_execution.log from the log folder (the harness's `run.pipeline_log` reads the old path)."""
+    p = (log_dir or _default_log_dir(run.project)) / "pipeline_execution.log"
+    return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+
+
+def _stage2_state(sandbox: sb.Sandbox, mode: str, log_dir: Path | None = None) -> None:
     """State that stage 1 leaves in production: mode, Odoo products and (partial) new products."""
-    sandbox.write("logs/run_mode.txt", f"{mode}\n")
+    _write_state(sandbox, "run_mode.txt", f"{mode}\n", log_dir)
     sandbox.write("ml_model/wayakit_products.csv", "Product_ID\nP1\n")
     if mode == "partial":
         sandbox.write("ml_model/wayakit_new_products_temp.csv", "Product_ID\nP2\nP3\n")
 
 
-def _no_real_effects(run: sb.SandboxRun) -> None:
+def _no_real_effects(run: sb.SandboxRun, log_dir: Path | None = None) -> None:
     """Everything that could leave the machine went through a shim and nothing was left unresolved."""
     assert not run.of("aws"), run.trace()
     assert [c.args for c in run.of("sudo")] == ["shutdown -h +1"], run.trace()
     assert not run.of("shutdown"), "the sudo shim executes nothing: shutdown must not be called directly"
     assert all(c.cwd == str(run.project) for c in run.of("python")), run.trace()
-    output = run.stdout + run.stderr + run.pipeline_log
+    output = run.stdout + run.stderr + _pipeline_log(run, log_dir)
     assert "command not found" not in output and "No such file" not in output, run.trace()
     assert not any(run.project.rglob("*.py")), "the copy must not contain code"
 
@@ -109,7 +137,7 @@ def test_python_shim_can_fail_a_step(sandbox):
     run = sandbox.run(stage=2, fail={SCRAPER: TIMEOUT_EXIT})
     assert f"shim python: {SCRAPER} -> exit {TIMEOUT_EXIT}" in run.stdout, run.trace()
     # run_command logs a failed step at ERROR level; only the level token is checked, not the wording.
-    assert re.search(r"\bERROR\b", run.pipeline_log), run.trace()
+    assert re.search(r"\bERROR\b", _pipeline_log(run)), run.trace()
     _no_real_effects(run)
 
 
@@ -121,8 +149,8 @@ def test_stage1_runs_its_steps_and_shuts_down_through_the_shim(sandbox):
     assert run.returncode == 0, run.trace()
     assert run.python_scripts == STAGE1, run.trace()
     assert [c.args for c in run.of("conda")][:2] == ["info --base", "activate wayakit_env"], run.trace()
-    assert (run.project / "logs" / "run_mode.txt").read_text().strip() == "full"
-    assert (run.project / "logs" / "last_full_run.txt").is_file()
+    assert (_default_log_dir(run.project) / "run_mode.txt").read_text().strip() == "full"
+    assert (_default_log_dir(run.project) / "last_full_run.txt").is_file()
     assert not run.of("git"), "stage 1 does not do git pull"
     _no_real_effects(run)
 
@@ -131,7 +159,7 @@ def test_stage1_aborts_if_the_odoo_read_fails_and_still_shuts_down(sandbox):
     run = sandbox.run(stage=1, fail={STAGE1[0]: 1})
     assert run.returncode == 1, run.trace()
     assert run.python_scripts == STAGE1[:1], run.trace()
-    assert not (run.project / "logs" / "run_mode.txt").exists()
+    assert not (_default_log_dir(run.project) / "run_mode.txt").exists()
     _no_real_effects(run)
 
 
@@ -167,7 +195,7 @@ def test_stage2_without_run_mode_exits_with_1_and_shuts_down(sandbox):
 
 def test_stage2_with_unknown_run_mode_exits_with_1_without_running_anything(sandbox):
     _stage2_state(sandbox, "full")
-    sandbox.write("logs/run_mode.txt", "weekly\n")
+    _write_state(sandbox, "run_mode.txt", "weekly\n")
     run = sandbox.run(stage=2)
     assert run.returncode == 1, run.trace()
     assert run.python_scripts == [], run.trace()
@@ -275,3 +303,124 @@ def test_missing_products_file_is_refetched_and_its_failure_also_aborts(sandbox,
     failed = sandbox.run(stage=2, fail={refetch: 1})
     assert failed.returncode != 0 and failed.python_scripts == expected, failed.trace()
     _no_real_effects(failed)
+
+
+# ---------------------------------------------------------------------------------------------
+# One log folder outside the code (Pending 17, resolved 2026-11-18)
+# ---------------------------------------------------------------------------------------------
+STATE_FILES = ("pipeline_execution.log", "run_mode.txt", "last_full_run.txt")
+
+
+def _with_log_dir(sandbox: sb.Sandbox, value: str) -> None:
+    """Adds PI_LOG_DIR to the environment the sandbox builds from scratch (keeps `fail`/`path`)."""
+    build = sandbox.env
+    def env(fail=None, path=None):
+        e = build(fail, path)
+        e["PI_LOG_DIR"] = value
+        return e
+    sandbox.env = env  # type: ignore[method-assign]
+
+
+def _record_python_log_dir(sandbox: sb.Sandbox) -> Path:
+    """Makes the python shim (in the temp copy) also record the PI_LOG_DIR it receives.
+
+    The extra line only appends to a file in the sandbox; the shim still does nothing else.
+    """
+    out = sandbox.root / "python_pi_log_dir.txt"
+    shim = sandbox.shims / "python"
+    shebang, rest = shim.read_text().split("\n", 1)
+    shim.write_text(f"{shebang}\nprintf '%s\\n' \"${{PI_LOG_DIR-<unset>}}\" >> '{out}'\n{rest}")
+    return out
+
+
+def _files_named_like_state_in(folder: Path) -> list[str]:
+    return sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.name in STATE_FILES)
+
+
+def test_default_log_folder_is_outside_the_code_and_holds_every_state_file(sandbox):
+    stage1 = sandbox.run(stage=1)
+    assert stage1.returncode == 0, stage1.trace()
+    logs = _default_log_dir(sandbox.project)
+    assert logs == sandbox.root / "logs"
+    for name in STATE_FILES:
+        assert (logs / name).is_file(), f"{name} not in {logs}\n{stage1.trace()}"
+    assert "Starting Wayakit Pipeline (STAGE 1)" in _pipeline_log(stage1)
+    # Nothing in the code folder: <project>/logs (the harness pre-creates it) stays empty or absent.
+    assert not any((sandbox.project / "logs").glob("*")), stage1.trace()
+    assert _files_named_like_state_in(sandbox.project) == [], stage1.trace()
+    _no_real_effects(stage1)
+    # Stage 2 picks up the mode stage 1 left in that folder and also logs there.
+    sandbox.write("ml_model/wayakit_products.csv", "Product_ID\nP1\n")
+    stage2 = sandbox.run(stage=2)
+    assert stage2.returncode == 0, stage2.trace()
+    assert stage2.python_scripts == STAGE2["full"], stage2.trace()
+    assert "Starting Wayakit Pipeline (STAGE 2)" in _pipeline_log(stage2)
+    assert not any((sandbox.project / "logs").glob("*")), stage2.trace()
+    assert _files_named_like_state_in(sandbox.project) == [], stage2.trace()
+    _no_real_effects(stage2)
+
+
+def test_python_steps_receive_the_default_log_folder_as_an_absolute_pi_log_dir(sandbox):
+    """Exported, so the upload's IDs file lands in the same folder as run_mode.txt."""
+    seen = _record_python_log_dir(sandbox)
+    _stage2_state(sandbox, "full")
+    run = sandbox.run(stage=2)
+    assert run.returncode == 0, run.trace()
+    values = seen.read_text(encoding="utf-8").splitlines()
+    assert len(values) == len(STAGE2["full"]), run.trace()
+    assert set(values) == {str(_default_log_dir(run.project))}, values
+    _no_real_effects(run)
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+def test_pi_log_dir_moves_every_state_file_and_the_log_there(sandbox, tmp_path, stage):
+    custom = tmp_path / "shared state" / "pi-logs"  # with a space: the script must quote it
+    _with_log_dir(sandbox, str(custom))
+    seen = _record_python_log_dir(sandbox)
+    if stage == 2:
+        _stage2_state(sandbox, "full", log_dir=custom)
+    run = sandbox.run(stage=stage)
+    assert run.returncode == 0, run.trace()
+    assert run.python_scripts == (STAGE1 if stage == 1 else STAGE2["full"]), run.trace()
+    assert (custom / "run_mode.txt").read_text().strip() == "full"
+    if stage == 1:
+        assert (custom / "last_full_run.txt").is_file()
+    assert f"Starting Wayakit Pipeline (STAGE {stage})" in _pipeline_log(run, custom)
+    # Neither the default folder nor the code folder got anything.
+    assert not _default_log_dir(run.project).exists(), run.trace()
+    assert _files_named_like_state_in(sandbox.project) == [], run.trace()
+    assert set(seen.read_text(encoding="utf-8").splitlines()) == {str(custom)}
+    _no_real_effects(run, custom)
+
+
+def test_stage2_reads_run_mode_only_from_pi_log_dir(sandbox, tmp_path):
+    """A run_mode.txt left in the default folder is ignored when PI_LOG_DIR points elsewhere."""
+    custom = tmp_path / "pi-logs"
+    _with_log_dir(sandbox, str(custom))
+    _stage2_state(sandbox, "full")  # run_mode.txt in the DEFAULT folder only
+    run = sandbox.run(stage=2)
+    assert run.returncode == 1, run.trace()
+    assert run.python_scripts == [], run.trace()
+    assert str(custom / "run_mode.txt") in _pipeline_log(run, custom), run.trace()
+    _no_real_effects(run, custom)
+
+
+def test_empty_pi_log_dir_means_the_default_folder(sandbox):
+    _with_log_dir(sandbox, "")
+    run = sandbox.run(stage=1)
+    assert run.returncode == 0, run.trace()
+    assert (_default_log_dir(run.project) / "run_mode.txt").read_text().strip() == "full"
+    assert _files_named_like_state_in(sandbox.project) == [], run.trace()
+    _no_real_effects(run)
+
+
+def test_relative_pi_log_dir_is_made_absolute_against_the_launch_folder(sandbox):
+    """The harness launches from the project copy; the steps get the absolute folder."""
+    _with_log_dir(sandbox, "rel-state")
+    seen = _record_python_log_dir(sandbox)
+    run = sandbox.run(stage=1)
+    assert run.returncode == 0, run.trace()
+    expected = sandbox.project / "rel-state"
+    assert (expected / "run_mode.txt").read_text().strip() == "full"
+    assert set(seen.read_text(encoding="utf-8").splitlines()) == {str(expected)}
+    _no_real_effects(run, expected)

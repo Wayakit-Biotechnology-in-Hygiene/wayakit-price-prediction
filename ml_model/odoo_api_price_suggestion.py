@@ -7,7 +7,8 @@ Modes:
 - `--run_mode partial` (default): creates the new records; deletes nothing.
 - `--run_mode full`: replaces the table without ever leaving it empty:
     1. reads the IDs of the current suggestions and saves them to
-       logs/odoo_previous_suggestion_ids.json (`ids`, no `created_ids` yet);
+       odoo_previous_suggestion_ids.json in the log folder (PI_LOG_DIR, default <repo>/../logs;
+       see `log_dir()`) (`ids`, no `created_ids` yet);
     2. creates the new batch (one call: Odoo creates all or none). If it fails, exit 1;
     3. as soon as the create returns, writes the new IDs to the file (`created_ids`): from then
        on the file proves that a new batch exists;
@@ -49,9 +50,20 @@ HISTORY_MODEL_NAME = 'product.price.suggestion.history'
 
 REPORT_FILE = 'ml_model/wayakit_prediction_report.csv'
 DRY_RUN_FILE = 'ml_model/price_suggestion_dry_run.csv'
-# <project>/logs, next to logs/pipeline_execution.log (log_config.LOG_DIR is <project>/../logs).
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PREVIOUS_IDS_FILE = os.path.join(PROJECT_DIR, 'logs', 'odoo_previous_suggestion_ids.json')
+
+
+def log_dir(environ=os.environ, project_dir: str = PROJECT_DIR) -> str:
+    """The single log and state folder: PI_LOG_DIR if set and non-empty, else <project>/../logs.
+
+    Same rule as log_config.LOG_DIR and run_pipeline.sh. Outside the code so the IDs file survives
+    a new code folder (F4 releases). Computed here rather than imported from log_config, so a copy
+    with only ml_model/ (the E2E harness) or a stand-in log_config resolves it the same way.
+    """
+    return os.path.abspath(environ.get('PI_LOG_DIR') or os.path.join(project_dir, '..', 'logs'))
+
+
+PREVIOUS_IDS_FILE = os.path.join(log_dir(), 'odoo_previous_suggestion_ids.json')
 
 # More unparseable rows than this means a broken report, not a few bad products.
 MAX_SKIPPED_FRACTION = 0.05
@@ -357,7 +369,8 @@ def parse_args(argv=None):
                              "full upload whose cleanup failed. Uploads nothing.")
     parser.add_argument('--input', default=REPORT_FILE, help=f"Prediction report (default: {REPORT_FILE}).")
     parser.add_argument('--ids-file', default=PREVIOUS_IDS_FILE,
-                        help="Where full mode stores the previous IDs until they are deleted.")
+                        help="Where full mode stores the previous IDs until they are deleted "
+                             f"(default: {PREVIOUS_IDS_FILE}, from PI_LOG_DIR or <repo>/../logs).")
     return parser.parse_args(argv)
 
 

@@ -38,12 +38,12 @@ Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/pl
 ## Known pitfalls
 
 - **Silent failures (fixed in F2 on `f2-hardening`, still live on the instance until it is deployed):** bare `exit()`, swallowed exceptions and stage 2 steps without `|| exit 1`. On the branch every error exits 1; do not reintroduce `exit()` or an `except` that only logs.
-- **`git pull` in stage 2** is still on the instance (old `run_pipeline.sh`) and can pull new code of `server-improvement` on its own; F2 removes it. Until F4, code reaches the instance with a manual pull over SSM (how it authenticates is still to be decided).
+- **`git pull` in stage 2** is still on the instance (old `run_pipeline.sh`) and can pull new code of `server-improvement` on its own; F2 removes it. Until F4, code reaches the instance with a manual pull over SSM: the GitHub repo is public, so anonymous HTTPS works; never put a personal account or token on the instance (if the repo is made private, a read-only deploy key generated on the instance).
 - **Case-sensitive subindustry:** `TARGET_MAP.get` in `sites_for()` (`scraper/main.py`) uses `'Land Transportation'` and the data has `'Land transportation'`; those rows are never scraped and there is no warning.
 - **New CSV column = `config.py` + `main.py` at the same time:** `csv.DictWriter` (`_run()` in `scraper/main.py`) uses the default `extrasaction='raise'`.
 - **Odoo reads with 0 records exit 1** (F2): products, sales (rolling 12 months) and competitor products. An empty read would otherwise leave the previous run's CSV in use.
 - **The Gemini key is in plain text** in `logs/cron.log` and `logs/pipeline_execution.log` on the instance (confirmed in F1; the old `ai_service.py` put it in the URL). Do not copy those logs anywhere or print them without redacting `key=`. Bedrock errors are logged with the model, exception class and AWS error code only (AWS messages can carry ARNs with the account ID).
-- **`log_config.LOG_DIR` is `<repo>/../logs`**, while `run_pipeline.sh` and the upload's IDs file use `<repo>/logs` (Pending 17).
+- **One folder for logs and state, outside the code** (Mafer, 2026-11-18): `PI_LOG_DIR`, default `<repo>/../logs` (`/home/ec2-user/logs` on the instance). `log_config.py`, `run_pipeline.sh` (`pipeline_execution.log`, `run_mode.txt`, `last_full_run.txt`) and the upload's IDs file all use it, so F4 release folders never lose them. Never write logs or state inside the code folder.
 - **A failing step does not stop the pipeline:** in the 13–15 Nov 2026 run, scraping hit the 30 h timeout with 53 rows and training and the Odoo upload in full mode still happened.
 - **Inconsistent sizes in Apify:** in `junglee`, `Item Volume`, `Unit Count` and `Size` often do not match; keep the 2-out-of-3-sources rule.
 - **Wayakit products show up in the results** (Amazon and Noon). Today nothing excludes them; the Apify adapters must discard the Wayakit brand and seller.
