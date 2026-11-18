@@ -222,6 +222,8 @@ def _subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
     # No PYTHONPATH: `from log_config import ...` must resolve to the temporary copy, not the real repo.
     env.pop("PYTHONPATH", None)
+    # No PI_LOG_DIR: E2E subprocesses must never write to a developer's real log folder.
+    env.pop("PI_LOG_DIR", None)
     env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1", PYTHONHASHSEED="0",
                PYTHONIOENCODING="utf-8", MPLBACKEND="Agg")
     return env

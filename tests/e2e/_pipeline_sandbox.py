@@ -96,8 +96,12 @@ class SandboxRun:
 
     @property
     def pipeline_log(self) -> str:
-        p = self.project / "logs" / "pipeline_execution.log"
-        return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+        # PI_LOG_DIR layout (f2-hardening): <project>/../logs; older run_pipeline.sh: <project>/logs.
+        for p in (self.project.parent / "logs" / "pipeline_execution.log",
+                  self.project / "logs" / "pipeline_execution.log"):
+            if p.is_file():
+                return p.read_text(encoding="utf-8", errors="replace")
+        return ""
 
     def trace(self) -> str:
         lines = [f"run_pipeline.sh (copy in {self.project}) exited with {self.returncode}. Calls:"]
