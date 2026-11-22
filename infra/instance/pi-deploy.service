@@ -1,0 +1,33 @@
+# Price Intelligence release install (F4, pull-on-boot). Installed and enabled by
+# infra/instance/bootstrap.sh as /etc/systemd/system/pi-deploy.service; later versions are synced
+# by pi_deploy.py itself from the active release.
+#
+# Runs once on every boot, as root, before pi-pipeline.service: /opt/price-intelligence/pi_deploy.py
+# installs the release named by the S3 pointer releases/current and points
+# /home/ec2-user/wayakit-price-prediction at /home/ec2-user/pi-releases/<sha>. On a deploy boot
+# (a valid releases/deploy-request.json written by infra/release.py) it also writes the result to
+# state/deploys/<request_id>.json and powers the instance off, except inside the monthly window.
+# The deployer lives in /opt, outside the releases, so a bad release cannot break it.
+#
+# pi-pipeline.service is only ordered after this unit (After=), never Requires=/BindsTo=: a failed
+# install must not block the monthly run, which then uses the release that was already active.
+#
+# Check:  systemctl status pi-deploy.service; journalctl -u pi-deploy.service -b;
+#         $PI_LOG_DIR/deploy.log (default /home/ec2-user/logs/deploy.log)
+
+[Unit]
+Description=Price Intelligence release install (pull-on-boot, F4)
+Wants=network-online.target
+After=network-online.target
+Before=pi-pipeline.service
+
+[Service]
+Type=oneshot
+User=root
+# Optional (-): without the env file it still runs with the default log folder and no alert.
+EnvironmentFile=-/etc/price-intelligence.env
+ExecStart=/usr/bin/python3 /opt/price-intelligence/pi_deploy.py
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target

@@ -113,14 +113,19 @@ def expected_deploy_trust():
 
 
 def expected_deploy_policy(instance=INSTANCE):
+    """F4 (2026-11-22): the F3 `ec2:CreateTags` grant for the `pi-mode` tag is gone (the deploy-only
+    signal is now `releases/deploy-request.json`); the role reads the pointer and the deploy
+    results, lists only those two prefixes and may describe instances (no resource-level
+    permissions) to refuse a deploy unless the instance is stopped."""
     arn = f"arn:aws:ec2:eu-north-1:{ACCOUNT}:instance/{instance}"
     return {"Version": "2012-10-17", "Statement": [
         {"Sid": "PublishReleases", "Effect": "Allow", "Action": "s3:PutObject", "Resource": f"{BUCKET}/releases/*"},
-        {"Sid": "ReadAndMoveCurrentPointer", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
-         "Resource": f"{BUCKET}/releases/current"},
+        {"Sid": "ReadPointerAndDeployResults", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": [f"{BUCKET}/releases/current", f"{BUCKET}/state/deploys/*"]},
+        {"Sid": "ListPointerAndDeployResults", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": BUCKET,
+         "Condition": {"StringLike": {"s3:prefix": ["releases/current", "state/deploys/*"]}}},
         {"Sid": "StartPiInstance", "Effect": "Allow", "Action": "ec2:StartInstances", "Resource": arn},
-        {"Sid": "SetPiModeTag", "Effect": "Allow", "Action": "ec2:CreateTags", "Resource": arn,
-         "Condition": {"ForAllValues:StringEquals": {"aws:TagKeys": ["pi-mode"]}}},
+        {"Sid": "FindPiInstance", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*"},
     ]}
 
 
@@ -245,6 +250,20 @@ def test_deploy_builders_match_the_spec():
     assert deploy_role.deploy_policy(ACCOUNT, INSTANCE) == expected_deploy_policy()
 
 
+def test_deploy_policy_cannot_tag_delete_stop_or_forge_a_deploy_result():
+    """F4: no CreateTags (pi-mode removed), no DeleteObject, no StopInstances, and PutObject only
+    under releases/ (the instance writes state/deploys/<id>.json; the role must not forge it)."""
+    doc = deploy_role.deploy_policy(ACCOUNT, INSTANCE)
+    actions = {a for st in doc["Statement"] for a in (st["Action"] if isinstance(st["Action"], list)
+                                                       else [st["Action"]])}
+    assert actions == {"s3:PutObject", "s3:GetObject", "s3:ListBucket", "ec2:StartInstances",
+                       "ec2:DescribeInstances"}
+    puts = [st for st in doc["Statement"] if "s3:PutObject" in str(st["Action"])]
+    assert [st["Resource"] for st in puts] == [f"{BUCKET}/releases/*"]
+    assert not hasattr(config, "PI_MODE_TAG_KEY")
+    assert deploy_role.LIST_PREFIXES == ("releases/current", "state/deploys/*")
+
+
 def test_deploy_trust_is_main_only_with_string_equals():
     cond = deploy_role.trust_policy(ACCOUNT)["Statement"][0]["Condition"]
     assert list(cond) == ["StringEquals"]
@@ -287,19 +306,26 @@ def test_documents_are_allow_only_without_wildcard_actions_or_not_elements(name)
 
 @pytest.mark.parametrize("name", ["instance policy", "scheduler policy", "deploy policy"])
 def test_wildcards_only_where_documented(name):
-    """`*` only as the PutMetricData resource (with the namespace condition) and the end of a
-    bucket prefix (data, models, state, logs, releases): never the whole bucket; `?` only in the
-    secret's 6-character random suffix."""
+    """`*` only as the PutMetricData resource (with the namespace condition), as the
+    DescribeInstances resource of the deploy role (F4: no resource-level permissions; read-only)
+    and the end of a bucket prefix (data, models, state, logs, releases, state/deploys): never the
+    whole bucket; `?` only in the secret's 6-character random suffix."""
     secret = f"arn:aws:secretsmanager:eu-north-1:{ACCOUNT}:secret:prod/wayakit-app-??????"
-    allowed = {"*", *(f"{BUCKET}/{p}/*" for p in ("data", "models", "state", "logs", "releases"))}
+    allowed = {"*", *(f"{BUCKET}/{p}/*" for p in ("data", "models", "state", "logs", "releases",
+                                                  "state/deploys"))}
     for st in ALL_DOCS[name]()["Statement"]:
         resources = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
         for r in resources:
             assert "*" not in r or r in allowed, r
             assert "?" not in r or r == secret, r
         if "*" in resources:
-            assert st["Sid"] == "PutPiMetrics"
-            assert st["Condition"] == {"StringEquals": {"cloudwatch:namespace": "PriceIntelligence"}}
+            assert resources == ["*"], st
+            if name == "deploy policy":
+                assert (st["Sid"], st["Action"]) == ("FindPiInstance", "ec2:DescribeInstances")
+                assert "Condition" not in st
+            else:
+                assert st["Sid"] == "PutPiMetrics"
+                assert st["Condition"] == {"StringEquals": {"cloudwatch:namespace": "PriceIntelligence"}}
 
 
 def test_documents_fit_iam_limits_and_are_valid_request_parameters():

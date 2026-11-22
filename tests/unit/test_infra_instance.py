@@ -989,9 +989,11 @@ def _unit():
 def test_service_unit_keys():
     unit = _unit()
     assert unit.sections() == ["Unit", "Service", "Install"]
+    # F4: ordered after pi-deploy.service (After= only, never Requires=/BindsTo=: a failed install
+    # must not block the monthly run, which then uses the release that was already active).
     assert dict(unit["Unit"]) == {
         "Description": "Price Intelligence monthly pipeline (only on the scheduled boot)",
-        "Wants": "network-online.target", "After": "network-online.target"}
+        "Wants": "network-online.target", "After": "network-online.target pi-deploy.service"}
     service = dict(unit["Service"])
     repo = ec2i.REPO_DIR
     assert service == {
@@ -1048,7 +1050,8 @@ def test_sourcing_only_defines_functions():
     assert r.returncode == 0, r.stderr
     functions = set(r.stdout.decode().split())
     assert {"filter_crontab", "env_file_value", "render_env_file", "valid_log_dir",
-            "valid_topic_arn", "valid_model", "main", "remove_old_cron_lines"} <= functions
+            "valid_topic_arn", "valid_model", "main", "remove_old_cron_lines",
+            "ensure_deployer", "ensure_deploy_service"} <= functions
     r = bash_source("true")
     assert r.stdout == b"" and r.stderr == b"", "sourcing must not print or run anything"
 
@@ -1440,6 +1443,7 @@ def _main_snippet(box, *args):
     quoted = " ".join(f"'{a}'" for a in args)
     return (f'REPO_DIR_EXPECTED="{REPO_ROOT}"; ENV_FILE="{box.root}/price-intelligence.env"; '
             f'SERVICE_DST="{box.root}/systemd/pi-pipeline.service"; CONDA_DIR="{box.root}/miniconda"; '
+            f'DEPLOY_SERVICE_DST="{box.root}/systemd/pi-deploy.service"; DEPLOYER_DIR="{box.root}/opt-pi"; '
             f'main --log-dir "{box.root}/logs" {quoted}')
 
 
@@ -1566,3 +1570,109 @@ def test_replace_blocked_reason(state, action, blocked):
     reason = ec2i.replace_blocked_reason(instance, {"action": action})
     assert (reason is not None) == blocked
     assert ec2i.replace_blocked_reason({"State": {"Name": "stopped"}}, None) is None
+
+
+# =============================================================================================
+# bootstrap.sh (F4): the deployer in /opt and pi-deploy.service
+# =============================================================================================
+DEPLOY_UNIT = REPO_ROOT / "infra" / "instance" / "pi-deploy.service"
+DEPLOYER_SRC = REPO_ROOT / "infra" / "instance"
+
+
+def test_bootstrap_f4_constants_match_config():
+    r = bash_source('printf "%s\\n" "$DEPLOY_SERVICE_NAME" "$DEPLOY_SERVICE_DST" "$DEPLOYER_DIR" "$DEPLOYER_FILES"')
+    assert r.stdout.decode().splitlines() == [
+        config.DEPLOY_SERVICE, f"/etc/systemd/system/{config.DEPLOY_SERVICE}", config.INSTANCE_DEPLOYER_DIR,
+        "pi_deploy.py pi_boot_guard.py"]
+    # The unit runs exactly the file bootstrap installs.
+    assert f"/usr/bin/python3 {config.INSTANCE_DEPLOYER_DIR}/pi_deploy.py" in DEPLOY_UNIT.read_text()
+
+
+def _deployer_snippet(box, dry_run=0):
+    return (f'REPO_DIR="{REPO_ROOT}"; DEPLOYER_DIR="{box.root}/opt-pi"; '
+            f'DEPLOY_SERVICE_DST="{box.root}/systemd/pi-deploy.service"; DRY_RUN={dry_run}; ')
+
+
+def test_ensure_deployer_installs_root_0755_dir_and_0644_files_then_is_idempotent(box):
+    opt = box.root / "opt-pi"
+    rc, out, err = box.run(_deployer_snippet(box) + "ensure_deployer")
+    assert rc == 0, err
+    assert box.calls("install") == [
+        f"-d -o root -g root -m 0755 {opt}",
+        f"-o root -g root -m 0644 {DEPLOYER_SRC / 'pi_deploy.py'} {opt / 'pi_deploy.py'}",
+        f"-o root -g root -m 0644 {DEPLOYER_SRC / 'pi_boot_guard.py'} {opt / 'pi_boot_guard.py'}"]
+    for name in ("pi_deploy.py", "pi_boot_guard.py"):
+        assert (opt / name).read_bytes() == (DEPLOYER_SRC / name).read_bytes()
+    box.reset_calls()
+    rc, out, err = box.run(_deployer_snippet(box) + "ensure_deployer")
+    assert rc == 0, err
+    assert box.calls("install") == []
+    assert f"{opt}/pi_deploy.py: up to date." in out and f"{opt}/pi_boot_guard.py: up to date." in out
+    assert box.calls("systemctl") == [], "installing the files never starts anything"
+
+
+def test_ensure_deployer_updates_only_a_file_that_differs(box):
+    opt = box.root / "opt-pi"
+    box.run(_deployer_snippet(box) + "ensure_deployer")
+    (opt / "pi_deploy.py").write_text("# stale\n")
+    box.reset_calls()
+    rc, out, err = box.run(_deployer_snippet(box) + "ensure_deployer")
+    assert rc == 0, err
+    assert box.calls("install") == [f"-o root -g root -m 0644 {DEPLOYER_SRC / 'pi_deploy.py'} {opt / 'pi_deploy.py'}"]
+
+
+def test_ensure_deployer_dry_run_writes_nothing(box):
+    rc, out, err = box.run(_deployer_snippet(box, dry_run=1) + "ensure_deployer")
+    assert rc == 0, err
+    assert box.calls("install") == []
+    assert not (box.root / "opt-pi").exists()
+    assert "[dry-run] would run: install -d -o root -g root -m 0755" in out
+
+
+def test_ensure_deploy_service_installs_and_enables_but_never_starts(box):
+    dst = box.root / "systemd" / "pi-deploy.service"
+    dst.parent.mkdir()
+    rc, out, err = box.run(_deployer_snippet(box) + "ensure_deploy_service")
+    assert rc == 0, err
+    assert dst.read_text() == DEPLOY_UNIT.read_text()
+    assert box.calls("install") == [f"-o root -g root -m 0644 {DEPLOY_UNIT} {dst}"]
+    assert box.calls("systemctl") == ["daemon-reload", "is-enabled --quiet pi-deploy.service",
+                                      "enable pi-deploy.service"]
+    box.reset_calls()
+    rc, out, err = box.run(_deployer_snippet(box) + "ensure_deploy_service")
+    assert rc == 0, err
+    assert box.calls("install") == [] and box.calls("systemctl") == ["is-enabled --quiet pi-deploy.service"]
+    every = " ".join(box.calls("systemctl"))
+    assert "start" not in every and "--now" not in every
+
+
+def test_main_installs_the_deployer_files_before_enabling_its_unit(box):
+    """An enabled pi-deploy.service without /opt/price-intelligence/pi_deploy.py would fail on the
+    next boot: the files go first."""
+    box.crontab.write_text(OLD_CRONTAB)
+    _main_box(box)
+    (box.root / "systemd").mkdir()
+    rc, out, err = box.run(_main_snippet(box, "--skip-chrome", "--skip-conda"))
+    assert rc == 0, out + err
+    calls = box.calls()
+    opt = box.root / "opt-pi"
+    i_files = max(i for i, (n, a) in enumerate(calls) if n == "install" and str(opt) in a)
+    i_enable = next(i for i, (n, a) in enumerate(calls) if n == "systemctl" and a == "enable pi-deploy.service")
+    assert i_files < i_enable
+    assert (opt / "pi_deploy.py").is_file() and (box.root / "systemd" / "pi-deploy.service").is_file()
+    every = " ".join(a for n, a in calls if n == "systemctl")
+    assert " start" not in f" {every}" and "--now" not in every.replace("--now amazon-ssm-agent", "")
+    # Nothing outside the box was touched: every install target is inside it.
+    for name, args in calls:
+        if name == "install":
+            assert str(box.root) in args, args
+
+
+def test_every_step_in_dry_run_changes_nothing_including_the_deployer(box):
+    snippet = (_deployer_snippet(box, dry_run=1) + "ensure_deployer && ensure_deploy_service")
+    rc, out, err = box.run(snippet)
+    assert rc == 0, out + err
+    assert box.calls("install") == []
+    assert set(box.calls("systemctl")) <= {"is-enabled --quiet pi-deploy.service"}
+    assert "[dry-run] would run: systemctl enable pi-deploy.service" in out
+    assert not (box.root / "opt-pi").exists() and not (box.root / "systemd").exists()

@@ -26,11 +26,15 @@ What it checks:
   meaning, not text: each required grant must be allowed, a set of look-alike resources (other
   buckets, including names with PI's bucket name as prefix or suffix, other secrets, including
   one whose name starts with PI's, other topic, other model, other instance) must not be, no
-  wildcard actions, `Resource: "*"` only for `cloudwatch:PutMetricData` (it has no
-  resource-level permissions; it must carry the `cloudwatch:namespace` condition),
-  `ec2:CreateTags` limited to the `pi-mode` tag key, `s3:PutObject`/`s3:DeleteObject` on
+  wildcard actions, `Resource: "*"` only for actions without resource-level permissions
+  (`cloudwatch:PutMetricData` on the instance role, which must carry the `cloudwatch:namespace`
+  condition; `ec2:DescribeInstances` on the deploy role), `s3:PutObject`/`s3:DeleteObject` on
   `releases/` (including `releases/current`) denied to the instance role (it only reads
-  releases). Any action outside the spec is a FAIL. The
+  releases). The deploy role (F4) must be able to write `releases/*`, read only
+  `releases/current` and `state/deploys/*`, list only those two prefixes (`StringLike s3:prefix`
+  condition), start the PI instance and describe instances; it must not delete objects, write
+  `state/` (it cannot forge a deploy result), read archives or data, tag, stop or start another
+  instance, or reach a look-alike bucket. Any action outside the spec is a FAIL. The
   old roles must still exist (rollback).
 - GitHub OIDC provider and the deploy role's trust (only `refs/heads/main`, StringEquals on
   `sub` and `aud`).
@@ -240,6 +244,8 @@ class RoleExpectation:
     conditions: tuple = ()
     aws_managed: frozenset = frozenset()  # AWS-managed policies that must be attached (and no others)
     skipped: tuple = ()  # probes that could not be built (e.g. instance not found)
+    # Lowercase actions this role may grant on `Resource: "*"` (no resource-level permissions).
+    star_resource_actions: frozenset = STAR_RESOURCE_ACTIONS
 
 
 def evaluate_permissions(label, stmts, exp):
@@ -251,7 +257,7 @@ def evaluate_permissions(label, stmts, exp):
     broad = [f"{p.action} on {p.resource}" for p in exp.must_deny if allows(stmts, p.action, p.resource)]
     out.append(_expect(not broad, f"{label} least privilege",
                        f"{len(exp.must_deny)} look-alike resources denied", "also allows " + "; ".join(broad)))
-    problems = broad_grants(stmts)
+    problems = broad_grants(stmts, exp.star_resource_actions)
     out.append(_expect(not problems, f"{label} wildcards", "no wildcard actions or broad resources",
                        "; ".join(problems)))
     extra = sorted(granted_actions(stmts) - {a.lower() for a in exp.expected_actions})
@@ -353,34 +359,61 @@ def scheduler_role_expectation(account, instance_id=None):
                            skipped=tuple(skipped))
 
 
+# The deploy role may only grant DescribeInstances on `Resource: "*"` (no resource-level permissions).
+DEPLOY_STAR_RESOURCE_ACTIONS = frozenset({"ec2:describeinstances"})
+
+
 def deploy_role_expectation(account, instance_id=None):
+    """What the deploy role (GitHub Actions, `infra/release.py`) must and must not be allowed to do."""
     current = _object_arn(account, config.RELEASES_CURRENT_KEY)
-    must_allow = [Probe("s3:PutObject", _object_arn(account, f"{config.RELEASES_PREFIX}probe.tar.gz")),
-                  Probe("s3:GetObject", current), Probe("s3:PutObject", current)]
+    result = _object_arn(account, f"{config.DEPLOYS_STATE_PREFIX}probe.json")
+    archive = _object_arn(account, f"{config.RELEASES_PREFIX}probe.tar.gz")
+    must_allow = [
+        *[Probe("s3:PutObject", _object_arn(account, key))
+          for key in (f"{config.RELEASES_PREFIX}probe.tar.gz", f"{config.RELEASES_PREFIX}probe.tar.gz.sha256",
+                      config.RELEASES_CURRENT_KEY, config.RELEASES_PREVIOUS_KEY, config.DEPLOY_REQUEST_KEY)],
+        Probe("s3:GetObject", current),
+        Probe("s3:GetObject", result),
+        Probe("s3:ListBucket", config.bucket_arn(account)),
+        Probe("ec2:DescribeInstances", "*"),
+    ]
     skipped = []
     if instance_id:
-        target = config.instance_arn(account, instance_id)
-        must_allow += [Probe("ec2:StartInstances", target), Probe("ec2:CreateTags", target)]
+        must_allow.append(Probe("ec2:StartInstances", config.instance_arn(account, instance_id)))
     else:
         skipped.append("instance not found")
+    target = config.instance_arn(account, instance_id or OTHER_INSTANCE_ID)
     other = config.instance_arn(account, OTHER_INSTANCE_ID)
     must_deny = [
-        Probe("s3:PutObject", _object_arn(account, f"{config.DATA_PREFIX}probe")),
-        Probe("s3:GetObject", _object_arn(account, f"{config.DATA_PREFIX}probe")),
-        Probe("s3:DeleteObject", current),
-        *[Probe(a, _object_arn(account, key, other)) for other in lookalike_buckets(account)
+        *[Probe(a, _object_arn(account, f"{prefix}probe"))
+          for prefix in DATA_PREFIXES if prefix != config.STATE_PREFIX
+          for a in ("s3:PutObject", "s3:GetObject")],
+        # The instance writes the deploy result: the role reads it but can never forge it.
+        Probe("s3:PutObject", result),
+        Probe("s3:PutObject", _object_arn(account, f"{config.STATE_PREFIX}probe")),
+        Probe("s3:GetObject", _object_arn(account, f"{config.STATE_PREFIX}probe")),
+        Probe("s3:GetObject", archive),
+        Probe("s3:GetObject", _object_arn(account, config.DEPLOY_REQUEST_KEY)),
+        *[Probe("s3:DeleteObject", arn) for arn in (current, archive, result)],
+        *[Probe(a, _object_arn(account, key, bucket)) for bucket in lookalike_buckets(account)
           for a, key in (("s3:PutObject", f"{config.RELEASES_PREFIX}probe"),
-                         ("s3:GetObject", config.RELEASES_CURRENT_KEY))],
+                         ("s3:GetObject", config.RELEASES_CURRENT_KEY),
+                         ("s3:GetObject", f"{config.DEPLOYS_STATE_PREFIX}probe.json"))],
+        *[Probe("s3:ListBucket", f"arn:aws:s3:::{bucket}") for bucket in lookalike_buckets(account)],
         Probe("ec2:StartInstances", other),
-        Probe("ec2:CreateTags", other),
-        Probe("ec2:StopInstances", config.instance_arn(account, instance_id or OTHER_INSTANCE_ID)),
+        Probe("ec2:CreateTags", target),
+        Probe("ec2:StopInstances", target),
+        Probe("ec2:TerminateInstances", target),
+        Probe("iam:PassRole", config.role_arn(account, config.INSTANCE_ROLE)),
     ]
     return RoleExpectation(
         tuple(must_allow), tuple(must_deny),
-        frozenset({"s3:PutObject", "s3:GetObject", "ec2:StartInstances", "ec2:CreateTags"}),
-        conditions=(ConditionRule("ec2:CreateTags", "aws:TagKeys", "ForAllValues:StringEquals",
-                                  frozenset({config.PI_MODE_TAG_KEY})),),
-        skipped=tuple(skipped))
+        frozenset({"s3:PutObject", "s3:GetObject", "s3:ListBucket", "ec2:StartInstances",
+                   "ec2:DescribeInstances"}),
+        conditions=(ConditionRule("s3:ListBucket", "s3:prefix", "StringLike",
+                                  frozenset({config.RELEASES_CURRENT_KEY, f"{config.DEPLOYS_STATE_PREFIX}*"})),),
+        skipped=tuple(skipped),
+        star_resource_actions=DEPLOY_STAR_RESOURCE_ACTIONS)
 
 
 # --- Trust policies (pure) ---------------------------------------------------------------------

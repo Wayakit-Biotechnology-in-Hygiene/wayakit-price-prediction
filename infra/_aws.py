@@ -1,8 +1,11 @@
 """Shared AWS helpers for the `infra/` scripts.
 
 What it provides:
-- `get_session(session=None)`: the injected session (tests) or a boto3 session on the configured
-  profile, always in `eu-north-1`. `client(session, service)` pins the region.
+- `get_session(session=None, *, env_credentials=False)`: the injected session (tests), a boto3
+  session on the configured profile, or (`env_credentials=True`, GitHub Actions) a session on the
+  default credential chain, i.e. the short-lived OIDC credentials `configure-aws-credentials`
+  exports; always in `eu-north-1` and never with the profile `default`. `client(session, service)`
+  pins the region.
 - `account_id(session)`: the account ID from STS (never stored in the repo).
 - Tags: `project_tags`, `to_tag_list`, `tags_to_dict`, `tags_to_add`, `merge_tags`. AWS uses
   two shapes (`Key`/`Value` almost everywhere; `key`/`value` in Bedrock), so every helper
@@ -21,6 +24,7 @@ Importing this module does not call AWS; boto3 and botocore are imported only wh
 import argparse
 import difflib
 import json
+import os
 import re
 import sys
 
@@ -28,11 +32,19 @@ from infra import config
 
 
 # --- Session and account -----------------------------------------------------------------------
-def get_session(session=None):
-    """Return `session` if given (tests inject a fake), else a boto3 session on `config.profile()`
-    in `config.REGION`. Refuses the profile `default`."""
+def get_session(session=None, *, env_credentials=False):
+    """Return `session` if given (tests inject a fake), else a boto3 session in `config.REGION`:
+    on `config.profile()`, or with `env_credentials=True` on boto3's default credential chain (the
+    environment credentials of a GitHub Actions job; no profile is named). Both refuse
+    `AWS_PROFILE=default`: with env credentials boto3 would otherwise pick that profile up."""
     if session is not None:
         return session
+    if env_credentials:
+        if os.environ.get("AWS_PROFILE") == "default":
+            raise SystemExit("Refusing the AWS profile 'default': unset AWS_PROFILE with --env-credentials.")
+        import boto3
+
+        return boto3.Session(region_name=config.REGION)
     name = config.profile()
     if name == "default":
         raise SystemExit("Refusing the AWS profile 'default': use 'wayakit-vdc' (CLAUDE.md).")
@@ -200,10 +212,14 @@ def base_parser(description):
     return parser
 
 
-def profile_line():
+ENV_CREDENTIALS_FLAG = "--env-credentials"  # scripts that accept it pass it to get_session
+
+
+def profile_line(env_credentials=False):
     """First line every script prints: the AWS profile it uses (never the account), so a stale
-    `AWS_PROFILE` in the shell is visible before anything happens."""
-    return f"Profile: {config.profile()}"
+    `AWS_PROFILE` in the shell is visible before anything happens. With env credentials there is
+    no profile: it says so."""
+    return "Profile: environment credentials" if env_credentials else f"Profile: {config.profile()}"
 
 
 # BotoCoreError subclasses that mean "log in again" (expired or missing SSO session, wrong
@@ -216,7 +232,8 @@ _LOGIN_ERRORS = ("NoCredentialsError", "PartialCredentialsError", "CredentialRet
 def cli_main(main, argv=None, **kwargs):
     """Entry point of every script: `if __name__ == "__main__": _aws.cli_main(main)`.
 
-    Prints `profile_line()`, then calls `main(argv, **kwargs)` (`kwargs` lets tests inject a
+    Prints `profile_line()` (`environment credentials` if the arguments carry `--env-credentials`;
+    `argv=None` means `sys.argv[1:]`), then calls `main(argv, **kwargs)` (`kwargs` lets tests inject a
     session) and always ends with SystemExit:
     - `main` returns an int: that is the exit code; any other return value (None, a summary
       dict) means success, code 0.
@@ -229,7 +246,8 @@ def cli_main(main, argv=None, **kwargs):
     """
     from botocore.exceptions import BotoCoreError, ClientError
 
-    print(profile_line())
+    args = sys.argv[1:] if argv is None else argv
+    print(profile_line(env_credentials=ENV_CREDENTIALS_FLAG in args))
     try:
         result = main(argv, **kwargs)
     except ClientError as exc:

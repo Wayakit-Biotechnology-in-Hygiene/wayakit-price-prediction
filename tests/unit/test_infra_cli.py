@@ -1,5 +1,6 @@
 """Unit tests of the shared CLI entry point of the infra scripts, `infra._aws.cli_main` (alias
-`run_cli`), and of its use in every script (F3 review, Important 1).
+`run_cli`), and of its use in every script (F3 review, Important 1; F4: `release.py`, which has a
+subcommand, has its own cases).
 
 Contract (pi-dev, 2026-11-18):
 - prints `Profile: <config.profile()>` first (AWS_PROFILE, else wayakit-vdc), then calls
@@ -22,9 +23,13 @@ before any request.
 from __future__ import annotations
 
 import ast
+import datetime as dt
+import gzip
+import io
 import os
 import subprocess
 import sys
+import tarfile
 
 import boto3
 import pytest
@@ -34,7 +39,7 @@ from botocore.exceptions import (BotoCoreError, ClientError, EndpointConnectionE
                                  UnauthorizedSSOTokenError)
 
 from infra import (_aws, alerts, bedrock_profiles, bucket, check_pi, config, deploy_role, ec2_instance,
-                   instance_role, schedule, scheduler_role)
+                   instance_role, release, schedule, scheduler_role)
 from tests.conftest import REPO_ROOT
 
 pytestmark = pytest.mark.unit
@@ -52,6 +57,9 @@ SCRIPTS = (alerts, bedrock_profiles, bucket, check_pi, deploy_role, ec2_instance
            scheduler_role)
 # The four scripts of Important 1 have no local handler: only cli_main sanitizes their errors.
 NO_LOCAL_HANDLER = (deploy_role, ec2_instance, instance_role, scheduler_role)
+# F4: release.py has a subcommand and required arguments, so it is not in the generic
+# `--dry-run` / apply cases above; it has its own cases below (same guarantees).
+SUBCOMMAND_SCRIPTS = (release,)
 
 
 def _name(module):
@@ -186,7 +194,7 @@ def test_every_infra_script_main_block_is_exactly_cli_main():
             if isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'":
                 found.append(path.stem)
                 assert [ast.unparse(n) for n in node.body] == ["_aws.cli_main(main)"], path.name
-    assert sorted(found) == sorted(_name(m) for m in SCRIPTS)
+    assert sorted(found) == sorted(_name(m) for m in SCRIPTS + SUBCOMMAND_SCRIPTS)
 
 
 @pytest.mark.parametrize("module", SCRIPTS, ids=_name)
@@ -206,6 +214,75 @@ def test_python_dash_m_with_a_missing_profile_exits_1_without_a_traceback(module
     if module not in (alerts, bedrock_profiles):  # those two report it with their own line
         assert r.stderr == ("AWS client error: ProfileNotFound\n"
                             "If the SSO session expired: aws sso login --profile pi-test-missing-profile\n")
+
+
+# --- release.py (F4) through the CLI entry point ---------------------------------------------------
+RELEASE_NOW = dt.datetime(2026, 11, 10, 15, 0, tzinfo=dt.timezone.utc)  # far from the monthly window
+
+
+def _release_argv(tmp_path, *extra):
+    """A valid archive (the local checks pass) so the run reaches AWS."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for name in config.RELEASE_REQUIRED_FILES:
+            data = b"#!/bin/bash\n" if name.endswith(".sh") else b"# x\n"
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    archive = tmp_path / "release.tar.gz"
+    archive.write_bytes(gzip.compress(raw.getvalue(), mtime=0))
+    return ["deploy", "--sha", "a" * 40, "--archive", str(archive), "--request-id", "1-1", *extra]
+
+
+@pytest.mark.parametrize("error", ["client", "token"])
+@pytest.mark.parametrize("fail_sts", [True, False], ids=["on-sts", "after-sts"])
+@pytest.mark.parametrize("extra", [["--dry-run"], [], ["--env-credentials"]], ids=["dry-run", "apply", "env"])
+def test_release_errors_through_the_cli_never_print_the_aws_message(tmp_path, capsys, error, fail_sts, extra):
+    s = HookedSession(fail_sts=fail_sts, error=error)
+    with pytest.raises(SystemExit) as exc:
+        _aws.cli_main(release.main, _release_argv(tmp_path, *extra), session=s, now=RELEASE_NOW,
+                      sleep=lambda _: None)
+    out, err = capsys.readouterr()
+    assert exc.value.code == 1, out + err
+    expected_profile = "environment credentials" if "--env-credentials" in extra else PROFILE
+    assert out.splitlines()[0] == f"Profile: {expected_profile}"
+    assert s.failed == ["GetCallerIdentity" if fail_sts else "DescribeInstances"]
+    _assert_no_leak(out + err)
+    if error == "client":
+        assert err == f"AWS error AccessDenied in {s.failed[0]}\n"
+    else:
+        assert err.startswith("AWS client error: TokenRetrievalError\n")
+    assert "PutObject" not in s.ops and "StartInstances" not in s.ops
+
+
+def test_release_python_dash_m_with_a_missing_profile_exits_1_without_a_traceback():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}
+    env.update(AWS_CONFIG_FILE="/dev/null", AWS_SHARED_CREDENTIALS_FILE="/dev/null",
+               AWS_EC2_METADATA_DISABLED="true", AWS_PROFILE="pi-test-missing-profile",
+               HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+    argv = ["deploy", "--sha", "a" * 40, "--archive", "/nonexistent/release.tar.gz", "--request-id", "1-1",
+            "--dry-run"]
+    r = subprocess.run([sys.executable, "-m", "infra.release", *argv], cwd=REPO_ROOT, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.splitlines()[0] == "Profile: pi-test-missing-profile"
+    assert "Traceback" not in r.stderr, r.stderr
+    assert r.stderr == ("AWS client error: ProfileNotFound\n"
+                        "If the SSO session expired: aws sso login --profile pi-test-missing-profile\n")
+
+
+def test_release_python_dash_m_refuses_the_default_profile_with_env_credentials():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}
+    env.update(AWS_CONFIG_FILE="/dev/null", AWS_SHARED_CREDENTIALS_FILE="/dev/null",
+               AWS_EC2_METADATA_DISABLED="true", AWS_PROFILE="default",
+               HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")
+    argv = ["deploy", "--sha", "a" * 40, "--archive", "/nonexistent/release.tar.gz", "--request-id", "1-1",
+            "--env-credentials"]
+    r = subprocess.run([sys.executable, "-m", "infra.release", *argv], cwd=REPO_ROOT, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.splitlines()[0] == "Profile: environment credentials"
+    assert "Refusing the AWS profile 'default'" in r.stderr and "Traceback" not in r.stderr
 
 
 # --- cli_main itself -----------------------------------------------------------------------------

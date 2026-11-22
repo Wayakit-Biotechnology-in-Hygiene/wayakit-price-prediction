@@ -51,7 +51,7 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 - **F2 (in the code):** relevance with Bedrock instead of Gemini: DeepSeek V3.2 as primary and Claude Haiku 4.5 as fallback, in batches and with the same `RelevanceAgent` interface. Needs the F3 permission to run on the instance.
 - **F3 (applied 2026-11-22; first run 2026-11-26):** a single monthly full run on the last Thursday of each month at 21:50 Mexico City (`run_pipeline.sh` with no arguments: one run, no stages; the keyword review happens outside the run and never blocks it), started by the `price-intelligence-monthly` schedule and gated by a boot guard.
 - **F3 (applied 2026-11-22):** resources in `infra/` (boto3 scripts with `--dry-run`, tag `project=price-intelligence`), state bucket in S3 (`price-intelligence-<account>`; nothing writes to it yet) and SNS failure alerts by email.
-- **Planned (F4):** pull-on-boot CI/CD from `main`: GitHub Actions (OIDC, deploy role from F3) publishes the release to S3 and starts the instance in "deploy only" mode.
+- **F4 (code on branch `f4-cicd`, not rolled out):** pull-on-boot CI/CD from `main`: after CI is green, `.github/workflows/deploy.yml` (OIDC, deploy role) runs `python -m infra.release deploy`, which publishes `releases/<sha>.tar.gz` to S3, moves `releases/current` and starts the instance for a deploy-only boot; `pi-deploy.service` installs the release in its own folder, switches the symlink atomically and powers off. Rollback: run the workflow by hand with a `sha`. Refused inside the monthly window or while the instance is not stopped. Steps: [docs/runbook.md](docs/runbook.md), *Deploy and rollback*.
 - **F2 (in the code):** safe upload to Odoo (`create` of the new batch and then `unlink` of the previous one), with `--dry-run` and a company guard.
 
 ## Structure
@@ -68,11 +68,11 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 | `pi_secrets.py` | The only reader of the `prod/wayakit-app` secret (`get_secret()`, `get_odoo_credentials()`), since F2 |
 | `pi_odoo.py` | Shared Odoo XML-RPC session (`connect()`, `OdooSession`, `get_single_company()`), since F2 |
 | `requirements.txt` | Dependencies, without pinned versions |
-| `infra/` | F3 boto3 scripts (one per resource; `config.py` and `_aws.py` shared; `check_pi.py` read-only check) and `infra/instance/` (`bootstrap.sh`, `pi-pipeline.service`, `pi_boot_guard.py`). Written and tested with fakes, not applied yet |
+| `infra/` | F3 boto3 scripts (one per resource; `config.py` and `_aws.py` shared; `check_pi.py` read-only check), `release.py` (F4: publishes a release and runs the deploy-only boot) and `infra/instance/` (`bootstrap.sh`, `pi-pipeline.service`, `pi_boot_guard.py`; F4: `pi-deploy.service`, `pi_deploy.py`). Tested with fakes only |
 | `tests/` | Tests without network: `unit/`, `property/` (Hypothesis), `e2e/` (ML stages and `run_pipeline.sh` in a temporary copy) and `differential/` (base branch against the new version). Run with `scripts/verify.sh quick\|full` |
 | `scripts/` | `verify.sh`, `install_githooks.sh` (`commit-msg` hook for the `Verified:` stamp) and the Claude Code hooks (`hooks/`) |
 | `.claude/` | Development team agents (`pi-dev`, `pi-tester`, `pi-reviewer`), skills `team` and `verify`, and `settings.json` with the hooks |
-| `.github/workflows/` | Planned (F4): `ci.yml` and `deploy.yml` |
+| `.github/workflows/` | F4: `deploy.yml` (deploy after `CI` on `main`, manual rollback); `ci.yml` (the checks) |
 
 ## Sources
 
