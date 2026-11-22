@@ -1,0 +1,121 @@
+# Price Intelligence CI (F4). A check: it gates merges, so it is changed only in a checks-only PR
+# (REVIEW.md, rule 8). The deploy workflow (deploy.yml) starts only after this workflow, named
+# "CI", succeeds on a push to main.
+#
+# What it runs (no network to AWS, Odoo, Apify or Bedrock; no secrets):
+# - lint: `bash -n` and ShellCheck (errors only) on every tracked shell script; py_compile of every
+#   tracked Python file with Python 3.10 (the conda env) and of infra/instance/*.py with Python 3.9
+#   (the system python3 of Amazon Linux 2023 runs them before conda).
+# - secrets: gitleaks on the tracked files and, in a pull request, on the commits it adds.
+# - tests: `scripts/verify.sh quick` (unit + property) with the versions pinned in environment.yml.
+#   E2E and differential tests need data/f1_before_2026-11-15/ (never in git), so `full` stays a
+#   local, mandatory step before every commit (verify skill); CI cannot replace it.
+#
+# Actions are pinned to commit SHAs (the tag is in the comment). The gitleaks binary is checked
+# against its published sha256.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, server-improvement]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: |
+            3.9
+            3.10
+      - name: bash -n and ShellCheck (errors)
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files '*.sh')
+          for f in "${scripts[@]}"; do bash -n "$f"; done
+          shellcheck --version | head -n 2
+          shellcheck --severity=error "${scripts[@]}"
+      - name: py_compile (3.10 everything, 3.9 instance scripts)
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          git ls-files -z '*.py' | xargs -0 python3.10 -c 'import py_compile, sys; [py_compile.compile(f, doraise=True, cfile="/dev/null") for f in sys.argv[1:]]'
+          git ls-files -z 'infra/instance/*.py' | xargs -0 --no-run-if-empty python3.9 -c 'import py_compile, sys; [py_compile.compile(f, doraise=True, cfile="/dev/null") for f in sys.argv[1:]]'
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (sha256 checked)
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+      - name: Scan the tracked files
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/tree"
+          git archive --format=tar HEAD | tar -x -C "$RUNNER_TEMP/tree"
+          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/tree" --redact --no-banner --exit-code 1
+      - name: Scan the commits of the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/gitleaks" git . --log-opts="${BASE_SHA}..${HEAD_SHA}" --redact --no-banner --exit-code 1
+
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+      - name: Install the pinned environment
+        run: |
+          set -euo pipefail
+          # The pip pins of environment.yml (the instance versions), then the test tools.
+          python - <<'EOF' > "$RUNNER_TEMP/requirements-ci.txt"
+          import re
+          for line in open("environment.yml", encoding="utf-8"):
+              m = re.match(r"^\s+-\s+([A-Za-z0-9_.-]+==[A-Za-z0-9_.+-]+)\s*$", line)
+              if m:
+                  print(m.group(1))
+          EOF
+          test -s "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install --disable-pip-version-check -r "$RUNNER_TEMP/requirements-ci.txt" -r requirements-dev.txt
+      - name: scripts/verify.sh quick
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          PI_PYTHON="$(command -v python)" scripts/verify.sh quick
