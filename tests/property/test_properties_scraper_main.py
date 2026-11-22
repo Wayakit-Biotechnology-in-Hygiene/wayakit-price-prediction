@@ -7,6 +7,8 @@
 - C08: `build_row_data` always has exactly `config.CSV_COLUMNS` and round-trips through
   `csv.DictWriter` (default `extrasaction='raise'`) and `csv.DictReader`, for any text: NUL is
   stripped (`strip_nul`, idempotent, identity on text without NUL).
+- F6: a product without Seller / Origin (Mumzworld, SACO, B2B) gets seller '' and origin 'unknown',
+  and Seller / Origin never change the 13 original cells.
 - `temp_path_for`: same directory, different from the output, still a `.csv` when the output is.
 """
 from __future__ import annotations
@@ -73,10 +75,13 @@ any_text = st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_siz
 cell = st.one_of(st.none(), any_text, st.integers(-10**6, 10**6),
                  st.floats(allow_nan=False, allow_infinity=False))
 product = st.fixed_dictionaries({}, optional={k: cell for k in (
-    "Product", "Price_SAR", "Company", "URL", "Unit of measurement", "Total quantity", "Extra key")})
+    "Product", "Price_SAR", "Company", "URL", "Unit of measurement", "Total quantity", "Seller", "Origin",
+    "Extra key")})
+PRE_F6_COLUMNS = ["date", "industry", "subindustry", "type_of_product", "generic_product_type", "product",
+                  "price_sar", "company", "source", "url", "unit_of_measurement", "total_quantity", "channel"]
 
 
-@given(product, any_text, any_text, st.sampled_from(["amazon", "mumzworld", "saco"]))
+@given(product, any_text, any_text, st.sampled_from(["amazon", "noon", "mumzworld", "saco"]))
 def test_row_data_round_trips_through_the_csv(prod, sub, top, site):
     row = m.build_row_data(prod, "Industry", sub, top, "Generic", site, m.channel_for(sub), "2026-11-14")
     assert list(row) == m.config.CSV_COLUMNS
@@ -108,3 +113,17 @@ def test_temp_path_is_a_sibling(name, ext):
     assert tmp != out
     if out.endswith(".csv"):
         assert tmp.endswith(".csv")
+
+
+@given(product, st.one_of(st.none(), any_text), st.sampled_from([None, "", "local", "imported", "unknown"]),
+       any_text, st.sampled_from(["amazon", "noon", "mumzworld", "saco", "fine", "aerosense"]))
+def test_seller_and_origin_are_inert_for_the_original_cells(prod, seller, origin, sub, site):
+    base = {k: v for k, v in prod.items() if k not in ("Seller", "Origin")}
+    args = ("Industry", sub, "T", "Generic", site, m.channel_for(sub), "2026-11-22")
+    without = m.build_row_data(base, *args)
+    with_new = m.build_row_data({**base, "Seller": seller, "Origin": origin}, *args)
+    assert (without["seller"], without["origin"]) == ("", "unknown")
+    assert [without[c] for c in PRE_F6_COLUMNS] == [with_new[c] for c in PRE_F6_COLUMNS]
+    assert with_new["seller"] == ((seller or "").replace("\x00", ""))
+    assert with_new["origin"] == (origin or "unknown")
+    assert list(with_new) == m.config.CSV_COLUMNS == PRE_F6_COLUMNS + ["seller", "origin"]
