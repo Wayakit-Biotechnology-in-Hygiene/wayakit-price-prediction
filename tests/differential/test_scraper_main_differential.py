@@ -5,8 +5,10 @@ and the Mumzworld and SACO rows must not change (ticket A). Both versions run in
 versioned `scraper/analysis-odoo.csv` (read only) with the SAME fake scrapers: each returns a
 deterministic product list per (site, keyword, mode), and one site raises for one keyword, which
 both versions must log and skip. Nothing opens Chrome or calls an AI: the base version gets its
-`RelevanceAgent`, `ChromeDriverManager`, scraper classes and `time` replaced in its globals; the new
-one gets them injected. The date is pinned so both write the same day.
+`RelevanceAgent`, `ChromeDriverManager`, scraper classes and `time` replaced in its globals when it
+has the pre-F2 shape (e.g. 8c278ca), or injected through `main(argv, ...)` when it has the F2 shape
+(e.g. the base after the F3 cutover); the new one gets them injected. The date is pinned so both
+write the same day.
 
 The base version (`PI_BASE_REF`, default `origin/server-improvement`) is read with `git show`; if
 the ref does not exist locally the test FAILS (`git fetch origin`).
@@ -15,6 +17,8 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.util
+import re
 import runpy
 import subprocess
 import sys
@@ -80,10 +84,30 @@ def _base_main_source() -> str:
 
 def _run_base(tmp: Path, out: Path) -> None:
     new = load_module("scraper/main.py")  # puts scraper/ on sys.path and loads config, scrapers, ai_service
+    source = _base_main_source()
     script = tmp / "base" / "scraper" / "main.py"
     script.parent.mkdir(parents=True)
-    script.write_text(_base_main_source(), encoding="utf-8")
+    script.write_text(source, encoding="utf-8")
     saved = list(sys.path)
+    if re.search(r"^def main\(argv", source, re.MULTILINE):
+        # F2 shape and later (e.g. the base after the F3 cutover): importing has no side effects and
+        # `main(argv, ...)` takes the fakes, exactly like the new version.
+        try:
+            spec = importlib.util.spec_from_file_location("pi_base_scraper_main", script)
+            base = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(base)
+            assert base.config.CSV_COLUMNS == new.config.CSV_COLUMNS
+            with mock.patch.object(base, "time", FAKE_TIME):
+                code = base.main(["--analysis_file", str(ANALYSIS), "--output_mode", "overwrite",
+                                  "--output_file", str(out), "--coverage_file", str(tmp / "base_coverage.csv")],
+                                 agent_factory=FakeAgent,
+                                 scraper_factory=lambda d, a: {s: FakeScraper(s) for s in SITES},
+                                 driver_installer=lambda: "/fake/chromedriver", sleep=lambda s: None)
+            assert code == 0, f"base scraper/main.py returned {code!r}"
+        finally:
+            sys.path[:] = saved
+        return
+    # Pre-F2 shape (e.g. 8c278ca): argv is parsed at import time and the collaborators are module globals.
     argv = [str(script), "--analysis_file", str(ANALYSIS), "--output_mode", "overwrite", "--output_file", str(out)]
     try:
         with mock.patch.object(sys, "argv", argv):
