@@ -62,7 +62,7 @@ Found by `pi-tester` while writing the unit and property tests for the current c
 | 3 | Thousands separator | `'Shampoo 1,000 ml'` → quantity 0.0 (the regex takes only "000") | `scraper/utils.py:3` | F7 (F6 regression) |
 | 4 | Decimal without leading zero | `'Bleach .5 L'` → quantity 5.0 (5 L instead of 0.5 L) | `scraper/utils.py:3` | F7 (F6 regression) |
 | 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7 (small fixes) |
-| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7, directly for Pets** (small n per type; "robust trimming when n is small") and F5 (count how many Pets types are affected) |
+| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7, directly for Pets** (small n per type; "robust trimming when n is small"); in Pets (F5), **2 types are emptied** (1 of 19 volumetric and 1 of 3 unit), neither with a Wayakit SKU |
 | 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7 (and the SKU cleanup in section 7.3) |
 | 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7 (small fixes, C18) |
 | 9 | **Possible bug (confirm with Mafer):** the concentration "3X" is taken as 3 pieces | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | F7, depending on question 12 |
@@ -182,7 +182,7 @@ Original plan:
   - a deliberately broken deploy does not change `current`;
   - rollback to a previous SHA works.
 
-### F5 · Pets diagnosis (1 day), in parallel with F3/F4
+### F5 · Pets diagnosis (1 day), in parallel with F3/F4 — **done on 2026-11-22** ([f5-pets-diagnosis.md](f5-pets-diagnosis.md))
 
 With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pets rows from scraping, so Pets is explained almost entirely by `competitor_products_from_odoo.csv`), for each Pets product type:
 - n before and after trimming;
