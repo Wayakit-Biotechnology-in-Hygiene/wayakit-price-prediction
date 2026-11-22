@@ -546,8 +546,8 @@ A release whose `environment.yml` differs from the installed one is **refused** 
 Every step needs Mafer's OK. **Never on the last Thursday of the month, nor while a run may be in progress** (the first monthly run is Thursday 2026-11-26 and can last into Saturday): do it after that run has finished and the instance is stopped.
 
 1. (lead) Merge `f4-cicd` into `server-improvement` through its PR, with the `CI` workflow (`.github/workflows/ci.yml`, named `CI`; the Deploy workflow listens to that name) in place.
-2. Deploy role: `python -m infra.deploy_role --dry-run`, then the apply. It replaces the inline policy (removes `ec2:CreateTags`; adds `ListBucket` with the prefix condition, `GetObject` on `state/deploys/*`, `DescribeInstances`). Then `python -m infra.check_pi --only iam oidc`: no FAIL.
-3. GitHub secret `PI_DEPLOY_ROLE_ARN` (repository secret), set without printing the ARN (it contains the account):
+2. **Done 2026-11-22.** Deploy role: `python -m infra.deploy_role --dry-run`, then the apply. It replaces the inline policy (removes `ec2:CreateTags`; adds `ListBucket` with the prefix condition, `GetObject` on `state/deploys/*`, `DescribeInstances`). Then `python -m infra.check_pi --only iam oidc`: no FAIL.
+3. **Done 2026-11-22.** GitHub secret `PI_DEPLOY_ROLE_ARN` (repository secret), set without printing the ARN (it contains the account). Without the `gh` CLI: copy it with `aws iam get-role --role-name price-intelligence-deploy --query Role.Arn --output text --profile wayakit-vdc | tr -d '\n' | pbcopy`, paste it in GitHub (Settings → Secrets and variables → Actions → New repository secret) and clear the clipboard with `pbcopy < /dev/null`. With `gh`:
    ```bash
    aws iam get-role --role-name price-intelligence-deploy --query Role.Arn --output text --profile wayakit-vdc \
      | gh secret set PI_DEPLOY_ROLE_ARN --repo Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction
