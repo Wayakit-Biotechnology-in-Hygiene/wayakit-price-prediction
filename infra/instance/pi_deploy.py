@@ -6,9 +6,10 @@ boot, before `pi-pipeline.service`):
 - `/home/ec2-user/wayakit-price-prediction` (APP_LINK, the fixed path of `pi-pipeline.service`)
   is a symlink to `/home/ec2-user/pi-releases/<sha>`, the release named by the S3 pointer
   `releases/current` (40 lowercase hex). The archive `releases/<sha>.tar.gz` is checked against
-  `releases/<sha>.tar.gz.sha256`, unpacked safely (regular files, directories and in-tree
-  symlinks only), must hold RELEASE_REQUIRED_FILES and pass `bash -n run_pipeline.sh`, gets a
-  `.release` file with the sha and is owned by ec2-user. The switch is one `rename(2)` of a new
+  `releases/<sha>.tar.gz.sha256`, unpacked safely (regular files, directories and symlinks
+  without `..` or absolute targets only), must hold RELEASE_REQUIRED_FILES, pass
+  `bash -n run_pipeline.sh` and its own pi_deploy.py must start (`--help`) under the system
+  python3; then it gets a `.release` file with the sha and is owned by ec2-user. The switch is one `rename(2)` of a new
   symlink onto APP_LINK: on any failure before it, APP_LINK is never touched.
 - Legacy migration (first F4 install): if APP_LINK is a real directory (the old git checkout), it
   is renamed to `/home/ec2-user/wayakit-price-prediction.pre-f4` right before the switch (it
@@ -58,7 +59,9 @@ stay equal to their `infra.config` counterparts (a unit test checks them).
 Exit codes: 0 ok (installed, already active, no pointer yet on a normal boot, dry-run);
 1 failed (any error, including bad arguments). Every failure leaves APP_LINK as it was, except a
 failed sync of the system files, which happens after the switch (the result is "failed", so
-`release.py` restores the pointer and the next boot switches back).
+`release.py` restores the pointer and the next boot switches back). A failed prune of old
+releases, also after the switch, does not undo a good release: the result stays "ok", it alerts
+and exits 1.
 
 Cost: S3 GETs of a few hundred KB per installed release.
 
@@ -131,6 +134,7 @@ CONDA_BIN = "/home/ec2-user/miniconda/bin/conda"  # bootstrap.sh CONDA_DIR
 LEGACY_SUFFIX = ".pre-f4"
 RELEASE_MARKER = ".release"
 LOCK_FILE = ".deploy.lock"
+SYSTEM_PYTHON = "/usr/bin/python3"  # the interpreter of pi-deploy.service's ExecStart
 TMP_PREFIX = ".tmp-"
 # (file in the release, destination folder attribute of Paths)
 SYSTEM_FILES = (
@@ -179,6 +183,7 @@ REASON_LEGACY_BACKUP_EXISTS = "legacy backup already exists"
 REASON_SWITCH = "symlink switch failed"
 REASON_SYSTEM_FILES = "system files sync failed"
 REASON_PRUNE = "pruning old releases failed"
+REASON_DEPLOYER = "the release's pi_deploy.py does not run"
 REASON_LOCKED = "another pi_deploy is running"
 REASON_COMMAND = "local command failed"
 REASON_UNEXPECTED = "unexpected error"
@@ -307,12 +312,17 @@ def safe_member_path(name: str) -> str:
 
 def safe_link_target(member_path: str, linkname: str) -> str:
     """Symlink at `member_path` (already normalized) pointing at `linkname` -> the normalized
-    in-tree path it resolves to. Raises UnsafeArchiveError for an empty, absolute or escaping
-    target."""
+    path it resolves to, inside the release. Raises UnsafeArchiveError for an empty or absolute
+    target or one with any `..` component, even one that stays inside: resolving text alone is
+    not enough once links chain (`d1/s -> ..` then `d1/e -> s/..` leaves the release). Without
+    `..` and with no member under a symlink (check_members), every link points at or below its
+    own folder. The repo has no symlinks today."""
     if not isinstance(linkname, str) or not linkname or "\x00" in linkname:
         raise UnsafeArchiveError("empty symlink target")
     if linkname.startswith("/"):
         raise UnsafeArchiveError("absolute symlink target")
+    if ".." in linkname.split("/"):
+        raise UnsafeArchiveError("symlink target with '..'")
     resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member_path), linkname))
     if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
         raise UnsafeArchiveError("symlink target outside the release")
@@ -589,6 +599,27 @@ def validate_release(folder: Path, runner) -> None:
     if proc.returncode != 0:
         text = (proc.stderr or "").replace(str(folder) + "/", "")  # the temp folder is noise
         raise DeployError(REASON_BASH_SYNTAX, "bash -n: " + " ".join(text.split())[:300])
+    check_deployer_runs(folder, runner)
+
+
+def check_deployer_runs(folder: Path, runner) -> None:
+    """The release's pi_deploy.py must start under the system python3 before anything switches:
+    once synced to /opt it runs on every boot, and an import that python3 lacks (e.g. 3.9) would
+    break every later deploy. It runs from a temporary copy holding only pi_deploy.py and
+    pi_boot_guard.py, as in /opt. `-E -s -B` rather than `-I`: -I would also drop the script's
+    own folder from sys.path, where pi_boot_guard is imported from."""
+    with tempfile.TemporaryDirectory(prefix="pi-deploy-check-") as scratch:
+        for name in ("pi_deploy.py", "pi_boot_guard.py"):
+            shutil.copyfile(folder / "infra" / "instance" / name, Path(scratch) / name)
+        argv = [SYSTEM_PYTHON, "-E", "-s", "-B", str(Path(scratch) / "pi_deploy.py"), "--help"]
+        try:
+            proc = runner(argv, timeout=60)
+        except (subprocess.TimeoutExpired, OSError):
+            raise DeployError(REASON_DEPLOYER, "pi_deploy.py --help could not run") from None
+    if proc.returncode != 0:
+        lines = (proc.stderr or "").strip().splitlines()
+        raise DeployError(REASON_DEPLOYER, f"pi_deploy.py --help exit {proc.returncode}: "
+                          + (lines[-1][:200] if lines else "no output"))
 
 
 def install_release(sha: str, store, paths: Paths, runner, log) -> Path:
@@ -731,11 +762,15 @@ def sync_system_files(release: Path, paths: Paths, runner, log, dry_run: bool = 
 
 
 def prune(paths: Paths, current: str, previous, log) -> list:
+    """Delete the releases releases_to_prune() names. Raises DeployError(REASON_PRUNE)."""
     mtimes = {}
-    for entry in paths.releases_dir.iterdir():
-        if is_sha(entry.name) and entry.is_dir() and not entry.is_symlink():
-            marker = entry / RELEASE_MARKER
-            mtimes[entry.name] = (marker if marker.is_file() else entry).stat().st_mtime
+    try:
+        for entry in paths.releases_dir.iterdir():
+            if is_sha(entry.name) and entry.is_dir() and not entry.is_symlink():
+                marker = entry / RELEASE_MARKER
+                mtimes[entry.name] = (marker if marker.is_file() else entry).stat().st_mtime
+    except OSError as exc:
+        raise DeployError(REASON_PRUNE, f"listing releases failed ({exc.strerror})") from None
     doomed = releases_to_prune(mtimes, current, previous)
     for name in doomed:
         try:
@@ -746,9 +781,25 @@ def prune(paths: Paths, current: str, previous, log) -> list:
     return doomed
 
 
-def send_alert(runner, topic_arn: str, reason: str, sha, log) -> bool:
+def prune_best_effort(paths: Paths, current: str, previous, log, out) -> None:
+    """A prune failure comes after a good switch: rolling back a working release for it would be
+    worse. It is logged, kept in `out.prune_error` (main alerts and exits 1) and the result stays
+    ok."""
+    try:
+        prune(paths, current, previous, log)
+    except DeployError as exc:
+        out.prune_error = exc.detail
+        log(f"ERROR: {REASON_PRUNE}: {exc.detail} (release {current[:12]} stays active)")
+
+
+ALERT_INSTALL_FAILED = "release install on the instance failed"
+ALERT_PRUNE_FAILED = "old releases could not be pruned on the instance (the new release is active)"
+
+
+def send_alert(runner, topic_arn: str, reason: str, sha, log,
+               headline: str = ALERT_INSTALL_FAILED) -> bool:
     """Best effort: a failed publish is logged and does not change the exit code."""
-    message = f"Price Intelligence: release install on the instance failed: {reason}"
+    message = f"Price Intelligence: {headline}: {reason}"
     if sha:
         message += f" (release {sha[:12]})"
     argv = ["aws", "sns", "publish", "--topic-arn", topic_arn, "--subject",
@@ -764,7 +815,7 @@ def send_alert(runner, topic_arn: str, reason: str, sha, log) -> bool:
         log(f"WARNING: alert not sent (aws sns publish failed (exit {proc.returncode}"
             f"{', ' + code if code else ''}))")
         return False
-    log("failure alert sent")
+    log("alert sent")
     return True
 
 
@@ -776,6 +827,7 @@ class Outcome:
     previous: object = None
     deploy_mode: bool = False
     request: dict = field(default_factory=dict)
+    prune_error: str = ""  # set by prune_best_effort; the result stays ok
 
 
 def with_retries(fn, what: str, log, sleep=time.sleep, attempts: int = READ_ATTEMPTS,
@@ -874,7 +926,7 @@ def _deploy(args, out: Outcome, *, store, now_utc, paths, runner, log, sleep) ->
         out.reason = REASON_ALREADY_CURRENT
         sync_system_files(paths.release(sha), paths, runner, log, dry_run=dry)
         if not dry:
-            prune(paths, sha, None, log)
+            prune_best_effort(paths, sha, None, log, out)
         return
     if dry:
         _dry_run_plan(sha, out.previous, paths, args, log)
@@ -885,8 +937,8 @@ def _deploy(args, out: Outcome, *, store, now_utc, paths, runner, log, sleep) ->
     check_environment(release, paths, args.allow_env_update, runner, log)
     switch_to(release, paths, log)
     sync_system_files(release, paths, runner, log)
-    prune(paths, sha, out.previous, log)
     out.reason = REASON_DEPLOYED
+    prune_best_effort(paths, sha, out.previous, log, out)
     log(f"release {sha[:12]} active (previous: {out.previous[:12] if out.previous else 'none'})")
 
 
@@ -1007,11 +1059,16 @@ def main(argv=None, *, store=None, now=None, paths=None, runner=None, environ=No
         except DeployError as exc:
             log(f"FAILED: result not written: {exc.detail}")
             exit_code = EXIT_FAILED
-    if not ok:
+    if ok and outcome.prune_error:
+        exit_code = EXIT_FAILED  # loud (unit failed, alert) but the release and result stay ok
+    if not ok or outcome.prune_error:
         topic = (environ.get(ENV_ALERTS_TOPIC_ARN) or "").strip()
         if topic:
             log.redact.append(topic)
-            send_alert(runner, topic, outcome.reason, outcome.sha, log)
+            if ok:
+                send_alert(runner, topic, REASON_PRUNE, outcome.sha, log, headline=ALERT_PRUNE_FAILED)
+            else:
+                send_alert(runner, topic, outcome.reason, outcome.sha, log)
         else:
             log(f"no alert: {ENV_ALERTS_TOPIC_ARN} is not set")
     if outcome.deploy_mode:

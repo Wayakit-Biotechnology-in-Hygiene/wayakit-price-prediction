@@ -107,8 +107,9 @@ class FakeStore:
 
 
 class FakeRunner:
-    """Records argv lists. Only `/bin/bash -n` really runs. `fail` = set of argv prefixes (tuples)
-    that exit 1; `pipeline_active` answers `systemctl is-active`."""
+    """Records argv lists. Only `/bin/bash -n` and the deployer check (`/usr/bin/python3 -E -s -B
+    <copy>/pi_deploy.py --help`, run with this interpreter: no side effects) really run. `fail` =
+    set of argv prefixes (tuples) that exit 1; `pipeline_active` answers `systemctl is-active`."""
 
     def __init__(self, *, fail=(), pipeline_active=False, on_call=None):
         self.calls = []
@@ -124,6 +125,10 @@ class FakeRunner:
             self.on_call(argv)
         if argv[:2] == ["/bin/bash", "-n"]:
             return subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                                  env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        if argv[0] == pd.SYSTEM_PYTHON and argv[-1] == "--help" and not any(
+                tuple(argv[:len(f)]) == f for f in self.fail):
+            return subprocess.run([sys.executable, *argv[1:]], capture_output=True, text=True, timeout=60,
                                   env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
         rc = 0
         if argv[:3] == ["systemctl", "is-active", "--quiet"]:
@@ -485,6 +490,9 @@ UNSAFE = {
     "nested-dotdot": _member("infra/../../evil", tarfile.REGTYPE),
     "symlink-absolute": _member("link", tarfile.SYMTYPE, "/etc/passwd"),
     "symlink-escape": _member("infra/link", tarfile.SYMTYPE, "../../outside"),
+    # Round 2: any ".." in a link target is rejected, even one that stays inside the release.
+    "symlink-dotdot-inside": _member("docs/link-to-readme", tarfile.SYMTYPE, "../README.md"),
+    "symlink-chain": None,  # built below: d1/s -> .. then d1/e -> s/.. (escapes on disk)
     "hardlink": _member("hard", tarfile.LNKTYPE, "run_pipeline.sh"),
     "fifo": _member("fifo", tarfile.FIFOTYPE),
     "char-device": _member("dev", tarfile.CHRTYPE),
@@ -499,6 +507,9 @@ UNSAFE = {
 def test_unsafe_archive_members_are_rejected_and_nothing_is_written(tmp_path, case):
     if case == "file-under-symlink":
         members = [_member("sub", tarfile.SYMTYPE, "infra"), _member("sub/x", tarfile.REGTYPE)]
+    elif case == "symlink-chain":
+        members = [_member("d1", tarfile.DIRTYPE), _member("d1/s", tarfile.SYMTYPE, ".."),
+                   _member("d1/e", tarfile.SYMTYPE, "s/..")]
     else:
         members = [UNSAFE[case]]
     store = FakeStore()
@@ -509,14 +520,17 @@ def test_unsafe_archive_members_are_rejected_and_nothing_is_written(tmp_path, ca
     assert not Path("/tmp/pi-evil").exists()
 
 
-def test_in_tree_symlinks_are_allowed(tmp_path):
-    members = [_member("docs/link-to-readme", tarfile.SYMTYPE, "../README.md")]
+def test_in_tree_symlinks_without_dotdot_are_allowed(tmp_path):
+    """Round 2: links may only point at or below their own folder (no "..", not absolute)."""
+    members = [_member("readme-link", tarfile.SYMTYPE, "README.md"),
+               _member("ml_model/same", tarfile.SYMTYPE, "./1a_preprocess_data.py")]
     store = FakeStore()
     publish(store, archive=tar_gz(release_files(), members))
     rc, paths, *_ = run(tmp_path, store)
     assert rc == 0
-    link = paths.releases_dir / SHA / "docs" / "link-to-readme"
-    assert link.is_symlink() and os.readlink(link) == "../README.md"
+    root = paths.releases_dir / SHA
+    assert (root / "readme-link").is_symlink() and os.readlink(root / "readme-link") == "README.md"
+    assert (root / "ml_model" / "same").read_bytes() == release_files()["ml_model/1a_preprocess_data.py"]
 
 
 @pytest.mark.parametrize("content", [b"not gzip", gzip.compress(b"not a tar", mtime=0), b""])
@@ -1156,12 +1170,11 @@ def test_new_folders_are_given_to_ec2_user(tmp_path):
     assert str(paths.releases_dir) in owned and str(paths.log_dir) in owned
 
 
-def test_a_release_whose_deployer_does_not_compile_fails_after_the_switch(tmp_path):
-    """Documented: the system files are synced after the switch; a broken pi_deploy.py fails the
-    deploy (release.py then moves the pointer back and the next boot switches back) and the
-    deployer in /opt is left as it was."""
+def test_a_release_whose_deployer_does_not_compile_is_refused_before_the_switch(tmp_path):
+    """Round 2: the deployer --help check (before the switch) now catches what the post-switch
+    compile used to catch; /opt and APP_LINK stay as they were."""
     paths = make_paths(tmp_path)
-    install_active(paths, OLD)
+    old = install_active(paths, OLD)
     paths.deployer_dir.mkdir(parents=True)
     (paths.deployer_dir / "pi_deploy.py").write_bytes(SYSTEM_FILES["infra/instance/pi_deploy.py"])
     store = FakeStore()
@@ -1169,8 +1182,25 @@ def test_a_release_whose_deployer_does_not_compile_fails_after_the_switch(tmp_pa
     request(store)
     rc, _, runner, _ = run(tmp_path, store, paths=paths)
     assert rc == 1
-    assert store.result()["reason"] == pd.REASON_SYSTEM_FILES
+    assert store.result()["reason"] == pd.REASON_DEPLOYER
+    assert_untouched(paths, old)
     assert (paths.deployer_dir / "pi_deploy.py").read_bytes() == SYSTEM_FILES["infra/instance/pi_deploy.py"]
+    assert runner.powered_off
+
+
+def test_system_files_sync_failure_after_the_switch_is_a_failed_result(tmp_path):
+    """Documented: the system files are synced after the switch; a failure there (here
+    daemon-reload) fails the deploy, so release.py moves the pointer back and the next boot
+    switches back."""
+    paths = make_paths(tmp_path)
+    install_active(paths, OLD)
+    store = FakeStore()
+    publish(store)
+    request(store)
+    rc, _, runner, _ = run(tmp_path, store, paths=paths, runner=FakeRunner(fail=[("systemctl", "daemon-reload")]))
+    assert rc == 1
+    assert store.result()["result"] == "failed" and store.result()["reason"] == pd.REASON_SYSTEM_FILES
+    assert target(paths) == paths.releases_dir / SHA
     assert runner.powered_off
 
 
@@ -1398,3 +1428,128 @@ def test_with_retries_only_retries_store_errors():
     assert sleeps == []
     assert pd.with_retries(lambda: False, "w", log.append, sleeps.append) is False  # "not found" is a value
     assert sleeps == []
+
+
+# =============================================================================================
+# Round 2 (lead review): the new deployer must start before the switch; prune is best effort
+# =============================================================================================
+def test_the_release_deployer_is_started_from_a_copy_before_the_switch(tmp_path):
+    paths = make_paths(tmp_path)
+    old = install_active(paths, OLD)
+    seen = []
+
+    def on_call(argv):
+        if argv[0] == pd.SYSTEM_PYTHON:
+            copy = Path(argv[-2]).parent
+            seen.append((argv, sorted(p.name for p in copy.iterdir()), target(paths),
+                         (copy / "pi_deploy.py").read_bytes()))
+
+    store = FakeStore()
+    publish(store)
+    request(store)
+    rc, _, runner, _ = run(tmp_path, store, paths=paths, runner=FakeRunner(on_call=on_call))
+    assert rc == 0
+    assert len(seen) == 1
+    argv, files, active, code = seen[0]
+    assert argv[:4] == ["/usr/bin/python3", "-E", "-s", "-B"] and argv[-1] == "--help" and len(argv) == 6
+    assert pd.SYSTEM_PYTHON == "/usr/bin/python3"
+    assert files == ["pi_boot_guard.py", "pi_deploy.py"], "the copy is laid out like /opt/price-intelligence"
+    assert active == old, "checked while the old release is still active"
+    assert code == SYSTEM_FILES["infra/instance/pi_deploy.py"]
+    assert not Path(argv[-2]).parent.exists(), "the temporary copy is removed"
+    assert not list((paths.releases_dir / SHA).rglob("__pycache__"))
+
+
+@pytest.mark.parametrize("deployer", [
+    pytest.param(b"import module_that_does_not_exist_pi\n", id="missing-import"),
+    pytest.param(b"import pi_boot_guard\nraise SystemExit(3)\n", id="exits-3"),
+    pytest.param(b"x: int = (\n", id="syntax-error"),
+])
+def test_a_release_whose_deployer_does_not_start_keeps_current(tmp_path, deployer):
+    """Really run (with this interpreter): a pi_deploy.py that cannot start would break every
+    later boot once synced to /opt, so the release is refused before the switch."""
+    store = FakeStore()
+    publish(store, files=release_files({"infra/instance/pi_deploy.py": deployer}))
+    rc, paths, runner, old = _failing_deploy(tmp_path, store)
+    _assert_failed(rc, paths, runner, store, old, pd.REASON_DEPLOYER)
+    assert not (paths.deployer_dir / "pi_deploy.py").exists(), "/opt is never touched"
+
+
+def test_deployer_check_that_cannot_run_keeps_current(tmp_path):
+    store = FakeStore()
+    publish(store)
+    rc, paths, runner, old = _failing_deploy(tmp_path, store, runner=FakeRunner(fail=[(pd.SYSTEM_PYTHON,)]))
+    _assert_failed(rc, paths, runner, store, old, pd.REASON_DEPLOYER)
+
+
+def test_a_reused_release_folder_is_checked_again(tmp_path):
+    paths = make_paths(tmp_path)
+    install_active(paths, SHA)
+    install_active(paths, OLD)
+    store = FakeStore({"releases/current": f"{SHA}\n".encode()})
+    rc, _, runner, _ = run(tmp_path, store, paths=paths)
+    assert rc == 0 and target(paths) == paths.releases_dir / SHA
+    assert len(runner.named(pd.SYSTEM_PYTHON)) == 1
+
+
+def _failing_prune(monkeypatch, paths):
+    real = pd._remove
+
+    def remove(path):
+        if pd.is_sha(Path(path).name):
+            raise OSError(13, "Permission denied")
+        return real(path)
+
+    monkeypatch.setattr(pd, "_remove", remove)
+    for i, c in enumerate("0123456"):
+        folder = paths.releases_dir / (c * 40)
+        folder.mkdir(parents=True)
+        (folder / ".release").write_text(c * 40 + "\n")
+        os.utime(folder / ".release", (1_700_000_000 + i, 1_700_000_000 + i))
+
+
+@pytest.mark.parametrize("deploy_mode", [True, False])
+def test_prune_failure_after_a_good_switch_keeps_the_release_and_alerts(tmp_path, monkeypatch, deploy_mode):
+    paths = make_paths(tmp_path)
+    _failing_prune(monkeypatch, paths)
+    store = FakeStore()
+    publish(store)
+    if deploy_mode:
+        request(store)
+    rc, _, runner, _ = run(tmp_path, store, paths=paths, environ={"PI_ALERTS_TOPIC_ARN": TOPIC})
+    assert rc == 1, "loud: the unit fails"
+    assert target(paths) == paths.releases_dir / SHA, "the good release stays active"
+    if deploy_mode:
+        assert store.result()["result"] == "ok" and store.result()["reason"] == pd.REASON_DEPLOYED
+        assert runner.powered_off
+    else:
+        assert store.puts == [] and not runner.powered_off
+    sns = runner.named("aws", "sns", "publish")
+    assert len(sns) == 1
+    message = sns[0][sns[0].index("--message") + 1]
+    assert message == (f"Price Intelligence: {pd.ALERT_PRUNE_FAILED}: {pd.REASON_PRUNE} (release {SHA[:12]})")
+    log = (paths.log_dir / "deploy.log").read_text()
+    assert f"ERROR: {pd.REASON_PRUNE}" in log and "stays active" in log
+
+
+def test_prune_failure_when_already_current_is_also_best_effort(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    _failing_prune(monkeypatch, paths)
+    install_active(paths, SHA)
+    store = FakeStore()
+    publish(store)
+    request(store)
+    rc, _, runner, _ = run(tmp_path, store, paths=paths)
+    assert rc == 1
+    assert store.result()["result"] == "ok" and store.result()["reason"] == pd.REASON_ALREADY_CURRENT
+    assert target(paths) == paths.releases_dir / SHA and runner.powered_off
+
+
+def test_install_failure_alert_headline_is_unchanged(tmp_path):
+    store = FakeStore()
+    publish(store, checksum="0" * 64)
+    request(store)
+    _, _, runner, _ = run(tmp_path, store, environ={"PI_ALERTS_TOPIC_ARN": TOPIC})
+    sns = runner.named("aws", "sns", "publish")
+    assert sns[0][sns[0].index("--message") + 1] == (
+        f"Price Intelligence: release install on the instance failed: {pd.REASON_CHECKSUM} (release {SHA[:12]})")

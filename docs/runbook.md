@@ -480,7 +480,7 @@ python -m infra.check_pi --only schedule iam   # sections: bucket, instance, bed
 1. A change reaches **`main`** (merge of a reviewed PR). The `CI` workflow runs the checks.
 2. If `CI` is green for that push, `.github/workflows/deploy.yml` (`Deploy`) starts. It deploys only if the commit is still the tip of `main` (if a newer push arrived, it prints a notice and stops; the newer run deploys). One deploy at a time (`concurrency: pi-deploy`).
 3. The job builds `git archive <sha> | gzip -n`, gets short-lived AWS credentials for `price-intelligence-deploy` through OIDC (secret `PI_DEPLOY_ROLE_ARN`; no keys) and runs `python -m infra.release deploy --env-credentials --sha <sha> --archive … --request-id <run_id>-<attempt>`, which:
-   - **refuses** (exit 1, nothing written) if the monthly run window is open or opens within 30 minutes (last Thursday of the month, 21:40–23:00 Mexico City), or if the instance is not `stopped` (a run or a maintenance session may be going on);
+   - **refuses** (exit 1, nothing written) on the **whole last Thursday of the month** in Mexico City time (now or 30 minutes from now; the day is reserved for the monthly run: a deploy boot that stayed on would turn the 21:50 start into a no-op and the run would be skipped without an alert), inside or within 30 minutes of the monthly window (21:40–23:00, a second guard), or if the instance is not `stopped` (a run or a maintenance session may be going on);
    - uploads `releases/<sha>.tar.gz` and its `.sha256`, sets `releases/previous` to the old pointer and `releases/current` to the new sha, writes `releases/deploy-request.json` (valid 30 minutes) and starts the instance;
    - waits up to 15 minutes for `state/deploys/<request_id>.json`, written by the instance.
 4. On the instance, `pi-deploy.service` runs on every boot before `pi-pipeline.service`. With a valid request (deploy-only boot) it downloads the release, checks the sha256, the required files and `bash -n run_pipeline.sh`, installs it in `/home/ec2-user/pi-releases/<sha>`, switches the `/home/ec2-user/wayakit-price-prediction` symlink atomically, keeps the last 5 release folders, writes the result and **powers the instance off**. The boot guard keeps the pipeline from running (it is not the window), so a deploy never scrapes or writes to Odoo.
@@ -504,7 +504,10 @@ Read-only check over SSM (instance started by hand, outside the window): `sudo /
 
 - **Fastest (restore a known-good commit):** GitHub → Actions → **Deploy** → *Run workflow*, branch **`main`**, `sha` = the full 40-character commit to go back to (it must be in the history of `main`). The previous sha is in the log of the last successful Deploy run (`releases/current = <new> (was <old>)`) and in `git log`. Same checks and same refusals as a push. The instance reuses `/home/ec2-user/pi-releases/<sha>` if it is still one of the 5 kept; otherwise it downloads the archive again (S3 archives are not pruned).
 - **Then fix forward:** a rollback does not change `main`; the next push to `main` deploys its tip again. If the bad change must not come back, `git revert` it on `main` (PR), which deploys normally.
-- Not inside the monthly window and not while a run may be in progress (the job refuses anyway).
+- Not on the last Thursday of the month and not while a run may be in progress (the job refuses anyway).
+- **A rollback to a commit with another `environment.yml`** than the installed one is refused by the instance (`FAILED: … environment.yml changed`): follow [Changing environment.yml](#changing-environmentyml) with that sha.
+- **A rollback to a pre-F4 commit is refused** (`REFUSED: the archive lacks required files`: it has no `infra/instance/pi_deploy.py` or `pi-deploy.service`). Going back before F4 means undoing the rollout: see *Rolling back the migration* in [F4 rollout (once)](#f4-rollout-once).
+- **Queued runs can be replaced:** deploys run one at a time (`concurrency: pi-deploy`, `cancel-in-progress: false`), but GitHub keeps only **one pending** run per group, so a newer run (e.g. a push to `main`) replaces a rollback that was still waiting. Check that the rollback run actually ran (its log ends with `OK: release <sha> deployed`); if it was cancelled, run it again.
 
 ### When a deploy fails
 
@@ -512,7 +515,8 @@ The job log (and the GitHub notification) says why. The output never shows the a
 
 | Message | Meaning | What to do |
 |---|---|---|
-| `REFUSED: the monthly run window starts within 30 minutes or is open` | Too close to the scheduled run | Re-run the job (Actions, *Re-run jobs*) after 23:00 Mexico City |
+| `REFUSED: the last Thursday of the month is reserved for the monthly run (<date>, America/Mexico_City)` | Deploys are not allowed that day (Mexico City time, including a deploy started after 23:30 on the Wednesday before) | Re-run the job (Actions, *Re-run jobs*) another day; if the run is still going (it can last into Saturday), the instance-state check refuses until it ends |
+| `REFUSED: the monthly run window starts within 30 minutes or is open` | Second guard, same cause (it cannot trigger without the one above) | As above |
 | `REFUSED: instance wayakit-app-server is running, not stopped` (or `pending`, `stopping`) | A run or a maintenance session is in progress | **Do not stop the instance** to make room. Wait until it is stopped (the run shuts it down at the end) and re-run the job |
 | `REFUSED: the archive lacks required files` / `--sha must be …` / `releases/current is malformed` | The build or the pointer is wrong; nothing was written | Fix the cause (a required file deleted on `main`; a pointer edited by hand) and re-run |
 | `FAILED: the instance reported a failed deploy: <reason>` | The instance refused the release (sha256 mismatch, unsafe or incomplete archive, `bash -n` error, `environment.yml` changed, …); the pointer was moved back, the previous release is still active and the instance powered itself off | Read the reason; for `environment.yml changed` see [Changing environment.yml](#changing-environmentyml); otherwise fix on `main` and push again. Details in `deploy.log` (log folder on the instance) |

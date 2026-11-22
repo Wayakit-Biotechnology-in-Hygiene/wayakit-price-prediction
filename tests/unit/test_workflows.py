@@ -71,8 +71,9 @@ def _key_indent(line):
     return _indent(line) + extra
 
 
-def run_blocks(text):
-    """Every `run:` script as (line number, script text), block scalars included."""
+def run_blocks(text, *, with_style=False):
+    """Every `run:` script as (line number, script text), block scalars included. With
+    `with_style`, (line number, script text, style) where style is "|", ">" or "" (inline)."""
     lines = text.splitlines()
     blocks = []
     i = 0
@@ -90,12 +91,22 @@ def run_blocks(text):
             while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > own):
                 body.append(lines[j])
                 j += 1
-            blocks.append((i + 1, "\n".join(body)))
+            blocks.append((i + 1, "\n".join(body), value.strip()[0]))
             i = j
         else:
-            blocks.append((i + 1, value))
+            blocks.append((i + 1, value, ""))
             i += 1
-    return blocks
+    return blocks if with_style else [b[:2] for b in blocks]
+
+
+def commands(text):
+    """Logical shell commands of every `run:` script: folded (`>`) scalars become one line (YAML
+    joins their lines with spaces), backslash continuations are joined, then split on newlines."""
+    out = []
+    for _, body, style in run_blocks(text, with_style=True):
+        body = " ".join(body.split()) if style == ">" else re.sub(r"\\\n\s*", " ", body)
+        out += [" ".join(line.split()) for line in body.splitlines() if line.strip()]
+    return out
 
 
 def block_under(text, key, *, indent=None):
@@ -152,6 +163,12 @@ jobs:
       - run: >-
           echo four
 """
+
+
+def test_commands_folds_and_joins_lines():
+    text = ("jobs:\n  a:\n    steps:\n      - run: >-\n          pip install\n          a==1 b==2\n"
+            "      - run: |\n          set -e\n          pip install c==3 \\\n            d==4\n          echo x\n")
+    assert commands(text) == ["pip install a==1 b==2", "set -e", "pip install c==3 d==4", "echo x"]
 
 
 def test_scanner_finds_inline_and_block_run_scripts():
@@ -323,6 +340,26 @@ def test_deploy_pins_boto_to_the_instance_versions(deploy_text):
     botocore_v = re.search(r"botocore==([\d.]+)", env_yml).group(1)
     scripts = scripts_of(deploy_text)
     assert f"boto3=={boto3_v}" in scripts and f"botocore=={botocore_v}" in scripts
+
+
+def test_every_pip_install_pins_every_package(deploy_text):
+    """Round 2: transitive dependencies are pinned too, so a new release of one of them cannot
+    change what the deploy job runs. Every requirement after `pip install` is `name==version`."""
+    installs = [c.split("pip install", 1)[1] for c in commands(deploy_text) if "pip install" in c]
+    assert installs, "no pip install found"
+    for args in installs:
+        assert not re.search(r"[;&|]", args), args
+        reqs = [a for a in args.split() if not a.startswith("-")]
+        assert reqs, args
+        for req in reqs:
+            assert re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][A-Za-z0-9.]*", req), req
+        names = {r.split("==")[0].lower() for r in reqs}
+        assert {"boto3", "botocore", "s3transfer", "jmespath", "python-dateutil", "urllib3", "six"} <= names
+
+
+def test_deploy_runs_on_a_pinned_runner_image(deploy_text):
+    runs_on = re.findall(r"^\s*runs-on:\s*(\S+)\s*$", deploy_text, re.M)
+    assert runs_on == ["ubuntu-24.04"], runs_on
 
 
 def test_deploy_assumes_the_role_from_a_secret_with_the_account_masked(deploy_text):

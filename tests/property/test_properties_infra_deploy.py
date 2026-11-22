@@ -2,7 +2,9 @@
 
 Rules checked over generated inputs:
 - Archive safety: `safe_member_path` equals an obvious reference, its output is relative,
-  normalized and idempotent; `safe_link_target` never resolves outside the release; any listing
+  normalized and idempotent; `safe_link_target` equals a reference (round 2: no absolute target
+  and no `..` component at all, so chained links cannot escape) and never resolves outside its
+  own folder; any listing
   accepted by `safe_extract` (real tarballs generated from hostile names, links and types) writes
   only inside the destination, and a rejected one writes nothing at all.
 - Prune: never the active or the previous release, only 40-hex names, exactly `keep` left (or all
@@ -12,9 +14,11 @@ Rules checked over generated inputs:
   never) and result object round-trip between the two modules.
 - `parse_request` and `parse_result` never raise and never accept anything that is not a valid
   object for this request.
-- Power-off and the window: `should_power_off` is never True inside the monthly window; any time
-  release.py accepts a deploy (no window minute in [now, now + TTL]) the boot guard keeps the
-  pipeline closed for the whole request lifetime, so a deploy-only boot never runs the pipeline.
+- Power-off and the window: `should_power_off` is never True inside the monthly window; release.py
+  refuses the whole last Thursday (Mexico City local day, round 2) and, as a second guard, any
+  window minute in [now, now + TTL]; any time it accepts a deploy the boot guard keeps the
+  pipeline closed and the local date is not the last Thursday for the whole request lifetime, so a
+  deploy-only boot never runs the pipeline nor overlaps the scheduled start.
 - `release.wait_for_result`: exactly ceil(T*60/15) polls on timeout, and it stops at the first
   result.
 
@@ -91,11 +95,21 @@ def test_safe_member_path_matches_the_reference_and_is_normalized(name):
     assert posixpath.normpath(posixpath.join(base, out)).startswith(base + "/")
 
 
+def ref_link_unsafe(linkname):
+    """Round 2 (lead review): any `..` component is rejected, even one that resolves inside, since
+    text resolution misses chains (`d1/s -> ..` + `d1/e -> s/..`)."""
+    return (not linkname or "\x00" in linkname or linkname.startswith("/")
+            or ".." in linkname.split("/"))
+
+
 @given(names, names)
 @example("a/link", "../b")
 @example("a/link", "../../b")
 @example("link", "./")
-def test_safe_link_target_never_resolves_outside(member, linkname):
+@example("d1/e", "s/..")
+@example("d1/s", "..")
+@example("a/b/link", "c/../d")
+def test_safe_link_target_matches_the_reference_and_stays_inside(member, linkname):
     try:
         path = pd.safe_member_path(member)
     except pd.UnsafeArchiveError:
@@ -103,19 +117,22 @@ def test_safe_link_target_never_resolves_outside(member, linkname):
     try:
         resolved = pd.safe_link_target(path, linkname)
     except pd.UnsafeArchiveError:
-        if linkname and "\x00" not in linkname and not linkname.startswith("/"):
-            ref = posixpath.normpath(posixpath.join(posixpath.dirname(path), linkname))
-            assert ref == ".." or ref.startswith("../"), (path, linkname)
+        assert ref_link_unsafe(linkname), (path, linkname)
         return
+    assert not ref_link_unsafe(linkname), (path, linkname)
+    # Without "..", a link points at or below its own folder.
+    folder = posixpath.dirname(path)
+    assert resolved == folder or not folder or resolved.startswith(folder + "/") or resolved == ".", (path, resolved)
     assert resolved != ".." and not resolved.startswith(("../", "/"))
     assert posixpath.normpath(posixpath.join("/r/e/l", resolved)).startswith("/r/e/l")
 
 
 KINDS = {"file": tarfile.REGTYPE, "dir": tarfile.DIRTYPE, "symlink": tarfile.SYMTYPE,
          "hardlink": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE}
-member_names = st.lists(st.sampled_from(["a", "b", "..", ".", "c.sh"]), min_size=1, max_size=3).map("/".join) | \
+member_names = st.lists(st.sampled_from(["a", "b", "..", ".", "c.sh", "s", "e"]), min_size=1, max_size=3).map("/".join) | \
     st.sampled_from(["/abs", "../up", ".release", "a/../../up"])
-link_targets = st.sampled_from(["b", "../b", "../../out", "/etc", "a/b", ".", "..", "c.sh"])
+link_targets = st.sampled_from(["b", "../b", "../../out", "/etc", "a/b", ".", "..", "c.sh", "s/..", "s/../..",
+                                "./b", "a/./b", "s", "e"])
 hostile_members = st.lists(st.tuples(member_names, st.sampled_from(sorted(KINDS)), link_targets),
                            min_size=1, max_size=6)
 # Mostly-valid listings (git archive output plus in-tree links), so accepted archives are common too.
@@ -151,6 +168,8 @@ def _snapshot(root):
 @example([("a", "symlink", "."), ("a/b", "file", "")])
 @example([("a", "file", ""), ("a", "symlink", "b")])
 @example([("c.sh", "hardlink", "/etc")])
+@example([("a", "dir", ""), ("a/s", "symlink", ".."), ("a/e", "symlink", "s/..")])   # chain (round 2)
+@example([("a", "dir", ""), ("a/s", "symlink", "."), ("a/e", "symlink", "s/s/b")])   # loop, stays inside
 def test_safe_extract_writes_only_inside_dest_or_nothing(entries):
     with tempfile.TemporaryDirectory() as sandbox:
         sandbox = Path(sandbox)
@@ -345,18 +364,59 @@ def test_window_conflict_matches_a_reference(now):
     assert (release.window_conflict(now) is not None) == expected
 
 
+def accepted(now):
+    """What deploy() checks, in its order: the reserved day, then the window (round 2)."""
+    return release.reserved_day(now) is None and release.window_conflict(now) is None
+
+
+# Day boundaries of the 2026-11-26 last Thursday (Mexico City = UTC-6): Wed 23:29:59, Wed 23:30,
+# Thu 00:00, Thu 23:59:59, Fri 00:00 local.
+DAY_EDGES = [datetime(2026, 11, 26, 5, 29, 59, tzinfo=UTC), datetime(2026, 11, 26, 5, 30, tzinfo=UTC),
+             datetime(2026, 11, 26, 6, 0, tzinfo=UTC), datetime(2026, 11, 27, 5, 59, 59, tzinfo=UTC),
+             datetime(2026, 11, 27, 6, 0, tzinfo=UTC)]
+
+
+@given(instants)
+@example(DAY_EDGES[0])
+@example(DAY_EDGES[1])
+@example(DAY_EDGES[2])
+@example(DAY_EDGES[3])
+@example(DAY_EDGES[4])
+def test_reserved_day_matches_a_reference(now):
+    """Round 2: refused iff some instant of [now, now + TTL] has the month's last Thursday as its
+    Mexico City local date. Reference: check every minute and the end (the helper checks the ends)."""
+    tz = ZoneInfo(config.SCHEDULE_TIMEZONE)
+    ttl = config.DEPLOY_REQUEST_TTL_SECONDS
+    moments = [now + timedelta(seconds=x) for x in list(range(0, ttl, 60)) + [ttl]]
+    days = [m.astimezone(tz).date() for m in moments]
+    hit = next((d for d in days if d == last_thursday(d.year, d.month)), None)
+    assert release.reserved_day(now) == hit
+
+
+@given(instants)
+def test_the_window_lies_inside_the_reserved_day(now):
+    """window_conflict is kept as a second guard; whatever it refuses, reserved_day refuses first."""
+    if release.window_conflict(now) is not None:
+        assert release.reserved_day(now) is not None
+
+
 @given(instants)
 @example(EDGES[0])
 @example(EDGES[3])
+@example(DAY_EDGES[0])
+@example(DAY_EDGES[4])
 def test_an_accepted_deploy_never_boots_inside_the_window(now):
-    """If release.py accepts (no conflict), the boot guard says "outside" during the whole request
-    lifetime, so pi-pipeline.service skips ExecStart on that boot, and pi_deploy may power off."""
-    assume(release.window_conflict(now) is None)
+    """If release.py accepts, the boot guard says "outside" and the local date is never the last
+    Thursday during the whole request lifetime, so pi-pipeline.service skips ExecStart on that
+    boot, pi_deploy may power off, and the 21:50 scheduled start always finds the instance stopped."""
+    assume(accepted(now))
     ttl = config.DEPLOY_REQUEST_TTL_SECONDS
     for seconds in range(0, ttl + 1, 30):
         moment = now + timedelta(seconds=seconds)
         assert not guard.is_scheduled_window(moment)
         assert pd.should_power_off(True, moment, False)
+        local = moment.astimezone(ZoneInfo(config.SCHEDULE_TIMEZONE)).date()
+        assert not guard.is_last_thursday(local)
 
 
 @given(instants, st.booleans(), st.booleans())
@@ -374,6 +434,7 @@ def test_every_minute_of_every_window_keeps_the_instance_on(year, month, minute)
     assert guard.is_scheduled_window(moment)
     assert not pd.should_power_off(True, moment, False)
     assert release.window_conflict(moment) is not None
+    assert release.reserved_day(moment) is not None
 
 
 # =============================================================================================

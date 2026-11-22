@@ -506,35 +506,64 @@ def test_refuses_unless_the_instance_is_stopped(archive, capsys, state):
     assert_clean(out + err)
 
 
+# Round 2 (lead review, 2026-11-22): the whole last Thursday (America/Mexico_City local day) is
+# reserved for the monthly run, not just the window and the 30 minutes before it. A deploy boot that
+# hangs that day would leave the instance on and turn the 21:50 StartInstances into a no-op. The
+# old boundaries (30 min before refused, 31 min before and the window end accepted) are replaced by
+# the day boundaries: refused iff now or now + TTL is on that local date.
+# Last Thursday of November 2026 = 2026-11-26; Mexico City is UTC-6 (no DST since 2022).
+DAY_START_UTC = dt.datetime(2026, 11, 26, 6, 0, tzinfo=UTC)   # Thu 00:00 local
+DAY_END_UTC = dt.datetime(2026, 11, 27, 6, 0, tzinfo=UTC)     # Fri 00:00 local (exclusive)
+TTL = dt.timedelta(seconds=config.DEPLOY_REQUEST_TTL_SECONDS)
+
+
 @pytest.mark.parametrize("now", [
     pytest.param(WINDOW_START_UTC, id="window-start"),
-    pytest.param(WINDOW_START_UTC + dt.timedelta(minutes=45), id="inside"),
-    pytest.param(WINDOW_END_UTC - dt.timedelta(seconds=1), id="last-second"),
-    pytest.param(WINDOW_START_UTC - dt.timedelta(minutes=30), id="30-min-before"),
-    pytest.param(WINDOW_START_UTC - dt.timedelta(minutes=1), id="1-min-before"),
-    pytest.param((WINDOW_START_UTC - dt.timedelta(minutes=30)).astimezone(dt.timezone(dt.timedelta(hours=-6))),
-                 id="same-instant-local-offset"),
+    pytest.param(WINDOW_START_UTC + dt.timedelta(minutes=45), id="inside-window"),
+    pytest.param(WINDOW_END_UTC - dt.timedelta(seconds=1), id="window-last-second"),
+    pytest.param(WINDOW_START_UTC - dt.timedelta(minutes=30), id="30-min-before-window"),
+    pytest.param(WINDOW_START_UTC - dt.timedelta(minutes=31), id="31-min-before-window"),
+    pytest.param(WINDOW_END_UTC, id="window-end"),
+    pytest.param(DAY_START_UTC, id="thursday-00:00"),
+    pytest.param(DAY_START_UTC + dt.timedelta(hours=12), id="thursday-noon"),
+    pytest.param(DAY_END_UTC - dt.timedelta(seconds=1), id="thursday-23:59:59"),
+    pytest.param(DAY_START_UTC - TTL, id="wednesday-23:30-ttl-reaches-thursday"),
+    pytest.param((DAY_START_UTC - TTL + dt.timedelta(seconds=1)).astimezone(dt.timezone(dt.timedelta(hours=-6))),
+                 id="same-rule-with-a-local-offset"),
+    pytest.param(dt.datetime(2026, 12, 31, 12, 0, tzinfo=UTC), id="december-last-thursday"),
 ])
-def test_refuses_inside_or_30_minutes_before_the_monthly_window(archive, capsys, now):
+def test_refuses_the_whole_last_thursday_local_day(archive, capsys, now):
     s = StubSession()  # nothing stubbed: any AWS call fails the test
     rc, out, err, _ = run(s, argv(archive), capsys, now=now)
     assert rc == 1
     assert s.ops == []
-    assert err.startswith("REFUSED:") and "window" in err
+    assert err.startswith("REFUSED: the last Thursday of the month is reserved for the monthly run (")
+    assert "America/Mexico_City" in err and "deploy another day" in err
     assert_clean(out + err)
 
 
 @pytest.mark.parametrize("now", [
-    pytest.param(WINDOW_START_UTC - dt.timedelta(minutes=31), id="31-min-before"),
-    pytest.param(WINDOW_END_UTC, id="window-end"),
-    pytest.param(WINDOW_START_UTC - dt.timedelta(days=7), id="previous-thursday"),
+    pytest.param(DAY_START_UTC - TTL - dt.timedelta(seconds=1), id="wednesday-23:29:59"),
+    pytest.param(DAY_END_UTC, id="friday-00:00"),
+    pytest.param(WINDOW_START_UTC - dt.timedelta(days=7), id="previous-thursday-at-the-window-time"),
+    pytest.param(dt.datetime(2026, 11, 19, 6, 0, tzinfo=UTC), id="previous-thursday-00:00"),
 ])
-def test_does_not_refuse_just_outside_the_window(archive, capsys, now):
+def test_does_not_refuse_just_outside_the_reserved_day(archive, capsys, now):
     s = StubSession()
     stub_reads(s)
     rc, out, err, _ = run(s, argv(archive, "--dry-run"), capsys, now=now)
     assert rc == 0, err
     s.verify()
+
+
+def test_reserved_day_helper():
+    assert release.reserved_day(DAY_START_UTC) == dt.date(2026, 11, 26)
+    assert release.reserved_day(DAY_START_UTC - TTL) == dt.date(2026, 11, 26)
+    assert release.reserved_day(DAY_START_UTC - TTL - dt.timedelta(seconds=1)) is None
+    assert release.reserved_day(DAY_END_UTC) is None
+    # The window check stays as a second guard, and the window lies inside the reserved day.
+    assert release.window_conflict(WINDOW_START_UTC - dt.timedelta(minutes=30)) is not None
+    assert release.reserved_day(WINDOW_START_UTC - dt.timedelta(minutes=30)) is not None
 
 
 def test_the_window_used_is_the_boot_guard_one():

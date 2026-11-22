@@ -40,7 +40,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - name: Check out the repository (full history, to verify the commit is on main)
@@ -95,9 +95,12 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install boto3 (same version as the instance)
+      - name: Install boto3 and its dependencies (versions of the instance and the local environment)
         if: steps.resolve.outputs.deploy == 'true'
-        run: python -m pip install --disable-pip-version-check boto3==1.42.83 botocore==1.42.83
+        run: >-
+          python -m pip install --disable-pip-version-check
+          boto3==1.42.83 botocore==1.42.83 s3transfer==0.16.1 jmespath==1.1.0
+          python-dateutil==2.9.0.post0 urllib3==2.8.0 six==1.17.0
 
       - name: Build the release archive
         if: steps.resolve.outputs.deploy == 'true'

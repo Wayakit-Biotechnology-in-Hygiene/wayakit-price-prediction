@@ -18,9 +18,11 @@ What it leaves configured (bucket `price-intelligence-<account>`, eu-north-1):
 
 Steps of `deploy` (every S3 call passes `ExpectedBucketOwner` = the account from STS):
  1. Local checks, no AWS: `--sha` is 40 lowercase hex, `--request-id` is safe for an S3 key,
-    the archive is a gzip tar with the required files; and no minute between now and now + TTL
-    falls in the monthly window (`pi_boot_guard.is_scheduled_window`: last Thursday 21:40-23:00
-    Mexico City), so a deploy boot never collides with the scheduled run.
+    the archive is a gzip tar with the required files; neither now nor now + TTL falls on the last
+    Thursday of the month in Mexico City time (the whole day is reserved for the monthly run: a
+    deploy boot left on would turn the scheduled start into a no-op), and no minute between now
+    and now + TTL falls in the monthly window (`pi_boot_guard.is_scheduled_window`: last Thursday
+    21:40-23:00 Mexico City).
  2. STS `GetCallerIdentity`; the instance by Name tag (`instance_role.find_instance_id`), then
     `DescribeInstances` on its ID: refused unless it is `stopped` (a run or a maintenance session
     may be in progress). Nothing has been written yet.
@@ -59,9 +61,10 @@ import re
 import sys
 import tarfile
 import time
+from zoneinfo import ZoneInfo
 
 from infra import _aws, config
-from infra.instance.pi_boot_guard import is_scheduled_window
+from infra.instance.pi_boot_guard import is_last_thursday, is_scheduled_window
 from infra.instance_role import _info, _redact, find_instance_id
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -113,6 +116,18 @@ def window_conflict(now, ttl_seconds=config.DEPLOY_REQUEST_TTL_SECONDS, tz=confi
         moment = now + i * WINDOW_CHECK_STEP
         if is_scheduled_window(moment, tz):
             return moment
+    return None
+
+
+def reserved_day(now, ttl_seconds=config.DEPLOY_REQUEST_TTL_SECONDS, tz=config.SCHEDULE_TIMEZONE):
+    """Local date (in `tz`) of the last Thursday of the month touched by [now, now + ttl], or None.
+    The whole day is reserved: a deploy boot that hangs early on that day (e.g. S3 unreachable)
+    leaves the instance on, the 21:50 StartInstances is then a no-op and the monthly run would be
+    skipped without any alert. The interval is shorter than a day, so its two ends cover it."""
+    for moment in (now, now + dt.timedelta(seconds=ttl_seconds)):
+        day = moment.astimezone(ZoneInfo(tz)).date()
+        if is_last_thursday(day):
+            return day
     return None
 
 
@@ -263,7 +278,11 @@ def deploy(sess, args, *, now, sleep):
         return _stop("REFUSED", f"cannot use the archive: {exc}")
     if missing:
         return _stop("REFUSED", f"the archive lacks required files: {', '.join(missing)}")
-    conflict = window_conflict(now)
+    day = reserved_day(now)
+    if day is not None:
+        return _stop("REFUSED", f"the last Thursday of the month is reserved for the monthly run ({day:%Y-%m-%d}, "
+                                f"{config.SCHEDULE_TIMEZONE}); deploy another day")
+    conflict = window_conflict(now)  # inside the reserved day; kept as a second, independent guard
     if conflict is not None:
         return _stop("REFUSED", f"the monthly run window starts within {config.DEPLOY_REQUEST_TTL_SECONDS // 60} "
                                 f"minutes or is open ({conflict.astimezone(dt.timezone.utc):%Y-%m-%d %H:%M} UTC is inside it); "
