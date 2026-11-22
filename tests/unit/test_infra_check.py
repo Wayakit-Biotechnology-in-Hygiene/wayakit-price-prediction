@@ -1202,8 +1202,13 @@ def test_instance_bucket_name_wildcards_fail_least_privilege(sid, resource):
 @pytest.mark.parametrize("sid,resource", [
     ("PublishReleases", f"arn:aws:s3:::price-intelligence-*/{config.RELEASES_PREFIX}*"),
     ("PublishReleases", f"arn:aws:s3:::*-{ACCOUNT}/{config.RELEASES_PREFIX}*"),
-    ("ReadAndMoveCurrentPointer", f"arn:aws:s3:::price-intelligence-*/{config.RELEASES_CURRENT_KEY}"),
-    ("ReadAndMoveCurrentPointer", f"arn:aws:s3:::*-{ACCOUNT}/{config.RELEASES_CURRENT_KEY}"),
+    ("ReadPointerAndDeployResults", [f"arn:aws:s3:::price-intelligence-*/{config.RELEASES_CURRENT_KEY}",
+                                     f"{BUCKET_ARN}/{config.DEPLOYS_STATE_PREFIX}*"]),
+    ("ReadPointerAndDeployResults", [f"arn:aws:s3:::*-{ACCOUNT}/{config.RELEASES_CURRENT_KEY}",
+                                     f"{BUCKET_ARN}/{config.DEPLOYS_STATE_PREFIX}*"]),
+    ("ReadPointerAndDeployResults", [f"{BUCKET_ARN}/{config.RELEASES_CURRENT_KEY}",
+                                     f"arn:aws:s3:::*-{ACCOUNT}/{config.DEPLOYS_STATE_PREFIX}*"]),
+    ("ListPointerAndDeployResults", "arn:aws:s3:::price-intelligence-*"),
 ])
 def test_deploy_bucket_name_wildcards_fail_least_privilege(sid, resource):
     policy = _replace_resource(deploy_role.deploy_policy(ACCOUNT, IID), sid, resource)
@@ -1332,11 +1337,33 @@ def test_scheduler_without_instance_skips_the_grant_probe_with_a_warn():
                  {f"{D} least privilege"}, id="put-anywhere-in-bucket"),
     pytest.param(lambda p: _replace_resource(p, "StartPiInstance", f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/*"),
                  {f"{D} least privilege"}, id="start-any-instance"),
-    pytest.param(lambda p: _replace_resource(p, "ReadAndMoveCurrentPointer", f"{BUCKET_ARN}/*"),
+    pytest.param(lambda p: _replace_resource(p, "ReadPointerAndDeployResults", f"{BUCKET_ARN}/*"),
                  {f"{D} least privilege"}, id="read-anything"),
+    pytest.param(lambda p: _replace_resource(p, "ReadPointerAndDeployResults", f"{BUCKET_ARN}/{config.RELEASES_PREFIX}*"),
+                 {f"{D} least privilege", f"{D} required permissions"}, id="read-archives-not-results"),
+    pytest.param(lambda p: _replace_resource(p, "ReadPointerAndDeployResults", f"{BUCKET_ARN}/{config.STATE_PREFIX}*"),
+                 {f"{D} least privilege", f"{D} required permissions"}, id="read-all-state-not-pointer"),
     pytest.param(lambda p: _add(p, {"Effect": "Allow", "Action": "s3:DeleteObject",
                                     "Resource": f"{BUCKET_ARN}/{config.RELEASES_CURRENT_KEY}"}),
                  {f"{D} least privilege", f"{D} actions"}, id="delete-pointer"),
+    # F4: the role reads the deploy result the instance writes; it must never be able to forge it.
+    pytest.param(lambda p: _add(p, {"Effect": "Allow", "Action": "s3:PutObject",
+                                    "Resource": f"{BUCKET_ARN}/{config.DEPLOYS_STATE_PREFIX}*"}),
+                 {f"{D} least privilege"}, id="forge-deploy-result"),
+    # F4: the F3 pi-mode tag grant is gone; any CreateTags (even limited to pi-mode) is a FAIL.
+    pytest.param(lambda p: _add(p, {"Effect": "Allow", "Action": "ec2:CreateTags", "Resource": INSTANCE_ARN,
+                                    "Condition": {"ForAllValues:StringEquals": {"aws:TagKeys": ["pi-mode"]}}}),
+                 {f"{D} least privilege", f"{D} actions"}, id="f3-pi-mode-tag-grant"),
+    pytest.param(lambda p: _add(p, {"Effect": "Allow", "Action": "ec2:StopInstances", "Resource": INSTANCE_ARN}),
+                 {f"{D} least privilege", f"{D} actions"}, id="stop-instance"),
+    # DescribeInstances is the only action allowed on Resource "*" for this role.
+    pytest.param(lambda p: _replace_resource(p, "StartPiInstance", "*"),
+                 {f"{D} least privilege", f"{D} wildcards"}, id="start-on-star"),
+    pytest.param(lambda p: _add(p, {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}),
+                 {f"{D} least privilege", f"{D} wildcards", f"{D} condition on s3:ListBucket"},
+                 id="list-any-bucket"),
+    pytest.param(lambda p: _replace_resource(p, "FindPiInstance", INSTANCE_ARN),
+                 {f"{D} required permissions"}, id="describe-scoped-to-the-instance"),
 ])
 def test_deploy_role_least_privilege_fails(change, expected):
     assert set(fails(eval_deploy(deploy_state(change(deploy_role.deploy_policy(ACCOUNT, IID)))))) == expected
@@ -1344,19 +1371,34 @@ def test_deploy_role_least_privilege_fails(change, expected):
 
 @pytest.mark.parametrize("condition", [
     None,
-    {"ForAllValues:StringEquals": {"aws:TagKeys": ["pi-mode", "Name"]}},
-    {"ForAnyValue:StringEquals": {"aws:TagKeys": ["pi-mode"]}},
-    {"ForAllValues:StringLike": {"aws:TagKeys": ["pi-*"]}},
+    {"StringLike": {"s3:prefix": ["releases/*", "state/deploys/*"]}},
+    {"StringLike": {"s3:prefix": ["*"]}},
+    {"StringLike": {"s3:prefix": ["releases/current", "state/deploys/*", "data/*"]}},
+    {"StringEquals": {"s3:prefix": ["releases/current", "state/deploys/*"]}},
+    {"StringLike": {"s3:delimiter": ["releases/current", "state/deploys/*"]}},
 ])
-def test_deploy_create_tags_only_the_pi_mode_key(condition):
+def test_deploy_list_bucket_only_the_pointer_and_results_prefixes(condition):
+    """F4: ListBucket (needed to tell "not found" from AccessDenied) is limited with a StringLike
+    on s3:prefix to exactly `releases/current` and `state/deploys/*`."""
     policy = deploy_role.deploy_policy(ACCOUNT, IID)
     for s in policy["Statement"]:
-        if s.get("Sid") == "SetPiModeTag":
+        if s.get("Sid") == "ListPointerAndDeployResults":
             if condition is None:
                 del s["Condition"]
             else:
                 s["Condition"] = condition
-    assert fails(eval_deploy(deploy_state(policy))) == [f"{D} condition on ec2:CreateTags"]
+    assert fails(eval_deploy(deploy_state(policy))) == [f"{D} condition on s3:ListBucket"]
+
+
+def test_deploy_expectation_no_longer_mentions_pi_mode():
+    exp = check_pi.deploy_role_expectation(ACCOUNT, IID)
+    assert {"ec2:CreateTags", "ec2:StopInstances"} <= {p.action for p in exp.must_deny}
+    assert "ec2:CreateTags" not in {p.action for p in exp.must_allow}
+    assert all("pi-mode" not in str(rule) for rule in exp.conditions)
+    assert exp.star_resource_actions == frozenset({"ec2:describeinstances"})
+    # The instance role is unaffected: DescribeInstances on "*" is still a wildcard there.
+    assert check_pi.instance_role_expectation(ACCOUNT).star_resource_actions == frozenset(
+        {"cloudwatch:putmetricdata"})
 
 
 SUB = f"{config.GITHUB_OIDC_HOST}:sub"

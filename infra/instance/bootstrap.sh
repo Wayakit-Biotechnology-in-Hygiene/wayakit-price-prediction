@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bootstrap of the Price Intelligence instance (F3). Idempotent: run it as many times as needed.
+# Bootstrap of the Price Intelligence instance (F3, F4). Idempotent: run it as many times as needed.
 #
 # What it leaves configured on the instance (Amazon Linux 2023, user ec2-user):
 # - SSM agent installed, enabled and running (access is only through SSM, no SSH).
@@ -15,21 +15,27 @@
 #   /home/ec2-user/logs, the same folder run_pipeline.sh uses by default.
 # - pi-pipeline.service installed in /etc/systemd/system and enabled (not started: it runs on the
 #   next boot, and only on the scheduled one; see pi_boot_guard.py).
+# - F4: /opt/price-intelligence (root, 0755) with pi_deploy.py and pi_boot_guard.py (root, 0644),
+#   outside the releases so a bad release cannot break the deployer, and pi-deploy.service
+#   installed and enabled (not started: on every boot it installs the release named by the S3
+#   pointer releases/current before pi-pipeline.service; see pi_deploy.py). Later versions of
+#   these files are synced by pi_deploy.py itself from each release. The first install that finds
+#   /home/ec2-user/wayakit-price-prediction as a real folder moves it to
+#   wayakit-price-prediction.pre-f4 and puts a symlink in its place (see pi_deploy.py).
 # - The ec2-user crontab lines that launch run_pipeline.sh removed (any other line is kept; the
 #   previous crontab is saved in the log folder as crontab-ec2-user.<UTC time>.bak). They must
 #   go before the new run_pipeline.sh runs: the old no-argument line would now start a whole run,
 #   and the old `--stage 2` line exits 1, whose EXIT trap shuts down a run already in progress.
 #   So this is the first step, right after the arguments are checked: a later step that fails
 #   (packages, Chrome, conda) still leaves the crontab filtered.
-# The F4 deploy service (pi-deploy.service) and the S3 release layout are not part of F3.
-#
 # It never prints the values of the env file (the topic and profile ARNs contain the account ID),
 # only which keys are set.
 #
 # Cost: none by itself (it runs on the instance; downloads come from dnf, Google and GitHub).
 #
-# Usage (as root, from the repo at /home/ec2-user/wayakit-price-prediction; e.g. over SSM
-# Run Command, or from the userData of `python -m infra.ec2_instance --create`):
+# Usage (as root, from /home/ec2-user/wayakit-price-prediction: the git checkout before F4, the
+# symlink to the active release after it; e.g. over SSM Run Command, or from the userData of
+# `python -m infra.ec2_instance --create`):
 #   sudo infra/instance/bootstrap.sh --dry-run
 #   sudo infra/instance/bootstrap.sh --alerts-topic-arn <topic ARN> \
 #        --primary-model <DeepSeek profile ARN or model ID> --fallback-model <Haiku profile ARN or ID>
@@ -48,6 +54,10 @@ DEFAULT_LOG_DIR="$PI_HOME/logs"                         # run_pipeline.sh defaul
 ENV_FILE="/etc/price-intelligence.env"
 SERVICE_NAME="pi-pipeline.service"
 SERVICE_DST="/etc/systemd/system/$SERVICE_NAME"
+DEPLOY_SERVICE_NAME="pi-deploy.service"                 # F4: installs the release on boot
+DEPLOY_SERVICE_DST="/etc/systemd/system/$DEPLOY_SERVICE_NAME"
+DEPLOYER_DIR="/opt/price-intelligence"                  # pi_deploy.py INSTANCE_DEPLOYER_DIR
+DEPLOYER_FILES="pi_deploy.py pi_boot_guard.py"          # pi_deploy.py imports the guard
 MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
 CHROME_RPM_URL="https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm"
 ENV_KEYS="PI_LOG_DIR PI_ALERTS_TOPIC_ARN PI_RELEVANCE_PRIMARY_MODEL PI_RELEVANCE_FALLBACK_MODEL"
@@ -193,22 +203,52 @@ ensure_env_file() {
     [ -n "$TOPIC_ARN" ] || say "WARNING: PI_ALERTS_TOPIC_ARN is not set: failed runs will not send an email alert."
 }
 
-ensure_service() {
-    local src="$REPO_DIR/infra/instance/$SERVICE_NAME"
+# Installs (if it differs) and enables, never starts, a unit file from infra/instance/.
+install_unit() {
+    local name="$1" dst="$2" src="$REPO_DIR/infra/instance/$1"
     [ -f "$src" ] || die "$src not found."
-    if [ -f "$SERVICE_DST" ] && cmp -s "$src" "$SERVICE_DST"; then
-        say "$SERVICE_NAME: up to date."
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        say "$name: up to date."
     else
-        say "$SERVICE_NAME: installing."
-        act install -o root -g root -m 0644 "$src" "$SERVICE_DST"
+        say "$name: installing."
+        act install -o root -g root -m 0644 "$src" "$dst"
         act systemctl daemon-reload
     fi
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        say "$SERVICE_NAME: enabled."
+    if systemctl is-enabled --quiet "$name" 2>/dev/null; then
+        say "$name: enabled."
     else
-        act systemctl enable "$SERVICE_NAME"
+        act systemctl enable "$name"
     fi
 }
+
+ensure_service() { install_unit "$SERVICE_NAME" "$SERVICE_DST"; }
+
+# F4: the deployer in /opt (outside the releases) and the unit that runs it on every boot. The
+# files go first: an enabled unit without its script would fail on the next boot.
+ensure_deployer() {
+    local f src
+    for f in $DEPLOYER_FILES; do
+        src="$REPO_DIR/infra/instance/$f"
+        [ -f "$src" ] || die "$src not found."
+    done
+    if [ -d "$DEPLOYER_DIR" ]; then
+        say "$DEPLOYER_DIR: present."
+    else
+        say "$DEPLOYER_DIR: creating."
+        act install -d -o root -g root -m 0755 "$DEPLOYER_DIR"
+    fi
+    for f in $DEPLOYER_FILES; do
+        src="$REPO_DIR/infra/instance/$f"
+        if [ -f "$DEPLOYER_DIR/$f" ] && cmp -s "$src" "$DEPLOYER_DIR/$f"; then
+            say "$DEPLOYER_DIR/$f: up to date."
+        else
+            say "$DEPLOYER_DIR/$f: installing."
+            act install -o root -g root -m 0644 "$src" "$DEPLOYER_DIR/$f"
+        fi
+    done
+}
+
+ensure_deploy_service() { install_unit "$DEPLOY_SERVICE_NAME" "$DEPLOY_SERVICE_DST"; }
 
 remove_old_cron_lines() {
     local current filtered backup removed
@@ -291,6 +331,8 @@ main() {
     if [ "$skip_conda" = 1 ]; then say "conda: skipped (--skip-conda)."; else ensure_conda; fi
     ensure_env_file
     ensure_service
+    ensure_deployer
+    ensure_deploy_service
     say "done. The pipeline runs on the next scheduled boot (last Thursday of the month, 21:50 America/Mexico_City)."
 }
 

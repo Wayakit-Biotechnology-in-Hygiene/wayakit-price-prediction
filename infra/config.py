@@ -35,11 +35,32 @@ STATE_PREFIX = "state/"
 LOGS_PREFIX = "logs/"
 RELEASES_PREFIX = "releases/"
 BUCKET_PREFIXES = (DATA_PREFIX, MODELS_PREFIX, STATE_PREFIX, LOGS_PREFIX, RELEASES_PREFIX)
-RELEASES_CURRENT_KEY = f"{RELEASES_PREFIX}current"  # pointer to the active release (F4)
 NONCURRENT_EXPIRATION_DAYS = 30
 LOGS_EXPIRATION_DAYS = 180
 ABORT_MULTIPART_DAYS = 7
-RELEASES_TO_KEEP = 5  # pruned by the F4 deploy workflow, not by a lifecycle rule
+
+# --- Releases (F4: infra/release.py publishes, infra/instance/pi_deploy.py installs on boot) -----
+# Keys under RELEASES_PREFIX are written only by the deploy role; the instance only reads them and
+# writes its result under DEPLOYS_STATE_PREFIX. pi_deploy.py cannot import this module (stdlib
+# only, outside the repo on the instance): it repeats these values and a unit test keeps them equal.
+RELEASES_CURRENT_KEY = f"{RELEASES_PREFIX}current"  # "<sha>\n": the release every boot installs
+RELEASES_PREVIOUS_KEY = f"{RELEASES_PREFIX}previous"  # "<sha>\n": the release before the last deploy
+DEPLOY_REQUEST_KEY = f"{RELEASES_PREFIX}deploy-request.json"  # "deploy only" signal for the next boot
+DEPLOYS_STATE_PREFIX = f"{STATE_PREFIX}deploys/"  # <request_id>.json: result written by the instance
+DEPLOY_REQUEST_TTL_SECONDS = 1800  # a request is valid for 30 minutes after it is written
+# Files every release archive must contain (checked by release.py before upload, by pi_deploy.py
+# before the switch).
+RELEASE_REQUIRED_FILES = (
+    "run_pipeline.sh",
+    "environment.yml",
+    "infra/instance/pi_boot_guard.py",
+    "infra/instance/pi-pipeline.service",
+    "infra/instance/pi-deploy.service",
+    "infra/instance/pi_deploy.py",
+)
+# Release folders kept on the instance (the current and previous targets always among them). The
+# S3 archives are not pruned: a few hundred KB each, and old versions expire with the lifecycle.
+RELEASES_TO_KEEP = 5
 
 # --- IAM ---------------------------------------------------------------------------------------
 INSTANCE_ROLE = f"{PROJECT}-instance"
@@ -61,7 +82,6 @@ GITHUB_ORG = "Wayakit-Biotechnology-in-Hygiene"
 GITHUB_REPO = "wayakit-price-prediction"
 DEPLOY_BRANCH = "main"  # Mafer, 2026-11-18: production branch at the end of the project
 DEPLOY_OIDC_SUBJECT = f"repo:{GITHUB_ORG}/{GITHUB_REPO}:ref:refs/heads/{DEPLOY_BRANCH}"
-PI_MODE_TAG_KEY = "pi-mode"  # instance tag the deploy role may set (F4 "deploy only" signal)
 
 # --- EC2 instance (infra/ec2_instance.py, infra/instance/) --------------------------------------
 INSTANCE_NAME = "wayakit-app-server"  # Name tag; the instance ID is resolved at run time
@@ -70,6 +90,13 @@ IMDS_HOP_LIMIT = 2
 CONDA_ENV = "wayakit_env"  # hardcoded in run_pipeline.sh
 INSTANCE_ENV_FILE = "/etc/price-intelligence.env"
 PIPELINE_SERVICE = "pi-pipeline.service"
+DEPLOY_SERVICE = "pi-deploy.service"  # installs releases/current on every boot (F4)
+# F4 layout: INSTANCE_APP_DIR (the path pi-pipeline.service and the docs use) is a symlink to
+# INSTANCE_RELEASES_DIR/<sha>; the deployer lives outside the releases so a bad release cannot
+# break it.
+INSTANCE_APP_DIR = "/home/ec2-user/wayakit-price-prediction"
+INSTANCE_RELEASES_DIR = "/home/ec2-user/pi-releases"
+INSTANCE_DEPLOYER_DIR = "/opt/price-intelligence"
 # Variables written to INSTANCE_ENV_FILE (names only; no secrets go in that file).
 ENV_LOG_DIR = "PI_LOG_DIR"
 ENV_ALERTS_TOPIC_ARN = "PI_ALERTS_TOPIC_ARN"

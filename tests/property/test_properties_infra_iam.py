@@ -95,6 +95,9 @@ def test_no_wildcard_actions_and_resource_star_only_for_metrics(inputs, instance
             assert not {"NotAction", "NotResource", "NotPrincipal"} & set(st_)
             assert all("*" not in a and "?" not in a for a in as_list(st_["Action"])), (name, st_)
             if "*" in as_list(st_["Resource"]):
+                if name == "deploy":  # F4: DescribeInstances has no resource-level permissions
+                    assert (st_["Sid"], st_["Action"]) == ("FindPiInstance", "ec2:DescribeInstances")
+                    continue
                 assert (name, st_["Sid"]) == ("instance", "PutPiMetrics")
                 assert st_["Condition"] == {"StringEquals": {"cloudwatch:namespace": "PriceIntelligence"}}
 
@@ -106,7 +109,8 @@ def test_every_resource_is_scoped(inputs, instance):
     account, profiles, models = inputs
     bucket = f"arn:aws:s3:::price-intelligence-{account}"
     # Never the whole bucket (`{bucket}/*`): only the end of a known prefix.
-    allowed_wild = {"*", *(f"{bucket}/{p}/*" for p in ("data", "models", "state", "logs", "releases"))}
+    allowed_wild = {"*", *(f"{bucket}/{p}/*" for p in ("data", "models", "state", "logs", "releases",
+                                                       "state/deploys"))}
     secret = f"arn:aws:secretsmanager:eu-north-1:{account}:secret:prod/wayakit-app-??????"
     for doc in all_policies(account, profiles, models, instance).values():
         for st_ in statements(doc):
@@ -146,6 +150,31 @@ def test_instance_can_write_only_data_prefixes_and_only_read_releases(inputs, ke
     assert check_pi.allows(stmts, "s3:GetObject", obj) == (data or release)
     assert check_pi.allows(stmts, "s3:PutObject", obj) == data
     assert check_pi.allows(stmts, "s3:DeleteObject", obj) == data
+
+
+deploy_keys = st.one_of(
+    object_keys,
+    st.sampled_from(["releases/current", "releases/current.bak", "releases/currentx", "releases/previous",
+                     "releases/deploy-request.json", "state/deploys/1-1.json", "state/deploys/",
+                     "state/deploysx/1.json", "state/other.json", "releases/" + "a" * 40 + ".tar.gz"]))
+
+
+@given(accounts, instance_ids, deploy_keys)
+@example(ACCOUNT, "i-0abc1234def567890", "state/deploys/1-1.json")
+@example(ACCOUNT, "i-0abc1234def567890", "releases/current")
+@example(ACCOUNT, "i-0abc1234def567890", "releases/currentx")
+def test_deploy_role_object_access_by_key(account, instance, key):
+    """F4: on any object key of the PI bucket the deploy policy grants PutObject exactly under
+    releases/, GetObject exactly on releases/current and under state/deploys/ (never the archives
+    or data), and DeleteObject nowhere. Evaluated with check_pi's IAM matcher."""
+    stmts = check_pi.statements(deploy_role.deploy_policy(account, instance))
+    obj = f"arn:aws:s3:::price-intelligence-{account}/{key}"
+    assert check_pi.allows(stmts, "s3:PutObject", obj) == key.startswith("releases/")
+    assert check_pi.allows(stmts, "s3:GetObject", obj) == (
+        key == "releases/current" or key.startswith("state/deploys/"))
+    assert not check_pi.allows(stmts, "s3:DeleteObject", obj)
+    other = f"arn:aws:s3:::price-intelligence-{account}-other/{key}"
+    assert not any(check_pi.allows(stmts, a, other) for a in ("s3:PutObject", "s3:GetObject"))
 
 
 @given(instance_inputs())
@@ -242,10 +271,10 @@ def test_instance_scoped_builders_point_at_that_instance_only(account, instance)
     assert [s["Resource"] for s in statements(scheduler_role.scheduler_policy(account, instance))] == [arn]
     ec2 = [s for s in statements(deploy_role.deploy_policy(account, instance))
            if any(a.startswith("ec2:") for a in as_list(s["Action"]))]
-    assert [s["Resource"] for s in ec2] == [arn, arn]
-    assert {s["Action"] for s in ec2} == {"ec2:StartInstances", "ec2:CreateTags"}
-    tag = next(s for s in ec2 if s["Action"] == "ec2:CreateTags")
-    assert tag["Condition"] == {"ForAllValues:StringEquals": {"aws:TagKeys": ["pi-mode"]}}
+    # F4: StartInstances on that instance only; DescribeInstances (read-only, no resource-level
+    # permissions) on "*"; the F3 CreateTags grant for `pi-mode` is gone.
+    assert {s["Action"]: s["Resource"] for s in ec2} == {"ec2:StartInstances": arn, "ec2:DescribeInstances": "*"}
+    assert len(ec2) == 2
 
 
 ACCOUNT_RE = re.compile(r"[0-9]{12}")

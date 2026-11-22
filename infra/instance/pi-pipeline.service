@@ -13,16 +13,19 @@
 # boot (multi-user.target) finishes instead of staying "starting" for a run of up to 30 h or more.
 # ExecCondition still runs first and still decides whether ExecStart runs.
 #
-# The code path is fixed: /home/ec2-user/wayakit-price-prediction (F4 turns it into a symlink to
-# the active release). The env file holds no secrets: PI_LOG_DIR, PI_ALERTS_TOPIC_ARN,
-# PI_RELEVANCE_PRIMARY_MODEL and PI_RELEVANCE_FALLBACK_MODEL (written by bootstrap.sh).
+# The code path is fixed: /home/ec2-user/wayakit-price-prediction, since F4 a symlink to the
+# active release (/home/ec2-user/pi-releases/<sha>) that pi-deploy.service sets before this unit
+# starts (After= only: a failed install never blocks the run, which then uses the release that
+# was already active). pi_deploy.py refuses to move the link while this unit is active. The env
+# file holds no secrets: PI_LOG_DIR, PI_ALERTS_TOPIC_ARN, PI_RELEVANCE_PRIMARY_MODEL and
+# PI_RELEVANCE_FALLBACK_MODEL (written by bootstrap.sh).
 #
 # Check:  systemctl status pi-pipeline.service; journalctl -u pi-pipeline.service -b
 
 [Unit]
 Description=Price Intelligence monthly pipeline (only on the scheduled boot)
 Wants=network-online.target
-After=network-online.target
+After=network-online.target pi-deploy.service
 
 [Service]
 Type=exec

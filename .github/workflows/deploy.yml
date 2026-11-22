@@ -1,0 +1,130 @@
+# Deploy the PI code to the instance (F4, pull-on-boot). See docs/runbook.md, "Deploy and rollback".
+#
+# - After the "CI" workflow succeeds for a push to main: deploys that commit, unless main has moved
+#   on since (a newer run deploys the newer commit).
+# - Manual rollback (Actions > Deploy > Run workflow, branch main): deploys the commit in `sha`,
+#   which must be in the history of origin/main.
+# Both run `python -m infra.release deploy`: it refuses inside the monthly run window or when the
+# instance is not stopped, publishes releases/<sha>.tar.gz, moves releases/current, starts the
+# instance for a deploy-only boot and waits for its result (failure: the pointer is moved back).
+# AWS access: short-lived OIDC credentials of the role in the secret PI_DEPLOY_ROLE_ARN (trusted
+# only for refs/heads/main). No keys are stored anywhere.
+# Inputs and event fields reach shell steps only through `env:` (never `${{ }}` inside `run:`).
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to deploy (40 lowercase hex characters, in the history of main)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: pi-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out the repository (full history, to verify the commit is on main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the commit to deploy
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          INPUT_SHA: ${{ inputs.sha }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # fetch-depth 0 already fetched every branch as refs/remotes/origin/*.
+          main_tip="$(git rev-parse origin/main)"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$GIT_REF" != "refs/heads/main" ]; then
+              echo "::error::Run the rollback from the main branch (got $GIT_REF)."
+              exit 1
+            fi
+            sha="$INPUT_SHA"
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::sha must be a full commit SHA (40 lowercase hex characters)."
+              exit 1
+            fi
+          else
+            sha="$RUN_HEAD_SHA"
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Unexpected head_sha from the CI run."
+              exit 1
+            fi
+            if [ "$sha" != "$main_tip" ]; then
+              echo "::notice::Commit $sha is no longer the tip of main (superseded): not deploying it."
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::Commit $sha is not in the history of origin/main."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.resolve.outputs.deploy == 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+
+      - name: Install boto3 and its dependencies (versions of the instance and the local environment)
+        if: steps.resolve.outputs.deploy == 'true'
+        run: >-
+          python -m pip install --disable-pip-version-check
+          boto3==1.42.83 botocore==1.42.83 s3transfer==0.16.1 jmespath==1.1.0
+          python-dateutil==2.9.0.post0 urllib3==2.8.0 six==1.17.0
+
+      - name: Build the release archive
+        if: steps.resolve.outputs.deploy == 'true'
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar "$SHA" | gzip -n > release.tar.gz
+          sha256sum release.tar.gz
+
+      - name: Get short-lived AWS credentials (OIDC)
+        if: steps.resolve.outputs.deploy == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.PI_DEPLOY_ROLE_ARN }}
+          aws-region: eu-north-1
+          mask-aws-account-id: true
+
+      - name: Deploy
+        if: steps.resolve.outputs.deploy == 'true'
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python -m infra.release deploy --env-credentials --sha "$SHA" \
+            --archive release.tar.gz --request-id "$REQUEST_ID"

@@ -3,7 +3,7 @@
 Practical guide to operating Price Intelligence (PI). Each section solves one concrete task.
 To know *what* exists in AWS, see [resources.md](resources.md). To know *why* it is the way it is, see [decisions.md](decisions.md). The improvement plan is in [plan.md](plan.md).
 
-Status as of 2026-11-18: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory), plus the **F2 changes** (marked "since F2"): they are in the code of this branch but **not yet on the instance**, which still runs the pre-F2 code (see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)). **Update 2026-11-22: F3 is applied** (steps 1–7 on 2026-11-18, the cutover on 2026-11-22): the instance runs F2 + F3 (`server-improvement` @ 636bcf0) with the role `price-intelligence-instance`, the monthly schedule is ENABLED and the old weekly schedules and crontab lines are gone. Sections that describe the stages, the crontab or the old role describe the pre-cutover operation (kept for rollback). [Infrastructure as code (F3)](#infrastructure-as-code-f3) is the procedure. Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). The old roles are kept (rollback). At the end of the project the production branch is **`main`** (Mafer, 2026-11-18); until then the instance runs `server-improvement`.
+Status as of 2026-11-18: the operation described here is **today's** (branch `server-improvement` on the instance, F1 inventory), plus the **F2 changes** (marked "since F2"): they are in the code of this branch but **not yet on the instance**, which still runs the pre-F2 code (see [F2 is not on the instance yet](#f2-is-not-on-the-instance-yet)). **Update 2026-11-22: F3 is applied** (steps 1–7 on 2026-11-18, the cutover on 2026-11-22): the instance runs F2 + F3 (`server-improvement` @ 636bcf0) with the role `price-intelligence-instance`, the monthly schedule is ENABLED and the old weekly schedules and crontab lines are gone. Sections that describe the stages, the crontab or the old role describe the pre-cutover operation (kept for rollback). [Infrastructure as code (F3)](#infrastructure-as-code-f3) is the procedure. Anything marked **Planned (F#)** does not exist yet; the number is the phase in [plan.md](plan.md). The old roles are kept (rollback). At the end of the project the production branch is **`main`** (Mafer, 2026-11-18); until then the instance runs `server-improvement`. **F4 (CI/CD, pull-on-boot)** is code on branch `f4-cicd`, not rolled out: see [Deploy and rollback](#deploy-and-rollback).
 
 AWS commands are run from the repo root, on a Mac with AWS CLI v2. Pipeline commands are run inside the EC2 instance.
 
@@ -96,6 +96,8 @@ The step names below are what the log and the failure alert show (`run_pipeline.
 ### Files it produces
 
 Everything lives **only on the instance's disk** (volume without snapshots). Paths are relative to the repo root; the scripts assume the working directory is that root.
+
+After the F4 rollout the repo root on the instance is the release folder the `/home/ec2-user/wayakit-price-prediction` symlink points at: each run writes its CSVs and models **inside that release folder**, so after a deploy the new folder starts without the previous run's outputs (a run regenerates all of them; the previous folder keeps its own until it is pruned, 5 releases later). The log folder is outside the releases and is never touched by a deploy.
 
 **Log folder** (since F2): every log file goes to one folder **outside the code**, `PI_LOG_DIR` if it is set and non-empty, otherwise `<repo>/../logs` (`/home/ec2-user/logs` on the instance). `log_config.py`, `run_pipeline.sh` and `odoo_api_price_suggestion.py` apply the same rule; `run_pipeline.sh` makes it absolute and exports it to every step. Use an absolute path in `PI_LOG_DIR`. It is outside the code so a new code folder (F4 releases) does not lose the upload's IDs file. Before F2, `run_pipeline.sh` wrote to `<repo>/logs` and only `wayakit_app.log` was in `<repo>/../logs`.
 
@@ -465,45 +467,131 @@ python -m infra.check_pi --only schedule iam   # sections: bucket, instance, bed
 - Only `Describe*`/`Get*`/`List*` calls; `--dry-run` is accepted and changes nothing. One line per check, `[OK]`, `[WARN]` or `[FAIL]`, then `N OK, N WARN, N FAIL`. Exit 1 if there is any FAIL; WARN lines do not change the exit code.
 - To see a change made from code in AWS (ticket test): change `SCHEDULE_CRON` in `infra/config.py`, run `python -m infra.schedule --dry-run` and the apply, then `python -m infra.check_pi --only schedule` shows the cron, time zone and state AWS has.
 - Expected WARNs: the monthly schedule DISABLED (before step 13), no DeepSeek profile (after `[FALLBACK]`), email subscription only pending.
-- Always a FAIL: any IAM action outside the spec on a PI role (instance, scheduler or deploy; in inline or customer-managed policies, on any resource), a secret pattern broader than `prod/wayakit-app-??????` (e.g. `prod/wayakit-app-*` or `prod/*`), `s3:PutObject` or `s3:DeleteObject` on `releases/` (including `releases/current`) for the instance role (it only reads releases; only the deploy role writes them), and a bucket owned by another account (every S3 read passes `ExpectedBucketOwner`, the account from STS, so S3 answers `AccessDenied` and the bucket section FAILs).
+- Always a FAIL: any IAM action outside the spec on a PI role (instance, scheduler or deploy; in inline or customer-managed policies, on any resource), a secret pattern broader than `prod/wayakit-app-??????` (e.g. `prod/wayakit-app-*` or `prod/*`), `s3:PutObject` or `s3:DeleteObject` on `releases/` (including `releases/current`) for the instance role (it only reads releases; only the deploy role writes them), for the deploy role (F4) any write on `state/` (it only reads the deploy results), `ec2:CreateTags`, `s3:DeleteObject`, a `ListBucket` without the `s3:prefix` condition, or `Resource: "*"` on anything but `ec2:DescribeInstances`, and a bucket owned by another account (every S3 read passes `ExpectedBucketOwner`, the account from STS, so S3 answers `AccessDenied` and the bucket section FAILs).
 - What it does not check: what is on the instance (service, env file, crontab; see the bootstrap checks above), a missed monthly start (no "last run" metric yet), the SNS topic policy, the schedule's start and end dates.
 
 ---
 
 ## Deploy and rollback
 
-### Today
+**Status (2026-11-22): F4 is code on branch `f4-cicd`; nothing of it is in GitHub, AWS or the instance yet.** Until the [F4 rollout](#f4-rollout-once) is done, deploy by hand as in [Before F4: manual pull](#before-f4-manual-pull). What exists after the rollout: [resources.md, Releases and deploys (F4)](resources.md#releases-and-deploys-f4); why: [decisions.md](decisions.md) (2026-11-22 rows).
 
-- There is no CI/CD or deploy. With the pre-F2 code still on the instance, code reaches it through the `git pull` at the start of stage 2 (`run_pipeline.sh:133` in e25e2c9): the checked-out branch (`server-improvement`), without a pinned version and without checking the result (the instance has no stored git credentials, so with a private repo that pull fails silently).
-- **Since F2 there is no `git pull` in the pipeline. Until F4, deploy by hand through SSM**, with Mafer's OK and with the schedules paused (see [Pausing the run](#pausing-the-run)) so the pull does not happen while a run (or, with the pre-F2 code, a stage) is running:
-  ```bash
-  # inside the instance (SSM session, user ec2-user), from the repo root, with no run in progress
-  ps aux | grep -E "run_pipeline|python" | grep -v grep     # must print nothing
-  git status                                               # every run (stage 1 before F3) leaves scraper/analysis-odoo.csv modified
-  git checkout -- scraper/analysis-odoo.csv                # only if that is the only local change
-  git pull --ff-only origin server-improvement
-  git log -1 --oneline                                     # note the SHA in the change's PR
-  ```
-  The pull needs no credentials: the GitHub repo is public, so it is anonymous HTTPS (decided 2026-11-18). Never put a personal GitHub account or token on the instance, the repo, the logs or the shell history. If the repo is made private, use a read-only deploy key generated on the instance (Mafer configures it). Then re-enable the schedules.
-- **Rollback today:** `git revert` of the commit on `server-improvement`, push, and the same manual pull. Do not run `git checkout <sha>` inside the instance without Mafer's OK: it leaves the instance off the branch.
-- **Production branch:** when this development is finished, the branch deployed to production is **`main`** (Mafer, 2026-11-18): the manual pull then uses `main`, and in F4 only `main` can deploy (the deploy role's trust).
+### How a push deploys (F4, pull-on-boot)
+
+1. A change reaches **`main`** (merge of a reviewed PR). The `CI` workflow runs the checks.
+2. If `CI` is green for that push, `.github/workflows/deploy.yml` (`Deploy`) starts. It deploys only if the commit is still the tip of `main` (if a newer push arrived, it prints a notice and stops; the newer run deploys). One deploy at a time (`concurrency: pi-deploy`).
+3. The job builds `git archive <sha> | gzip -n`, gets short-lived AWS credentials for `price-intelligence-deploy` through OIDC (secret `PI_DEPLOY_ROLE_ARN`; no keys) and runs `python -m infra.release deploy --env-credentials --sha <sha> --archive … --request-id <run_id>-<attempt>`, which:
+   - **refuses** (exit 1, nothing written) on the **whole last Thursday of the month** in Mexico City time (now or 30 minutes from now; the day is reserved for the monthly run: a deploy boot that stayed on would turn the 21:50 start into a no-op and the run would be skipped without an alert), inside or within 30 minutes of the monthly window (21:40–23:00, a second guard), or if the instance is not `stopped` (a run or a maintenance session may be going on);
+   - uploads `releases/<sha>.tar.gz` and its `.sha256`, sets `releases/previous` to the old pointer and `releases/current` to the new sha, writes `releases/deploy-request.json` (valid 30 minutes) and starts the instance;
+   - waits up to 15 minutes for `state/deploys/<request_id>.json`, written by the instance.
+4. On the instance, `pi-deploy.service` runs on every boot before `pi-pipeline.service`. With a valid request (deploy-only boot) it downloads the release, checks the sha256, the required files and `bash -n run_pipeline.sh`, installs it in `/home/ec2-user/pi-releases/<sha>`, switches the `/home/ec2-user/wayakit-price-prediction` symlink atomically, keeps the last 5 release folders, writes the result and **powers the instance off**. The boot guard keeps the pipeline from running (it is not the window), so a deploy never scrapes or writes to Odoo.
+5. Result `ok` → the job is green (`OK: release <sha> deployed`). Anything else → `releases/current` is moved back to the old sha and the job fails (see [When a deploy fails](#when-a-deploy-fails)). The symlink is only switched after every check passed, so a failed install leaves the previous release in place, and the next monthly run uses it.
+
+On a normal boot (the monthly run, or a manual start for maintenance) `pi-deploy.service` also makes sure the installed release is `releases/current` (installing it if not) but never powers the instance off; a failure there is logged and does not block the run (ordering only). A whole deploy takes about 5–10 minutes.
+
+### Instance side of a deploy
+
+On every boot, `pi-deploy.service` (oneshot, root, ordered before `pi-pipeline.service`) runs `/usr/bin/python3 /opt/price-intelligence/pi_deploy.py`:
+
+- It reads `releases/current` and, if `/home/ec2-user/wayakit-price-prediction` does not already point at that release, downloads `releases/<sha>.tar.gz`, checks its SHA-256, unpacks it safely into `/home/ec2-user/pi-releases/<sha>` (owned by `ec2-user`, with a `.release` file), checks the required files and `bash -n run_pipeline.sh`, and switches the symlink atomically. Any failure before the switch leaves the symlink as it was. It refuses to switch while `pi-pipeline.service` is active, and only one `pi_deploy.py` runs at a time (lock file in `/home/ec2-user/pi-releases`).
+- Then it syncs `pi-pipeline.service` and `pi-deploy.service` (to `/etc/systemd/system`) and `pi_deploy.py` and `pi_boot_guard.py` (to `/opt/price-intelligence`) if they changed, and keeps 5 release folders (always the active one and the previous one, then the newest).
+- **Deploy-only boot:** if `releases/deploy-request.json` is valid (written by `release.py`, not closed, not expired, no result yet for its request), it writes `state/deploys/<request_id>.json` and powers the instance off, also after a failure, except inside the monthly window (then it stays on and the pipeline runs).
+- **Any other boot** installs the pointer's release if needed but writes no result and never powers off; with no pointer yet it does nothing. `pi-pipeline.service` only has `After=pi-deploy.service`: a failed install never blocks the monthly run, which uses the release that was already active. A failed install sends an SNS alert when `PI_ALERTS_TOPIC_ARN` is set.
+- Logs: `journalctl -u pi-deploy.service -b` and `$PI_LOG_DIR/deploy.log` (default `/home/ec2-user/logs/deploy.log`). It never prints AWS error text, the account or the bucket name.
+
+Read-only check over SSM (instance started by hand, outside the window): `sudo /usr/bin/python3 /opt/price-intelligence/pi_deploy.py --dry-run` (reads S3, prints the plan, changes nothing). Other options: `--no-poweroff`, `--sha <40-hex sha>` (install that release instead of the pointer; never deploy-only), `--allow-env-update`, `--bucket`.
+
+### Rolling back
+
+- **Fastest (restore a known-good commit):** GitHub → Actions → **Deploy** → *Run workflow*, branch **`main`**, `sha` = the full 40-character commit to go back to (it must be in the history of `main`). The previous sha is in the log of the last successful Deploy run (`releases/current = <new> (was <old>)`) and in `git log`. Same checks and same refusals as a push. The instance reuses `/home/ec2-user/pi-releases/<sha>` if it is still one of the 5 kept; otherwise it downloads the archive again (S3 archives are not pruned).
+- **Then fix forward:** a rollback does not change `main`; the next push to `main` deploys its tip again. If the bad change must not come back, `git revert` it on `main` (PR), which deploys normally.
+- Not on the last Thursday of the month and not while a run may be in progress (the job refuses anyway).
+- **A rollback to a commit with another `environment.yml`** than the installed one is refused by the instance (`FAILED: … environment.yml changed`): follow [Changing environment.yml](#changing-environmentyml) with that sha.
+- **A rollback to a pre-F4 commit is refused** (`REFUSED: the archive lacks required files`: it has no `infra/instance/pi_deploy.py` or `pi-deploy.service`). Going back before F4 means undoing the rollout: see *Rolling back the migration* in [F4 rollout (once)](#f4-rollout-once).
+- **Queued runs can be replaced:** deploys run one at a time (`concurrency: pi-deploy`, `cancel-in-progress: false`), but GitHub keeps only **one pending** run per group, so a newer run (e.g. a push to `main`) replaces a rollback that was still waiting. Check that the rollback run actually ran (its log ends with `OK: release <sha> deployed`); if it was cancelled, run it again.
+
+### When a deploy fails
+
+The job log (and the GitHub notification) says why. The output never shows the account, the bucket name or the instance ID.
+
+| Message | Meaning | What to do |
+|---|---|---|
+| `REFUSED: the last Thursday of the month is reserved for the monthly run (<date>, America/Mexico_City)` | Deploys are not allowed that day (Mexico City time, including a deploy started after 23:30 on the Wednesday before) | Re-run the job (Actions, *Re-run jobs*) another day; if the run is still going (it can last into Saturday), the instance-state check refuses until it ends |
+| `REFUSED: the monthly run window starts within 30 minutes or is open` | Second guard, same cause (it cannot trigger without the one above) | As above |
+| `REFUSED: instance wayakit-app-server is running, not stopped` (or `pending`, `stopping`) | A run or a maintenance session is in progress | **Do not stop the instance** to make room. Wait until it is stopped (the run shuts it down at the end) and re-run the job |
+| `REFUSED: the archive lacks required files` / `--sha must be …` / `releases/current is malformed` | The build or the pointer is wrong; nothing was written | Fix the cause (a required file deleted on `main`; a pointer edited by hand) and re-run |
+| `FAILED: the instance reported a failed deploy: <reason>` | The instance refused the release (sha256 mismatch, unsafe or incomplete archive, `bash -n` error, `environment.yml` changed, …); the pointer was moved back, the previous release is still active and the instance powered itself off | Read the reason; for `environment.yml changed` see [Changing environment.yml](#changing-environmentyml); otherwise fix on `main` and push again. Details in `deploy.log` (log folder on the instance) |
+| `FAILED: no result at state/deploys/<id>.json after 15 minutes; the instance may still be running and this job cannot stop it` | The instance did not answer in time (slow boot, S3 unreachable from the instance, `pi-deploy.service` hung or failed before writing the result). `pi_deploy.py` retries the reads that decide whether a boot is a deploy (STS, `releases/deploy-request.json`, `state/deploys/<id>.json`) 6 times, about 2 minutes; if they keep failing it carries on as a normal boot and **does not power off**. (Once a boot knows it is a deploy, every failure writes a `failed` result and powers off.) The pointer was moved back and the request closed | **The instance may still be running and costing money: the deploy role cannot stop it** (no `StopInstances`, by design). Check it in the EC2 console (`wayakit-app-server`) or over SSM: `systemctl status pi-deploy.service`, `journalctl -u pi-deploy.service -b`, `tail -n 50 /home/ec2-user/logs/deploy.log`; then stop it by hand (`sudo shutdown -h now`, or *Stop instance* in the console), unless it is the monthly window. The next boot reconciles the installed release with `releases/current` |
+| `MANUAL ACTION: could not move releases/current back to <sha>` | The failure handling itself failed (AWS error) | Put the pointer back by hand (below), before the next boot |
+| `AWS error <code> in <operation>` | AWS refused a call (permissions, throttling). If it happened after the pointer moved, the pointer was moved back first | `AccessDenied`: run `python -m infra.check_pi --only iam` (deploy role up to date?) |
+
+Putting the pointer back by hand (operator SSO role on the Mac; the account stays inside the shell):
+
+```bash
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile wayakit-vdc)
+printf '%s\n' <40-character sha> | aws s3 cp - "s3://price-intelligence-${ACCOUNT}/releases/current" \
+  --content-type text/plain --expected-bucket-owner "$ACCOUNT" --profile wayakit-vdc --region eu-north-1
+```
+
+### Changing environment.yml
+
+A release whose `environment.yml` differs from the installed one is **refused** on purpose before the switch (the conda update takes minutes and must not happen unattended): the job fails with `environment.yml changed: run with --allow-env-update over SSM`, `release.py` restores the pointer, the instance keeps the old release and powers off (the new one stays unpacked in `/home/ec2-user/pi-releases/<sha>`). With Mafer's OK, away from the monthly window:
+
+1. Start the instance by hand (a normal boot: the old release is already current, nothing happens) and open an SSM session.
+2. `sudo /usr/bin/python3 /opt/price-intelligence/pi_deploy.py --dry-run --allow-env-update --sha <new sha>`, then the same with `--no-poweroff` instead of `--dry-run`. It runs `conda env update -n wayakit_env -f <release>/environment.yml` as `ec2-user` (no time limit; several minutes), then switches the symlink.
+3. Check: `readlink -f /home/ec2-user/wayakit-price-prediction` (→ `pi-releases/<new sha>`), `tail -n 30 /home/ec2-user/logs/deploy.log`. Shut the instance down.
+4. Run the Deploy workflow by hand (`workflow_dispatch`) with the same sha: the boot finds the release already active and confirms it, so `releases/current` matches the instance again. **Do not skip this step:** the pointer is the source of truth, and until it is fixed every normal boot tries to go back to the old release, stops at the same `environment.yml` check (the new release stays active, but it logs a failure and alerts).
+
+### F4 rollout (once)
+
+Every step needs Mafer's OK. **Never on the last Thursday of the month, nor while a run may be in progress** (the first monthly run is Thursday 2026-11-26 and can last into Saturday): do it after that run has finished and the instance is stopped.
+
+1. (lead) Merge `f4-cicd` into `server-improvement` through its PR, with the `CI` workflow (`.github/workflows/ci.yml`, named `CI`; the Deploy workflow listens to that name) in place.
+2. **Done 2026-11-22.** Deploy role: `python -m infra.deploy_role --dry-run`, then the apply. It replaces the inline policy (removes `ec2:CreateTags`; adds `ListBucket` with the prefix condition, `GetObject` on `state/deploys/*`, `DescribeInstances`). Then `python -m infra.check_pi --only iam oidc`: no FAIL.
+3. **Done 2026-11-22.** GitHub secret `PI_DEPLOY_ROLE_ARN` (repository secret), set without printing the ARN (it contains the account). Without the `gh` CLI: copy it with `aws iam get-role --role-name price-intelligence-deploy --query Role.Arn --output text --profile wayakit-vdc | tr -d '\n' | pbcopy`, paste it in GitHub (Settings → Secrets and variables → Actions → New repository secret) and clear the clipboard with `pbcopy < /dev/null`. With `gh`:
+   ```bash
+   aws iam get-role --role-name price-intelligence-deploy --query Role.Arn --output text --profile wayakit-vdc \
+     | gh secret set PI_DEPLOY_ROLE_ARN --repo Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction
+   ```
+4. Install `pi-deploy.service` on the instance (the last manual pull): start the instance, SSM session, then the [manual pull](#before-f4-manual-pull) of `server-improvement` and `sudo infra/instance/bootstrap.sh --dry-run --skip-chrome --skip-conda`, then without `--dry-run` (values not passed are kept from the env file; see [Bootstrap on the current instance](#bootstrap-on-the-current-instance)). It installs `/opt/price-intelligence/` and enables `pi-deploy.service`. Check:
+   ```bash
+   systemctl is-enabled pi-deploy.service pi-pipeline.service    # enabled, enabled
+   ls -l /opt/price-intelligence                                  # pi_deploy.py, pi_boot_guard.py (root)
+   sudo python3 /opt/price-intelligence/pi_deploy.py --dry-run    # "no release pointer yet": nothing to do
+   ```
+   Shut the instance down (`sudo shutdown -h now`).
+5. (lead, Mafer's OK) The production branch **`main`** receives `server-improvement` (PR). That push runs `CI` and then the **first F4 deploy**: `pi_deploy.py` finds `/home/ec2-user/wayakit-price-prediction` as a real folder, renames it to `/home/ec2-user/wayakit-price-prediction.pre-f4` right before the switch (it refuses if that backup already exists) and puts the symlink in its place; if the switch fails it moves the folder back. The `.pre-f4` folder is never pruned (it holds the last pre-F4 run outputs and the old logs with the Gemini key: see [Security](#security)). Watch the Deploy job until `OK: release <sha> deployed`.
+6. Optional check over SSM on the next maintenance boot: `readlink -f /home/ec2-user/wayakit-price-prediction` (→ `/home/ec2-user/pi-releases/<sha>`), `tail /home/ec2-user/logs/deploy.log`. The instance must be stopped again afterwards.
+
+**Rolling back the migration** (over SSM, instance started by hand outside the window, pipeline not running): `sudo systemctl disable pi-deploy.service` (otherwise the next boot installs the pointer's release again), `sudo rm /home/ec2-user/wayakit-price-prediction` (removes only the symlink), `sudo mv /home/ec2-user/wayakit-price-prediction.pre-f4 /home/ec2-user/wayakit-price-prediction`; optionally `sudo cp /home/ec2-user/wayakit-price-prediction/infra/instance/pi-pipeline.service /etc/systemd/system/ && sudo systemctl daemon-reload` (the F4 unit only adds an ordering after `pi-deploy.service`). The release folders in `/home/ec2-user/pi-releases` can stay. Code then reaches the instance again by [manual pull](#before-f4-manual-pull).
+
+**Manual approval (question 8, not enabled):** if Mafer wants a reviewer to approve each deploy, create a GitHub environment `production` with required reviewers, add `environment: production` to the `deploy` job, change `DEPLOY_OIDC_SUBJECT` in `infra/config.py` to `repo:Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction:environment:production` and re-apply `infra/deploy_role.py` (all in one change; until the role is re-applied every deploy fails at the credentials step).
+
+### Before F4: manual pull
+
+Until the F4 rollout, code reaches the instance only by hand through SSM, with Mafer's OK and with no run in progress (and, before the cutover, with the schedules paused; see [Pausing the run](#pausing-the-run)):
+
+```bash
+# inside the instance (SSM session, user ec2-user), from the repo root, with no run in progress
+ps aux | grep -E "run_pipeline|python" | grep -v grep     # must print nothing
+git status                                               # a run leaves scraper/analysis-odoo.csv modified
+git checkout -- scraper/analysis-odoo.csv                # only if that is the only local change
+git pull --ff-only origin server-improvement
+git log -1 --oneline                                     # note the SHA in the change's PR
+```
+
+The pull needs no credentials: the GitHub repo is public, so it is anonymous HTTPS (decided 2026-11-18). Never put a personal GitHub account or token on the instance, the repo, the logs or the shell history. If the repo is made private before F4 is rolled out, use a read-only deploy key generated on the instance (Mafer configures it). After F4 the instance needs no GitHub access at all (it reads the release from S3). Rollback before F4: `git revert` on `server-improvement`, push, and the same manual pull; do not run `git checkout <sha>` inside the instance without Mafer's OK. Before F2, the code arrived through the stage 2 `git pull` (`run_pipeline.sh:133` in e25e2c9), unpinned and unchecked.
+
+**Production branch:** at the end of the project the deployed branch is **`main`** (Mafer, 2026-11-18); in F4 only `main` can deploy (the deploy role's trust).
 
 ### F2 is not on the instance yet
+
+Historical (F2 and F3 are on the instance since the 2026-11-22 cutover; kept for the rollback context).
 
 - The F2 relevance AI uses Bedrock with the instance role, which **has no `bedrock:InvokeModel` until F3**: with the F2 (or F3) code, the run stops at the Bedrock preflight in `3. Run scraping` (exit 1, nothing uploaded). Do not deploy F2 to the instance before the F3 role `price-intelligence-instance` is associated with it (cutover steps 4 and 9 in [Order](#order)).
 - While the instance runs the pre-F2 `run_pipeline.sh`, its stage 2 `git pull` could bring F2 in by itself once it is merged into `server-improvement`, rewriting `run_pipeline.sh` while bash is running it. Decided 2026-11-18: F2 is merged into `server-improvement` only after F3 creates the permission; the schedules and the crontab are not paused. In practice the F3 cutover does it in order: the old schedules are disabled (step 8), the instance gets the new role (step 9), then F2 + F3 are pulled and bootstrapped (steps 10–11); see [Order](#order).
 - **The logs move when F2 + F3 are deployed**: from `<repo>/logs` to the [log folder](#files-it-produces), `/home/ec2-user/logs` by default (where `wayakit_app.log` already is). The F3 code has **no state files**: the old `<repo>/logs/run_mode.txt` and `last_full_run.txt` are no longer read and can be deleted. The F3 bootstrap removes the crontab lines; the monthly run's output goes to `pipeline_execution.log` in the log folder and to the systemd journal (`journalctl -u pi-pipeline.service`).
-- The old `<repo>/logs/cron.log` and `<repo>/logs/pipeline_execution.log` on the instance still contain the Gemini key: scrub or delete them as already planned (see [Security](#security)); moving the folder does not clean them.
-
-### Planned (F4): pull-on-boot
-
-1. GitHub Actions (OIDC, no keys) runs the tests on every push to `main`.
-2. With CI green, it publishes `releases/<sha>.tar.gz` to S3 and updates the `current` pointer.
-3. It starts the instance in **"deploy only"** mode: the instance installs the release, verifies it, switches the symlink atomically and shuts down, without running the pipeline.
-4. If the deploy fails, the symlink is not touched and the previous version keeps working.
-5. **Rollback:** `workflow_dispatch` with a `sha`, which moves the pointer and runs the deploy again. The last 5 releases are kept on the instance.
-
-This depends on F3 (bucket, deploy role, GitHub OIDC provider, SSM agent, `bootstrap.sh`), whose scripts are ready but not applied. The deploy role trusts only `main` (the production branch at the end of the project). The F4 pieces (`pi-deploy.service`, the release layout in S3 and the "deploy only" signal through the `pi-mode` instance tag) do not exist yet; the exact steps will be written here when they are implemented.
+- The old `<repo>/logs/cron.log` and `<repo>/logs/pipeline_execution.log` on the instance still contain the Gemini key: scrub or delete them as already planned (see [Security](#security)); moving the folder does not clean them. With F4 the old checkout becomes `wayakit-price-prediction.pre-f4`: those logs move with it and still need the same cleanup.
 
 ---
 

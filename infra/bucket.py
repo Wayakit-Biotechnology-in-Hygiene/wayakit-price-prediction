@@ -15,12 +15,15 @@ What it leaves configured (eu-north-1):
   - objects under `logs/` expire after 180 days;
   - delete markers with no versions left are removed, incomplete multipart uploads are
     aborted after 7 days (whole bucket);
-  - `releases/` has no expiration rule: the F4 deploy workflow prunes it to the last 5.
+  - `releases/` has no expiration rule and is not pruned: release archives are a few hundred KB
+    each; the instance keeps only the last 5 release folders on disk (F4, `pi_deploy.py`).
 - Tag `project=price-intelligence` (other tags already on the bucket are kept).
 
 Layout (prefixes are created by whoever writes the first object; this script creates no
-placeholder objects): `data/`, `models/`, `state/`, `logs/`, `releases/` (`releases/current` is
-the pointer to the active release, F4).
+placeholder objects): `data/`, `models/`, `state/`, `logs/`, `releases/` (F4: `releases/current`
+is the pointer to the active release, `releases/previous` the one before, and
+`releases/deploy-request.json` the deploy-only signal; `infra/release.py` writes them and the
+instance writes each deploy result under `state/deploys/`).
 
 Every call except `create_bucket` passes `ExpectedBucketOwner`, so the script never configures
 a bucket that belongs to another account. If the bucket exists in another region or another
@@ -95,7 +98,7 @@ def bucket_policy(account):
 
 
 def lifecycle_rules():
-    """Full lifecycle configuration. `releases/` deliberately has no rule (F4 prunes it)."""
+    """Full lifecycle configuration. `releases/` deliberately has no rule (archives are kept; small)."""
     return [
         {
             "ID": "noncurrent-versions-expire",

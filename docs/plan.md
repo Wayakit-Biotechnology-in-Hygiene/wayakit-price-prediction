@@ -126,11 +126,11 @@ Original plan:
 4. Review the cron (if it has `@reboot`, turn it off before it fires), the checked-out branch, local changes, the conda environment, the git credentials and the Gemini log.
 5. Copy the current CSVs and models to S3. That is the **"before" snapshot** for ticket A.
 
-### F2 · Harden the pipeline (2 days) — **implemented on branch `f2-hardening` (2026-11-17), not deployed**
+### F2 · Harden the pipeline (2 days) — **implemented on branch `f2-hardening` (2026-11-17), deployed on 2026-11-22** (with the F3 cutover)
 
 Result (details in `docs/decisions.md` and `docs/runbook.md`):
 - Done: `|| exit 1` on every step and no `git pull` in stage 2 (the two stages stay while question 2 is open); `sys.exit(1)` and no swallowed exceptions in the ML and Odoo scripts (Odoo reads with 0 records also exit 1); `scraper/main.py` writes to a temporary file and renames it only on success; `pi_secrets.py` (plus `pi_odoo.py` for the connection) replaces the 6 copies of `get_secret()`; Bedrock (DeepSeek V3.2 + Haiku 4.5) replaces Gemini with the same `RelevanceAgent` interface; safe upload (company check, create first, unlink the saved IDs, `--dry-run`, `--cleanup-previous`); sales from the last rolling 12 months; coverage report `scraper/coverage_report.csv` (section 6, step 1). The ML differential shows no price change.
-- **Not deployed:** the instance role has no `bedrock:InvokeModel` until F3, so F2 must not reach the instance before then: it is merged into `server-improvement` only after F3 (Mafer, 2026-11-18).
+- **Deployed on 2026-11-22** with the F3 cutover (`server-improvement` @ 636bcf0), after the new instance role granted `bedrock:InvokeModel`. Before that it was held back on purpose: it was merged into `server-improvement` only after F3 (Mafer, 2026-11-18).
 - Left for later: `infra/bedrock_profile.py` and the IAM permission (F3); the single monthly stage (question 2); the company filter beyond the one-company check; the bake-off script in the repo; environment parity (finding 13); the property-test bugs (finding 12) and the `TARGET_MAP` case bug (C06), which change rows.
 
 Original plan:
@@ -165,7 +165,11 @@ Original plan:
 
 For later, outside the deadline: `alarms.py` and `budget.py`. In the meantime an SNS notification from the exit trap is used.
 
-### F4 · CI/CD (2 days)
+### F4 · CI/CD (2 days) — **implemented on branches `f4-ci` (checks) and `f4-cicd` (2026-11-22); rollout steps 2–3 applied**
+
+**Status (2026-11-22):** code and tests done; nothing merged yet. `ci.yml` (lint, ShellCheck, `py_compile` 3.10 and 3.9, gitleaks, `verify.sh quick`) goes in its own checks-only PR (`f4-ci`). `f4-cicd` has `deploy.yml` (after a green CI on a push to `main`, or `workflow_dispatch` with a `sha` for rollback), `infra/release.py` (publish, move `releases/current`, deploy-only request, start, wait for the result, restore the pointer on failure), `infra/instance/pi_deploy.py` + `pi-deploy.service` (pull-on-boot on every boot: sha256, safe extract, atomic `current` symlink, keeps 5, shuts down only after a deploy-only boot and never inside the monthly window) and the new deploy role policy. Changes against the plan: the deploy-only signal is an S3 request object instead of the `pi-mode` tag, and a changed `environment.yml` is refused unless `--allow-env-update` is run over SSM (see `decisions.md`, 2026-11-22). Applied 2026-11-22 (Mafer): the deploy role policy re-applied (`check_pi --only iam oidc` 0 FAIL) and the GitHub secret `PI_DEPLOY_ROLE_ARN` created. Pending, with Mafer's OK and never on the last Thursday of the month: merge the two PRs, re-run `bootstrap.sh` on the instance, merge `server-improvement` into `main`, then the ticket tests (`docs/runbook.md`, *F4 rollout (once)*). Question 8 (manual approval) is still open; default: none.
+
+Original plan:
 
 - `ci.yml`:
   - lint;
