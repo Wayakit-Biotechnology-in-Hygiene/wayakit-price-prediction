@@ -149,7 +149,7 @@ Original plan:
 
 ### F3 · `infra/` (3 days) — each script is run with Mafer's OK
 
-**Status (2026-11-18): scripts written and tested on branch `f3-infra`; runbook steps 1–6 applied with Mafer's OK (bucket, alerts, Bedrock profiles, instance, scheduler and deploy roles; `check_pi` OK for them). Steps 7–13 (audit, schedule, instance switch, deploy, enable) are pending.** Decisions: production branch `main` at the end (deploy role trust); new instance role instead of editing the old one, after a read-only CloudTrail audit; failure alerts by email through SNS (address passed at run time); **one run, no stages** (Mafer), started by the monthly schedule and guarded on boot; schedule created disabled. Next: Mafer approves each script (`--dry-run` first, then apply), then F2 is merged and deployed.
+**Status (2026-11-22): applied.** Steps 1–7 on 2026-11-18 and the cutover (steps 8–13) on 2026-11-22, with Mafer's OK: weekly schedules disabled, monthly schedule ENABLED, instance on `price-intelligence-instance`, F2 + F3 deployed (`server-improvement` @ 636bcf0), bootstrap done, smoke test on the instance (secret read, Bedrock preflight) OK, `check_pi` 74 OK / 0 WARN / 0 FAIL. First monthly run: Thursday 2026-11-26, 21:50 CDMX. Decisions: production branch `main` at the end (deploy role trust); new instance role instead of editing the old one, after a read-only CloudTrail audit; failure alerts by email through SNS (address passed at run time); **one run, no stages** (Mafer), started by the monthly schedule and guarded on boot; schedule created disabled. Next: check the first monthly run (2026-11-26); then revoke the Gemini key and remove it from `prod/wayakit-app`; optionally `schedule.py --delete-retired`.
 
 | Script | What it sets up |
 |---|---|

@@ -4,13 +4,13 @@ Context for Claude Code in this repo. Always reply to the user (Mafer) in Spanis
 
 ## What it is
 
-Wayakit project that suggests selling prices for the Saudi Arabia (KSA) products based on competitor prices. Today: Selenium scrapers (Amazon, Mumzworld, SACO and B2B stores) and Bedrock (DeepSeek V3.2, Haiku 4.5 fallback; since F2 on branch `f2-hardening`, Gemini before) to decide relevance → `scraper/competitors_complete.csv` → `ml_model/` (price per liter or per piece, p10–p90 trimming, RandomForest) → `product.price.suggestion` in Odoo. It runs on the EC2 `wayakit-app-server` (eu-north-1, almost always stopped): two EventBridge schedules in the `default` group start it on Thursday and Friday at 21:50 (CDMX), the `ec2-user` crontab launches `run_pipeline.sh` on Friday 04:00 UTC (stage 1) and `run_pipeline.sh --stage 2` on Saturday 04:00 UTC (Thursday and Friday 22:00 CDMX), and the `trap EXIT` stops it when it finishes. The instance runs the **`server-improvement`** branch (e25e2c9), not `main`. Access through SSM (no SSH). **F2 must not reach the instance before F3** grants `bedrock:InvokeModel` to the instance role (the run would stop at the Bedrock preflight): Mafer decided (2026-11-18) to merge `f2-hardening` into `server-improvement` only after F3.
+Wayakit project that suggests selling prices for the Saudi Arabia (KSA) products based on competitor prices. Today: Selenium scrapers (Amazon, Mumzworld, SACO and B2B stores) and Bedrock (DeepSeek V3.2, Haiku 4.5 fallback; since F2 on branch `f2-hardening`, Gemini before) to decide relevance → `scraper/competitors_complete.csv` → `ml_model/` (price per liter or per piece, p10–p90 trimming, RandomForest) → `product.price.suggestion` in Odoo. It runs on the EC2 `wayakit-app-server` (eu-north-1, almost always stopped). Since the F3 cutover (2026-11-22): the schedule `price-intelligence/price-intelligence-monthly` starts it on the last Thursday of each month at 21:50 (CDMX), `pi-pipeline.service` runs `run_pipeline.sh` (one run, no stages) only inside the boot-guard window, and the `trap EXIT` stops it when it finishes; the old `default` weekly schedules are disabled (kept for rollback) and the old crontab lines were removed. The instance runs the **`server-improvement`** branch at 636bcf0 (F2 + F3), not `main`, with the role `price-intelligence-instance`. Access through SSM (no SSH). First monthly run: Thursday 2026-11-26.
 
 Documentation: [docs/runbook.md](docs/runbook.md) (how to operate it and known issues), [docs/resources.md](docs/resources.md) (what exists), [docs/decisions.md](docs/decisions.md) (why).
 
 ## Status
 
-Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/plan.md). What is still to be decided: [docs/decisions.md#pending](docs/decisions.md#pending). In AWS, F3 steps 1–6 were applied on 2026-11-18 with Mafer's OK (bucket, SNS alerts, Bedrock profiles, the instance, scheduler and deploy roles, the GitHub OIDC provider); the schedule, the instance switch and the deploy (steps 8–13) are not. Anything marked "Planned (F#)" does not exist.
+Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/plan.md). What is still to be decided: [docs/decisions.md#pending](docs/decisions.md#pending). In AWS, F3 is fully applied with Mafer's OK: steps 1–7 on 2026-11-18, the cutover (steps 8–13) on 2026-11-22 (`check_pi`: 74 OK, 0 WARN, 0 FAIL). Pending after the first monthly run: revoke the Gemini key and remove it from `prod/wayakit-app`, then optionally `schedule.py --delete-retired`. Anything marked "Planned (F#)" does not exist.
 
 ## Rules that are never broken
 
@@ -37,8 +37,8 @@ Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/pl
 
 ## Known pitfalls
 
-- **Silent failures (fixed in F2 on `f2-hardening`, still live on the instance until it is deployed):** bare `exit()`, swallowed exceptions and stage 2 steps without `|| exit 1`. On the branch every error exits 1; do not reintroduce `exit()` or an `except` that only logs.
-- **`git pull` in stage 2** is still on the instance (old `run_pipeline.sh`) and can pull new code of `server-improvement` on its own; F2 removes it. Until F4, code reaches the instance with a manual pull over SSM: the GitHub repo is public, so anonymous HTTPS works; never put a personal account or token on the instance (if the repo is made private, a read-only deploy key generated on the instance).
+- **Silent failures (fixed in F2, deployed 2026-11-22):** bare `exit()`, swallowed exceptions and stage 2 steps without `|| exit 1`. On the branch every error exits 1; do not reintroduce `exit()` or an `except` that only logs.
+- **No `git pull` in the pipeline** since the 2026-11-22 deploy (the old stage 2 pull is gone). Until F4, code reaches the instance with a manual pull over SSM (the instance's `origin` now points at the organization repo URL): the GitHub repo is public, so anonymous HTTPS works; never put a personal account or token on the instance (if the repo is made private, a read-only deploy key generated on the instance).
 - **Case-sensitive subindustry:** `TARGET_MAP.get` in `sites_for()` (`scraper/main.py`) uses `'Land Transportation'` and the data has `'Land transportation'`; those rows are never scraped and there is no warning.
 - **New CSV column = `config.py` + `main.py` at the same time:** `csv.DictWriter` (`_run()` in `scraper/main.py`) uses the default `extrasaction='raise'`.
 - **Odoo reads with 0 records exit 1** (F2): products, sales (rolling 12 months) and competitor products. An empty read would otherwise leave the previous run's CSV in use.
@@ -48,7 +48,7 @@ Not maintained here. Phases, findings and open questions: [docs/plan.md](docs/pl
 - **Inconsistent sizes in Apify:** in `junglee`, `Item Volume`, `Unit Count` and `Size` often do not match; keep the 2-out-of-3-sources rule.
 - **Wayakit products show up in the results** (Amazon and Noon). Today nothing excludes them; the Apify adapters must discard the Wayakit brand and seller.
 
-## `infra/` conventions (F3, branch `f3-infra`; steps 1–6 applied 2026-11-18, steps 8–13 still need Mafer's OK)
+## `infra/` conventions (F3, applied 2026-11-18 and 2026-11-22; every re-apply still needs Mafer's OK)
 
 - One script per resource, with boto3. Each one can be run more than once (if the resource exists, it updates it; it never duplicates it), accepts `--dry-run` and has a docstring in English that says what it leaves configured and how to use it.
 - Shared configuration in `infra/config.py` (profile, region, tag, names, cron). Do not duplicate constants.

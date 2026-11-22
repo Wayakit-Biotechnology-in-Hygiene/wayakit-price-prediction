@@ -37,7 +37,7 @@ flowchart TD
 
 Details in [docs/runbook.md](docs/runbook.md) and [docs/decisions.md](docs/decisions.md).
 
-### F3 (scripts written; steps 1–6 applied 2026-11-18, cutover pending)
+### F3 (applied: 2026-11-18 and cutover 2026-11-22)
 
 - `infra/`: one boto3 script per resource, idempotent, with `--dry-run`, run as `python -m infra.<name>` with the `wayakit-vdc` profile in eu-north-1: S3 bucket, a new least-privilege instance role (with Bedrock), scheduler role, GitHub OIDC provider and deploy role (only `main`), Bedrock application inference profiles, SNS failure alerts by email, the monthly schedule and adopting the instance (IMDSv2, new instance profile). `python -m infra.check_pi` checks all of it read-only.
 - Run model: **one run, no stages** (Mafer, 2026-11-18). `run_pipeline.sh` takes no arguments (any argument exits 1) and runs, in order: Odoo products → `scraper/analysis-odoo.csv` → scraping (`timeout 30h`) → Odoo quotations and competitor products → preprocessing, training and prediction → upload to Odoo (`--run_mode full`). The search keywords come from the versioned `scraper/modifiers_mapping.csv`; their review (plan question 2) happens outside the run. No state files (`run_mode.txt`, `last_full_run.txt` are gone) and no partial mode (`ml_model/filter_new_products.py` was removed). `pi-pipeline.service` on the instance runs it only on the scheduled boot (last Thursday of the month, 21:40–23:00 Mexico City, `infra/instance/pi_boot_guard.py`); it replaces the crontab. A failed run sends an email through SNS from the exit trap, naming the failed step.
@@ -49,8 +49,8 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 
 - **Planned (F6):** Amazon KSA and Noon KSA through Apify (`junglee/amazon-crawler` and `saswave/noon-product-scraper`), in VdC's Apify account. Mumzworld and SACO stay the same.
 - **F2 (in the code):** relevance with Bedrock instead of Gemini: DeepSeek V3.2 as primary and Claude Haiku 4.5 as fallback, in batches and with the same `RelevanceAgent` interface. Needs the F3 permission to run on the instance.
-- **F3 (scripts ready, not applied):** a single monthly full run on the last Thursday of each month at 21:50 Mexico City (`run_pipeline.sh` with no arguments: one run, no stages; the keyword review happens outside the run and never blocks it), started by the `price-intelligence-monthly` schedule and gated by a boot guard.
-- **F3 (steps 1–6 applied 2026-11-18):** resources in `infra/` (boto3 scripts with `--dry-run`, tag `project=price-intelligence`), state bucket in S3 (`price-intelligence-<account>`; nothing writes to it yet) and SNS failure alerts by email.
+- **F3 (applied 2026-11-22; first run 2026-11-26):** a single monthly full run on the last Thursday of each month at 21:50 Mexico City (`run_pipeline.sh` with no arguments: one run, no stages; the keyword review happens outside the run and never blocks it), started by the `price-intelligence-monthly` schedule and gated by a boot guard.
+- **F3 (applied 2026-11-22):** resources in `infra/` (boto3 scripts with `--dry-run`, tag `project=price-intelligence`), state bucket in S3 (`price-intelligence-<account>`; nothing writes to it yet) and SNS failure alerts by email.
 - **Planned (F4):** pull-on-boot CI/CD from `main`: GitHub Actions (OIDC, deploy role from F3) publishes the release to S3 and starts the instance in "deploy only" mode.
 - **F2 (in the code):** safe upload to Odoo (`create` of the new batch and then `unlink` of the previous one), with `--dry-run` and a company guard.
 
