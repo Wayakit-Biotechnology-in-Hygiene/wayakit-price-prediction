@@ -357,21 +357,21 @@ def test_adopt_apply_replaces_the_profile_and_fixes_tags_and_imds(capsys):
     # The profile is checked before any change (a missing profile must leave nothing half-applied).
     stub_shutdown_attr(s)
     stub_profile(s)
+    stub_assocs(s, [assoc_doc(OLD_PROFILE_ARN)])
     s.add("ec2", "create_tags", {}, {"Resources": [IID],
                                      "Tags": [{"Key": "project", "Value": "price-intelligence"}]})
     s.add("ec2", "modify_instance_metadata_options",
           {"InstanceId": IID, "InstanceMetadataOptions": CONVERGED_MD},
           {"InstanceId": IID, "HttpTokens": "required", "HttpPutResponseHopLimit": 2,
            "HttpEndpoint": "enabled"})
-    stub_assocs(s, [assoc_doc(OLD_PROFILE_ARN)])
     s.add("ec2", "replace_iam_instance_profile_association", assoc_response(NEW_PROFILE_ARN),
           {"IamInstanceProfile": {"Arn": NEW_PROFILE_ARN}, "AssociationId": ASSOC_ID})
     rc, out = run_main(s, [], capsys)
     assert rc == 0
     s.verify()
     assert s.names == ["GetCallerIdentity", "DescribeInstances", "DescribeInstanceAttribute",
-                       "GetInstanceProfile", "CreateTags", "ModifyInstanceMetadataOptions",
-                       "DescribeIamInstanceProfileAssociations",
+                       "GetInstanceProfile", "DescribeIamInstanceProfileAssociations",
+                       "CreateTags", "ModifyInstanceMetadataOptions",
                        "ReplaceIamInstanceProfileAssociation"]
     # The rollback is printed before the switch, with the previous profile's name.
     assert f"previous instance profile: {OLD_PROFILE}" in out
@@ -526,7 +526,7 @@ def test_terminated_instances_are_not_searched():
 # --- rollback ------------------------------------------------------------------------------------
 def test_rollback_reassociates_the_old_profile_and_nothing_else(capsys):
     s = StubSession()
-    stub_describe(s, [instance_doc(tags=[], metadata=LEGACY_MD)])
+    stub_describe(s, [instance_doc(tags=[], metadata=LEGACY_MD, state="running")])
     stub_profile(s, name=OLD_PROFILE)
     stub_assocs(s, [assoc_doc(NEW_PROFILE_ARN)])
     s.add("ec2", "replace_iam_instance_profile_association", assoc_response(OLD_PROFILE_ARN),
@@ -550,6 +550,7 @@ def test_rollback_dry_run_only_reads(capsys):
     s.verify()
     assert not MUTATING_OPS & set(s.names)
     assert f"[dry-run] would replace instance profile {OLD_PROFILE}" in out
+    assert "[WARN] the apply would stop here: the instance is stopped" in out
 
 
 def test_rollback_of_a_missing_profile_exits_1():
@@ -659,8 +660,8 @@ class FakeAws:
     """Stateful STS + EC2 + IAM double for one instance. Records every call by API name."""
 
     def __init__(self, tags=None, metadata=None, profile=OLD_PROFILE, shutdown="stop",
-                 profiles=(NEW_PROFILE, OLD_PROFILE), instances=1, roleless=()):
-        self.instance = instance_doc(tags=tags, metadata=metadata)
+                 profiles=(NEW_PROFILE, OLD_PROFILE), instances=1, roleless=(), state="running"):
+        self.instance = instance_doc(tags=tags, metadata=metadata, state=state)
         self.instances = instances
         self.association = None if profile is None else {
             "AssociationId": "iip-assoc-fake-1", "InstanceId": IID, "State": "associated",
@@ -721,6 +722,8 @@ class FakeAws:
     def replace_iam_instance_profile_association(self, IamInstanceProfile, AssociationId):
         self.calls.append("ReplaceIamInstanceProfileAssociation")
         assert self.association and AssociationId == self.association["AssociationId"]
+        if self.instance["State"]["Name"] != "running":  # real AWS, seen 2026-11-22
+            raise _client_error("IncorrectState", "ReplaceIamInstanceProfileAssociation")
         self._associate(IamInstanceProfile["Arn"])
         return {}
 
@@ -1513,3 +1516,53 @@ def test_every_step_in_dry_run_changes_nothing(box):
     assert "[dry-run] would run: dnf install -y" in out
     assert "[dry-run] would run: systemctl enable pi-pipeline.service" in out
     assert ACCOUNT not in out + err
+
+
+# =============================================================================================
+# ec2_instance.py: a profile REPLACE needs the instance running (IncorrectState, 2026-11-22)
+# =============================================================================================
+@pytest.mark.parametrize("state", ["stopped", "stopping", "pending"])
+@pytest.mark.parametrize("argv", [[], ["--rollback-profile", OLD_PROFILE]])
+def test_replace_on_an_instance_not_running_exits_1_before_any_change(state, argv, capsys):
+    current = NEW_PROFILE if argv else OLD_PROFILE
+    aws = FakeAws(tags=[FOREIGN_TAG], metadata=dict(LEGACY_MD), profile=current, state=state)
+    before = aws.snapshot()
+    with pytest.raises(SystemExit) as exc:
+        ec2i.main(argv, session=aws)
+    assert "Cannot switch the instance profile: the instance is " + state in str(exc.value.code)
+    assert "Nothing was changed." in str(exc.value.code)
+    assert aws.mutations() == [], aws.calls
+    assert aws.snapshot() == before
+    assert_clean_output(capsys.readouterr().out + str(exc.value.code))
+
+
+@pytest.mark.parametrize("argv", [[], ["--rollback-profile", OLD_PROFILE]])
+def test_replace_dry_run_on_a_stopped_instance_warns_and_exits_0(argv, capsys):
+    current = NEW_PROFILE if argv else OLD_PROFILE
+    aws = FakeAws(profile=current, state="stopped")
+    before = aws.snapshot()
+    assert ec2i.main(argv + ["--dry-run"], session=aws) == 0
+    out = capsys.readouterr().out
+    assert aws.mutations() == [] and aws.snapshot() == before
+    assert "[WARN] the apply would stop here: the instance is stopped" in out
+    assert "Start it" in out and "Nothing was changed" not in out
+    assert_clean_output(out)
+
+
+def test_associate_and_converged_are_not_blocked_on_a_stopped_instance():
+    aws = FakeAws(tags=[FOREIGN_TAG], metadata=dict(LEGACY_MD), profile=None, state="stopped")
+    assert ec2i.main([], session=aws) == 0
+    assert aws.converged() and "AssociateIamInstanceProfile" in aws.calls
+    aws.calls.clear()
+    assert ec2i.main([], session=aws) == 0 and aws.mutations() == []
+
+
+@pytest.mark.parametrize("state,action,blocked", [
+    ("running", "replace", False), ("stopped", "replace", True), ("stopping", "replace", True),
+    ("pending", "replace", True), ("stopped", "associate", False), ("stopped", "none", False),
+    (None, "replace", True)])
+def test_replace_blocked_reason(state, action, blocked):
+    instance = {"State": {"Name": state}} if state else {}
+    reason = ec2i.replace_blocked_reason(instance, {"action": action})
+    assert (reason is not None) == blocked
+    assert ec2i.replace_blocked_reason({"State": {"Name": "stopped"}}, None) is None

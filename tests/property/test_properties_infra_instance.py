@@ -566,3 +566,28 @@ def test_mask_instance_ids_equals_the_reference_and_is_idempotent(texts, locale)
                 min_size=1, max_size=8))
 def test_mask_instance_ids_without_an_i_dash_is_the_identity(texts):
     assert run_mask(texts) == texts
+
+
+@given(tag_lists, metadata, profiles, shutdowns, st.sampled_from(["stopped", "stopping", "pending"]))
+@example([], {"State": "applied", "HttpTokens": "required", "HttpPutResponseHopLimit": 2,
+              "HttpEndpoint": "enabled"}, OLD_PROFILE, "stop", "stopped")  # the 2026-11-22 cutover
+def test_not_running_instance_never_gets_a_half_applied_adopt(tags, md, profile, shutdown, state):
+    """AWS replaces a profile only on a running instance: a due replace exits 1 before any change;
+    with nothing to replace (no profile, or already the PI one) the apply converges as usual."""
+    aws = FakeAws(tags=tags, metadata=md, profile=profile, shutdown=shutdown, state=state,
+                  profiles=(NEW_PROFILE, OLD_PROFILE, "some-other-profile"))
+    before = aws.snapshot()
+    rc, out = _quiet(ec2i.main, ["--dry-run"], session=aws)
+    assert rc == 0 and aws.mutations() == [] and aws.snapshot() == before
+    _assert_clean(out)
+    if profile in (None, NEW_PROFILE):
+        rc, out = _quiet(ec2i.main, [], session=aws)
+        assert rc == 0 and aws.converged()
+        assert "ReplaceIamInstanceProfileAssociation" not in aws.calls
+    else:
+        assert "[WARN] the apply would stop here" in out
+        with pytest.raises(SystemExit) as exc:
+            _quiet(ec2i.main, [], session=aws)
+        assert exc.value.code not in (0, None)
+        assert aws.mutations() == [] and aws.snapshot() == before
+        _assert_clean(str(exc.value.code))

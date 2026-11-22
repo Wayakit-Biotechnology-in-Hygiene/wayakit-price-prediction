@@ -10,8 +10,13 @@ What it leaves configured (default "adopt" mode, on the existing instance found 
 The profile is checked before anything is changed: if it is missing (or has no role) the script
 exits 1 with the instance untouched.
 It never stops, starts, reboots or terminates the instance and never changes its type. Changing
-the metadata options or the profile works on a stopped or a running instance; on a running one the
-new role's credentials reach the processes within minutes. It also warns if the instance's
+the metadata options, or associating a profile when there is none, works on a stopped or a running
+instance. **Replacing** a profile (the adopt switch and `--rollback-profile`) needs the instance
+running: on a stopped one AWS answers `IncorrectState` ("not the active association"; seen on
+2026-11-22). So when a replace is due and the instance is not running, the apply exits 1 before
+changing anything (the dry-run prints a WARN): start the instance (outside the last-Thursday window
+the boot runs nothing), run the script again, then stop it. On a running instance the new role's
+credentials reach the processes within minutes. It also warns if the instance's
 shutdown behavior is not `stop` (`run_pipeline.sh` ends with `shutdown -h`, which would TERMINATE
 an instance set to `terminate`).
 
@@ -259,11 +264,50 @@ def resolve_profile(iam, profile_name, dry_run, account):
     return arn
 
 
-def ensure_profile(ec2, instance, profile_name, arn, dry_run, account):
-    """Associates `profile_name` (ARN from resolve_profile); returns the plan (see association_plan)."""
+def replace_blocked_reason(instance, plan):
+    """Why `plan` cannot be applied now, or None.
+
+    AWS replaces an instance profile association only on a running instance (`IncorrectState`,
+    "not the active association", on a stopped one). Associating when there is none, or doing
+    nothing, is never blocked.
+    """
+    state = (instance.get("State") or {}).get("Name")
+    if not plan or plan.get("action") != "replace" or state == "running":
+        return None
+    return (f"the instance is {state}: AWS replaces an instance profile only on a running instance "
+            "(IncorrectState otherwise). Start it (outside the last-Thursday window the boot runs "
+            "nothing), run this script again, then stop it. Nothing was changed.")
+
+
+def plan_profile(ec2, instance, arn, dry_run, account):
+    """Reads the association and plans the profile change before anything is changed.
+
+    Returns the plan (see association_plan), or None when `arn` is None (dry-run with a missing
+    profile). A replace on an instance that is not running is a WARN in dry-run and exits 1 in an
+    apply, so the tags and the metadata options are not changed either.
+    """
+    if arn is None:
+        return None
+    plan = association_plan(current_associations(ec2, instance["InstanceId"]), arn)
+    reason = replace_blocked_reason(instance, plan)
+    if reason:
+        if not dry_run:
+            raise SystemExit(f"Cannot switch the instance profile: {reason}")
+        _aws.report(f"[WARN] the apply would stop here: {reason[:-len(' Nothing was changed.')]}",
+                    account=account)
+    return plan
+
+
+def ensure_profile(ec2, instance, profile_name, arn, dry_run, account, plan=None):
+    """Associates `profile_name` (ARN from resolve_profile); returns the plan (see association_plan).
+
+    `plan` is the one from plan_profile (read before any change); without it the association is
+    read here.
+    """
     if arn is None:  # dry-run with a missing profile: resolve_profile already warned
         return {"action": "missing", "association_id": None, "previous_profile": None}
-    plan = association_plan(current_associations(ec2, instance["InstanceId"]), arn)
+    if plan is None:
+        plan = association_plan(current_associations(ec2, instance["InstanceId"]), arn)
     if plan["action"] == "none":
         _aws.report(f"instance profile: OK ({profile_name})", account=account)
         return plan
@@ -340,15 +384,18 @@ def main(argv=None, session=None):
     _aws.report(f"instance '{config.INSTANCE_NAME}': {instance['State']['Name']}", account=account)
     if args.rollback_profile:
         arn = resolve_profile(iam, args.rollback_profile, args.dry_run, account)
-        ensure_profile(ec2, instance, args.rollback_profile, arn, args.dry_run, account)
+        plan = plan_profile(ec2, instance, arn, args.dry_run, account)
+        ensure_profile(ec2, instance, args.rollback_profile, arn, args.dry_run, account, plan=plan)
         return 0
-    # Reads and the profile check first: a missing profile must stop the run before the tags or
-    # the metadata options are changed (no half-applied adopt).
+    # Reads and the profile checks first: a missing profile, or a replace on an instance that is
+    # not running, must stop the run before the tags or the metadata options are changed (no
+    # half-applied adopt).
     check_shutdown_behavior(ec2, instance, account)
     arn = resolve_profile(iam, config.INSTANCE_PROFILE, args.dry_run, account)
+    plan = plan_profile(ec2, instance, arn, args.dry_run, account)
     ensure_tags(ec2, instance, args.dry_run, account)
     ensure_imdsv2(ec2, instance, args.dry_run, account)
-    ensure_profile(ec2, instance, config.INSTANCE_PROFILE, arn, args.dry_run, account)
+    ensure_profile(ec2, instance, config.INSTANCE_PROFILE, arn, args.dry_run, account, plan=plan)
     return 0
 
 
