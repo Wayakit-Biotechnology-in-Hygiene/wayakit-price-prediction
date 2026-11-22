@@ -8,9 +8,14 @@ refactor must not change a single byte for the same Odoo records.
 How: the base version of each script (`PI_BASE_REF`, default `origin/server-improvement`, read
 with `git show`) is executed in-process inside a temporary directory, with `boto3.session.Session`
 and `xmlrpc.client.ServerProxy` replaced by fakes (fake secret, fake Odoo returning the generated
-records): nothing reaches AWS or Odoo. The new version runs `main(argv, session=<fake>)`.
-Both CSVs must be byte-identical, and both versions must send the same `execute_kw` query (the
-sales window of `odoo_api_cotizations.py` is the only intended difference: C12).
+records): nothing reaches AWS or Odoo. The base can have either shape:
+- pre-F2 (e.g. 8c278ca): the work happens at import time, so it runs with `runpy` as `__main__`;
+- F2 and later (`def main(argv, ...)`, e.g. the base after the F3 cutover): it is imported and its
+  `main(argv, session=<fake>)` is called with the same fake Odoo, exactly like the new version.
+The new version runs `main(argv, session=<fake>)`. Both CSVs must be byte-identical, and both
+versions must send the same `execute_kw` query (against a pre-F2 base, the sales window of
+`odoo_api_cotizations.py` is the only intended difference: C12; an F2 base gets the same `today`).
+Modules shared by both versions (`pi_odoo`, `log_config`, ...) come from the working tree.
 
 If the base ref does not exist locally the test FAILS (`git fetch origin`), as the ML differential.
 """
@@ -18,7 +23,9 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib.util
 import json
+import re
 import runpy
 import subprocess
 import sys
@@ -81,12 +88,35 @@ class FakeBotoSession:
         return FakeSecretsClient()
 
 
-def _run_base(rel: str, records: list, workdir: Path) -> tuple[Path, list]:
-    """Runs the base script `rel` in `workdir` against fakes; returns (output CSV path, calls)."""
+def _has_main_entry(source: str) -> bool:
+    """True if the base script has the F2 shape: no import side effects, `main(argv, ...)` entry."""
+    return re.search(r"^def main\(argv", source, re.MULTILINE) is not None
+
+
+def _import_base(script: Path):
+    """Imports a base script written to disk (F2 shape: importing it reads no secrets)."""
+    spec = importlib.util.spec_from_file_location("pi_base_" + re.sub(r"\W", "_", script.stem), script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_session(models) -> OdooSession:
+    return OdooSession(models=models, db="FAKE-db", uid=1, api_token="FAKE-token")
+
+
+def _run_base(rel: str, records: list, workdir: Path, out_rel: str, **kwargs) -> tuple[Path, list]:
+    """Runs the base script `rel` in `workdir` against fakes; returns (output CSV path, calls).
+
+    `kwargs` (e.g. `today`) only reach an F2-shaped base; a pre-F2 base takes none.
+    """
     load_module("ml_model/1a_preprocess_data.py")  # installs the file-less log_config in sys.modules
+    source = _base_source(rel)
     script = workdir / rel
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(_base_source(rel), encoding="utf-8")
+    script.write_text(source, encoding="utf-8")
+    out = workdir / out_rel
+    out.parent.mkdir(parents=True, exist_ok=True)
     models = FakeModels(records)
 
     def server_proxy(url, *args, **kwargs):
@@ -99,19 +129,23 @@ def _run_base(rel: str, records: list, workdir: Path) -> tuple[Path, list]:
         stack.enter_context(mock.patch.object(sys, "argv", [str(script)]))
         stack.enter_context(in_directory(workdir))
         try:
-            runpy.run_path(str(script), run_name="__main__")
-        except SystemExit as e:  # the base scripts call exit() on errors
+            if _has_main_entry(source):
+                code = _import_base(script).main(["--output", str(out)], session=_fake_session(models), **kwargs)
+                if code != 0:
+                    pytest.fail(f"base {rel} returned {code!r} on valid records", pytrace=False)
+            else:
+                runpy.run_path(str(script), run_name="__main__")
+        except SystemExit as e:  # the pre-F2 base scripts call exit() on errors
             pytest.fail(f"base {rel} exited with {e.code!r} on valid records", pytrace=False)
         finally:
             sys.path[:] = saved_path
-    return workdir, models.calls
+    return out, models.calls
 
 
 def _run_new(rel: str, records: list, out: Path, **kwargs) -> list:
     module = load_module(rel)
     models = FakeModels(records)
-    session = OdooSession(models=models, db="FAKE-db", uid=1, api_token="FAKE-token")
-    code = module.main(["--output", str(out)], session=session, **kwargs)
+    code = module.main(["--output", str(out)], session=_fake_session(models), **kwargs)
     assert code == 0, f"new {rel} returned {code} on valid records"
     return models.calls
 
@@ -119,10 +153,10 @@ def _run_new(rel: str, records: list, out: Path, **kwargs) -> list:
 def _compare(rel: str, out_rel: str, records: list, **new_kwargs) -> tuple[list, list]:
     with tempfile.TemporaryDirectory(prefix="pi-odoo-eq-") as tmp:
         tmp = Path(tmp)
-        base_dir, base_calls = _run_base(rel, records, tmp / "base")
+        base_out, base_calls = _run_base(rel, records, tmp / "base", out_rel, **new_kwargs)
         new_out = tmp / "new.csv"
         new_calls = _run_new(rel, records, new_out, **new_kwargs)
-        base_bytes = (base_dir / out_rel).read_bytes()
+        base_bytes = base_out.read_bytes()
         new_bytes = new_out.read_bytes()
         assert new_bytes == base_bytes, (
             f"{rel}: CSV differs from base for the same records\n--- base ---\n"
@@ -191,7 +225,8 @@ def test_competitor_products_csv_is_identical_to_base(records):
 @given(st.lists(sale_line, min_size=1, max_size=6))
 def test_sales_csv_is_identical_to_base_and_only_the_window_changes(records):
     # The fake Odoo ignores the domain, so both versions get the same lines; the only intended
-    # difference is the date window (base: fixed 2025; new: rolling 12 months up to `today`).
+    # difference is the date window (pre-F2 base: fixed 2025; new: rolling 12 months up to `today`;
+    # an F2-shaped base gets the same `today`, so its window must match too).
     base_calls, new_calls = _compare("ml_model/odoo_api_cotizations.py", "ml_model/wayakit_cotizations.csv",
                                      records, today=date(2026, 11, 17))
     assert len(base_calls) == len(new_calls) == 1
@@ -207,8 +242,9 @@ def test_sales_csv_is_identical_to_base_and_only_the_window_changes(records):
 
 
 # --- scraper/odoo_api_connection_products.py (scraping list) --------------------------------------
-# It no longer talks to Odoo, but the base version read the secret and authenticated before
-# building the list; with the fakes above it runs offline. Same products + modifiers CSVs must
+# It no longer talks to Odoo, but the pre-F2 base read the secret and authenticated before
+# building the list; with the fakes above it runs offline. An F2-shaped base is imported and its
+# `main(argv)` called, like the new version. Same products + modifiers CSVs must
 # give a byte-identical `analysis-odoo.csv` (it decides what gets scraped).
 small = st.sampled_from(["H1-Floor cleaner", "H2-Glass cleaner", "P1-Pet wipes", "C1-Car shampoo", ""])
 product_row = st.fixed_dictionaries({
@@ -240,9 +276,10 @@ def test_scraping_list_is_identical_to_base(products, modifiers):
         argv = ["--input_odoo_products_file", str(products_csv), "--modifiers_file", str(modifiers_csv)]
 
         base_out, new_out = tmp / "base.csv", tmp / "new.csv"
+        source = _base_source(rel)
         script = tmp / "base" / rel
         script.parent.mkdir(parents=True)
-        script.write_text(_base_source(rel), encoding="utf-8")
+        script.write_text(source, encoding="utf-8")
         load_module("ml_model/1a_preprocess_data.py")  # file-less log_config
         saved_path = list(sys.path)
         with contextlib.ExitStack() as stack:
@@ -251,7 +288,12 @@ def test_scraping_list_is_identical_to_base(products, modifiers):
             stack.enter_context(mock.patch.object(sys, "argv", [str(script), *argv,
                                                                 "--output_analysis_file", str(base_out)]))
             try:
-                runpy.run_path(str(script), run_name="__main__")
+                if _has_main_entry(source):
+                    code = _import_base(script).main([*argv, "--output_analysis_file", str(base_out)])
+                    if code != 0:
+                        pytest.fail(f"base {rel} returned {code!r} on valid inputs", pytrace=False)
+                else:
+                    runpy.run_path(str(script), run_name="__main__")
             except SystemExit as e:
                 pytest.fail(f"base {rel} exited with {e.code!r} on valid inputs", pytrace=False)
             finally:
