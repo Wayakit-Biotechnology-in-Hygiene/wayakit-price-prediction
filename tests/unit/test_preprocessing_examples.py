@@ -44,10 +44,10 @@ def _scraper_row(product, price, unit, quantity):
     }
 
 
-def _run_main(tmp_path, monkeypatch, scraper_rows, odoo_rows=(ODOO_ROW,)):
+def _run_main(tmp_path, monkeypatch, scraper_rows, odoo_rows=(ODOO_ROW,), scraper_columns=SCRAPER_COLUMNS):
     (tmp_path / "scraper").mkdir()
     (tmp_path / "ml_model").mkdir()
-    pd.DataFrame(list(scraper_rows), columns=SCRAPER_COLUMNS).to_csv(tmp_path / "scraper/competitors_complete.csv", index=False)
+    pd.DataFrame(list(scraper_rows), columns=scraper_columns).to_csv(tmp_path / "scraper/competitors_complete.csv", index=False)
     pd.DataFrame(list(odoo_rows), columns=ODOO_COLUMNS).to_csv(tmp_path / "ml_model/competitor_products_from_odoo.csv", index=False)
     monkeypatch.chdir(tmp_path)
     preprocessing.main()
@@ -107,3 +107,26 @@ def test_process_volumetric_data_without_valid_rows_does_not_fail(tmp_path, monk
     df = pd.DataFrame({"unit_of_measurement": ["g"], "total_quantity": [100.0], "price_sar": [5.0]})
     preprocessing.process_volumetric_data(df)
     assert pd.read_csv("ml_model/competitor_volumetric_processed.csv").empty
+
+
+def test_f6_seller_and_origin_columns_are_inert_c08(tmp_path, monkeypatch):
+    """C08 (F6): a pre-F6 13-column file and a 15-column file (+ seller, origin) with the same rows
+    give the same processed CSVs: old rows stay readable and the new columns (and the source) are
+    not used by 1a. Using origin is F7b."""
+    rows = [
+        _scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0),
+        _scraper_row("Cleaner 2 L", 20.0, "L", 2.0),
+        _scraper_row("Cleaner 32 fl oz", 30.0, "fl oz", 32.0),
+        _scraper_row("Wipes 80", 8.0, "units", 80.0),
+    ]
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    old_volume, old_units = _run_main(old_dir, monkeypatch, rows)
+    new_rows = [{**r, "source": "noon", "seller": "Shop", "origin": "imported"} for r in rows]
+    new_volume, new_units = _run_main(new_dir, monkeypatch, new_rows,
+                                      scraper_columns=SCRAPER_COLUMNS + ["seller", "origin"])
+    assert "seller" not in new_volume.columns and "origin" not in new_volume.columns
+    pd.testing.assert_frame_equal(old_volume, new_volume)
+    pd.testing.assert_frame_equal(old_units, new_units)
+    assert len(new_volume) == 4 and len(new_units) == 1  # 3 scraped + the Odoo row; 1 per-piece row

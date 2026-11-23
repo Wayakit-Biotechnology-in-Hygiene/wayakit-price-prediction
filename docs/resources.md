@@ -19,7 +19,7 @@ Overall status: **everything that exists today was created by hand** (console or
 | Instance profile / IAM role | `Wayakit-EC2-Secrets-Role`, with the managed policies `SecretsManagerReadWrite` and `AmazonSSMManagedInstanceCore` (the latter added on 2026-11-17, F1, Mafer's OK) | By hand | **Too broad**: it can read and write every secret in the account, including `voz-del-cliente/api-keys`. SSM access enabled | No cost |
 | IAM role (Scheduler) | `Wayakit-EventBridge-Role`, with the managed policy `AmazonEC2FullAccess` | By hand | **Too broad**: it only needs to start one instance | No cost |
 | EventBridge Scheduler | `default` group: `Wayakit-Start-Thursday-Night` (`cron(50 21 ? * 5 *)`) and `Wayakit-Start-Friday-Night` (`cron(50 21 ? * 6 *)`), America/Mexico_City time zone. Target `ec2:startInstances` on `wayakit-app-server` | By hand | Active (paused during the F1 inventory and re-enabled on 2026-11-17). They only start the instance; inside, the `ec2-user` crontab launches `run_pipeline.sh` at 04:00 UTC (22:00 Mexico City) | No cost (free tier) |
-| Secret | `prod/wayakit-app`. Keys: `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` (read only through `pi_secrets.py`, since F2) and `GEMINI_API_KEY` (no longer read by the F2 code; still read by the pre-F2 code the instance runs) | By hand | Active, no rotation. Since F2 the name and region live only in `pi_secrets.py` (`SECRET_NAME`, `REGION_NAME`). Only PI uses it (Mafer, 2026-11-17). **The Gemini key leaked into the instance logs** (see Gemini) | ~USD 0.40 / month |
+| Secret | `prod/wayakit-app`. Keys: `ODOO_URL`, `ODOO_DB`, `ODOO_USERNAME`, `ODOO_API_TOKEN` (read only through `pi_secrets.py`, since F2), `APIFY_API_TOKEN` (F6, branch `f6-apify`; pending, to be added by Mafer) and `GEMINI_API_KEY` (no longer read by the F2 code; still read by the pre-F2 code the instance runs) | By hand | Active, no rotation. Since F2 the name and region live only in `pi_secrets.py` (`SECRET_NAME`, `REGION_NAME`). Only PI uses it (Mafer, 2026-11-17). **The Gemini key leaked into the instance logs** (see Gemini) | ~USD 0.40 / month |
 | Leftovers in **me-south-1** | Roles `EC2WayakitSecretsAccessRole` and `EventBridge-EC2-Wayakit-Role`; secret `wayakit/test/credentials` (the one used before 2026-04-05) | By hand | **Not inventoried**: the region endpoint did not respond. The roles were last used in March 2026. What to do with them is question 10 of the plan | Unknown |
 
 What **does not exist** today (verified read-only, except where noted):
@@ -74,7 +74,7 @@ Inventory inside the instance: **done on 2026-11-17 (F1)**. See `docs/runbook.md
 | Resource | Name | Script | Status | Approx. cost |
 |---|---|---|---|---|
 | CloudWatch metrics | Namespace `PriceIntelligence` (the instance role may already publish to it; nothing publishes yet) | To be defined | Planned | Per metric |
-| Apify key | A new key inside `prod/wayakit-app` (key name to be defined) | Manual step (value in the console, by Mafer) | Planned (F6) | No additional cost |
+| Apify key | Key `APIFY_API_TOKEN` inside `prod/wayakit-app` (read only through `pi_secrets.get_secret` by `scraper/services/apify_client.py`, F6 on branch `f6-apify`) | Manual step (value in the console, by Mafer) | **Pending, to be added by Mafer.** Until it exists, `scraper/main.py` on `f6-apify` exits 1 at the Apify preflight | No additional cost |
 | Alarms and budget | — | `infra/alarms.py`, `infra/budget.py` | Outside the tickets' timeframe; meanwhile, the SNS failure alert. Note: CloudWatch alarms cannot publish to a topic encrypted with `alias/aws/sns`; they would need a customer-managed key or another topic | — |
 
 Note on Bedrock: the current decision (2026-11-16) is DeepSeek V3.2 as primary and Haiku 4.5 as fallback, implemented in F2 (`scraper/services/ai_service.py`). The model IDs switch to the application inference profiles without a code change through `PI_RELEVANCE_PRIMARY_MODEL` and `PI_RELEVANCE_FALLBACK_MODEL` (written to `/etc/price-intelligence.env` by `bootstrap.sh`). Whether Bedrock allows a tagged application profile copied from DeepSeek is checked by the first real run of `infra/bedrock_profiles.py`; if not, the primary stays `deepseek.v3.2` and its cost is split by model ID in Cost Explorer.
@@ -85,7 +85,7 @@ Outside the scripts (manual steps):
 |---|---|---|---|
 | DeepSeek V3.2 and Qwen3 agreements (EULA) | Bedrock, eu-north-1 | Accepted with the first invocation of the comparison test, with Mafer's authorization | Done (2026-11-16) |
 | Upgrade the Apify plan (VdC account) | Apify Console | Mafer | Decided; tier and date pending |
-| Apify key value | Secrets Manager, `prod/wayakit-app` | Mafer, console | Planned (F6) |
+| Apify key value (`APIFY_API_TOKEN`) | Secrets Manager, `prod/wayakit-app` | Mafer, console (never pasted in chat, code or logs) | **Pending, to be added by Mafer** (F6 code is ready on `f6-apify`). PI must never read `voz-del-cliente/api-keys` |
 | Volume snapshot before starting the instance | EC2 | With Mafer's OK | Done (2026-11-17) |
 | **Revoke or rotate the Gemini key** (leaked in the logs) and clean up `<repo>/logs/cron.log` and `<repo>/logs/pipeline_execution.log` on the instance | Google (key's project: pending identification) and instance | IT / Mafer | **Urgent** (confirmed in F1, 2026-11-17). Remove `GEMINI_API_KEY` from the secret when the migration to Bedrock is finished (F2) |
 | GitHub secret `PI_DEPLOY_ROLE_ARN` and (optional) environment with manual approval | GitHub, repository settings | Mafer (organization admin) | Secret: created 2026-11-22 (Mafer). Manual approval: not used by default; question 8 still open (enabling it needs the environment, a new OIDC subject and a deploy role re-apply) |
@@ -119,12 +119,12 @@ The final Pets upload is reviewed by Puya and Luisa before writing to Odoo KSA (
 | Field | Value |
 |---|---|
 | Account | VdC's (Mafer's decision). The Starter plan is upgraded to cover PI's spend; the new tier is pending |
-| Actors | `junglee/amazon-crawler` (Amazon KSA, amazon.sa) and `saswave/noon-product-scraper` (Noon KSA), the same ones VdC uses |
-| Approx. cost | ~USD 14 / month: Amazon ~USD 11 (55 keywords × 50 results at USD 0.004) and Noon ~USD 2.5. Do not pass `countryCode` or `zipCode` to junglee (it would add ~USD 137 / month) |
-| Per-run cap | Pending (proposal: USD 20; question 5) |
+| Actors | `junglee/amazon-crawler` (Amazon KSA, amazon.sa; `config.APIFY_AMAZON_ACTOR`) and `saswave/noon-product-scraper` (Noon KSA, one search run per keyword plus one details run for the relevant rows; `config.APIFY_NOON_ACTOR`), the same ones VdC uses |
+| Approx. cost | ~USD 14–15 / monthly run: Amazon ~USD 11 (55 keywords × 50 results at USD 0.004), Noon search ~USD 2.5 and Noon details for relevant rows ~USD 0.5–1. Do not pass `countryCode` or `zipCode` to junglee (it would add ~USD 137 / month) |
+| Caps | **USD 20 per pipeline run** across all actor runs (`config.APIFY_RUN_BUDGET_USD`; Mafer, 2026-11-22; exceeding it aborts with exit 1). Per actor run: `maxTotalChargeUsd` USD 0.50 (`APIFY_AMAZON_MAX_USD`, `APIFY_NOON_MAX_USD`), 50 results (`APIFY_MAX_RESULTS`), 1200 s timeout, 1024 MB, one re-run on failure |
 | Calibration run | Done on 2026-11-16, keyword "pet urine odor remover", ~USD 0.08 |
-| Token | Today PI has no Apify token. It will be stored in `prod/wayakit-app` (F6). Whether it is a token separate from VdC's within the same account is to be defined |
-| Status | Planned (F6). Mumzworld and SACO stay on Selenium |
+| Token | Key `APIFY_API_TOKEN` in `prod/wayakit-app`, **pending, to be added by Mafer** (a token of the VdC account; PI never reads `voz-del-cliente/api-keys`). Sent only in the `Authorization: Bearer` header |
+| Status | Implemented on branch `f6-apify` (2026-11-22), not deployed: needs the token and a paid smoke run with Mafer's OK (`docs/runbook.md`, *Apify*). The Selenium Amazon scraper is deleted on that branch; Mumzworld, SACO and the B2B stores stay on Selenium |
 
 Note: PI shares the account's monthly spending limit with VdC. The account limit and the monthly guard are in the Apify section of `docs/runbook.md` in the `voz-del-cliente` repo.
 

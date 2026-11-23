@@ -626,7 +626,7 @@ Since F2 (not yet on the instance; see [F2 is not on the instance yet](#f2-is-no
 Since F2 (`scraper/main.py`).
 
 - The scraper writes to a temporary file next to the output (`scraper/competitors_complete.tmp.csv`) and only replaces `scraper/competitors_complete.csv` (`os.replace`, atomic on the same filesystem) when the run succeeds. In `append` mode the existing CSV is copied to the temp file first. If the run fails, the previous `competitors_complete.csv` is untouched and the partial rows stay in the `.tmp.csv` for diagnosis (ignored by git; the next run overwrites it).
-- Exit 1 when: the instructions file is missing or unreadable; ChromeDriver cannot be installed; the Bedrock client or the preflight of either model fails; a fatal AI error happens during scraping; any unexpected error in the main loop; zero rows were scraped in total; AI failures > 5 %. An exception in one site/keyword search does not abort the run: it is logged and appears in the `error` column of the coverage report.
+- Exit 1 when: the instructions file is missing or unreadable; ChromeDriver cannot be installed; the Bedrock client or the preflight of either model fails; the Apify preflight fails (F6); a fatal AI or Apify error happens during scraping (`ApifyFatalError`: token, HTTP 4xx, budget); any unexpected error in the main loop; zero rows were scraped in total; AI failures > 5 %; more than 5 % of the Apify keyword searches failed (F6, `APIFY_MAX_FAILED_KEYWORD_RATE = 0.05`). An exception in one site/keyword search does not abort the run: it is logged and appears in the `error` column of the coverage report (for Amazon and Noon it counts toward the 5 % limit checked at the end).
 - `timeout 30h` sends SIGTERM: `main.py` turns it into an exit (code 143 internally; `timeout` returns 124), Chrome is closed by the scrapers' `finally` and the coverage report is still written. The previous CSV is untouched and `run_pipeline.sh` stops before training.
 - New flag: `--coverage_file` (default `scraper/coverage_report.csv`).
 
@@ -641,7 +641,7 @@ Since F2 (`scraper/main.py`).
 | `relevant` | Titles the AI accepted |
 | `rows_written` | Rows added to `competitors_complete.csv` |
 | `ai_failures` | Titles where both models failed (relevance + wipes) |
-| `error` | Exception class if the search failed (e.g. `TimeoutException`, `RelevanceAgentFatalError`), empty otherwise |
+| `error` | Exception class if the search failed (e.g. `TimeoutException`, `RelevanceAgentFatalError`, and since F6 `ApifyRunFailed`, `ApifyFatalError`, `ApifyBudgetExceeded`), empty otherwise |
 
 How to read it:
 
@@ -650,6 +650,80 @@ How to read it:
 - `relevant` > `rows_written`: possible when the scraper's own limit stops early.
 - `ai_failures` > 0: Bedrock problems in that search.
 - The log ends with the list of pairs with 0 relevant results.
+
+## Apify (Amazon and Noon, F6)
+
+Implemented on branch `f6-apify` (2026-11-22); **not on the instance**. Amazon KSA (`junglee~amazon-crawler`, site `amazon`) and Noon KSA (`saswave~noon-product-scraper`, site `noon`) are scraped through the Apify REST API in Home, Automotive and Pets; the Selenium Amazon scraper is deleted. Mumzworld, SACO and the B2B stores stay on Selenium. Code: `scraper/services/apify_client.py` (client, caps, budget), `scraper/scrapers/apify_common.py` (parsing, Wayakit exclusion, `origin`), `scraper/scrapers/amazon_apify.py`, `scraper/scrapers/noon_apify.py`. Decisions: [decisions.md](decisions.md), 2026-11-22 rows.
+
+**Do not pull F6 onto the instance until `APIFY_API_TOKEN` exists in `prod/wayakit-app` and the paid smoke run below passed** (Mafer's OK for both). Without the key the scraper exits 1 at the Apify preflight, so the monthly run would stop at `3. Run scraping` with nothing uploaded.
+
+### Token
+
+- Key `APIFY_API_TOKEN` in `prod/wayakit-app` (eu-north-1), a token of the VdC account. **Pending: Mafer adds it** (see [Changing a key](#changing-a-key)). PI never reads `voz-del-cliente/api-keys`.
+- Read only through `pi_secrets.get_secret`, once per scraper process, on the first Apify call (never at import or when the scrapers are built). The instance role already reads `prod/wayakit-app`; nothing to change in IAM.
+- Before scraping starts, `scraper/main.py` runs the Apify preflight (`GET /users/me/limits`): a missing key, a blank value or a rejected token stops the run with exit 1 before any scraping. The log says `Apify token OK; account monthly usage USD x.xx` (the account is shared with VdC, so that number includes VdC's spend).
+- The token travels only in the `Authorization: Bearer` header. It is never in a URL, a log line, an exception or `repr()`. Never print it to check it.
+
+### Caps and cost
+
+All in `scraper/config.py` (`APIFY_*`):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `APIFY_RUN_BUDGET_USD` | 20.0 | All actor runs of one pipeline run (Mafer, 2026-11-22). Before each actor run the client reserves its cap and refuses to start it if spend + cap > 20: `ApifyBudgetExceeded`, scraping aborted, exit 1 |
+| `APIFY_AMAZON_MAX_USD`, `APIFY_NOON_MAX_USD` | 0.50 | `maxTotalChargeUsd` per actor run |
+| `APIFY_MAX_RESULTS` | 50 | `maxItems` / `maxItemsPerStartUrl`; Noon output is also cut here (the actor returns the full page) |
+| `APIFY_RUN_TIMEOUT_S` | 1200 | Apify-side timeout; the client aborts the run itself at 1200 + 120 s |
+| `APIFY_MEMORY_MB` | 1024 | Same as VdC |
+| `APIFY_RUN_ATTEMPTS` | 2 | A run that ends FAILED, TIMED-OUT or ABORTED is started once more |
+| `APIFY_MAX_FAILED_KEYWORD_RATE` | 0.05 | Failed / attempted Apify keyword searches above this make the scraper exit 1 |
+
+- Expected cost per monthly run: about **USD 14–15** (55 keywords: Amazon ~USD 11, Noon search ~USD 2.5, Noon details for relevant rows ~USD 0.5–1). Each actor run logs `Apify <actor> run <id>: <status>, USD x (spent y of 20.00)`.
+- The account's monthly limit is shared with VdC (`voz-del-cliente/docs/runbook.md`, section *Apify*): if the account hits it, Apify answers with an HTTP 4xx and the run aborts (exit 1).
+- Raising the budget, a per-run cap or `APIFY_MAX_FAILED_KEYWORD_RATE` is a code change in `scraper/config.py` with Mafer's OK, through a PR.
+
+### Failure modes
+
+| What happens | Effect | What to do |
+|---|---|---|
+| Preflight fails (key missing or blank, a token with inner spaces or control characters, token rejected, no network) | `Apify is not available: …`, exit 1 before scraping; `competitors_complete.csv` untouched | Check that the key exists in the secret (without printing it); check the token in the Apify console |
+| HTTP 401/403/402 or any other 4xx during scraping, or the budget would be exceeded | `ApifyFatalError` / `ApifyBudgetExceeded` → `Scraping aborted by a fatal error (relevance AI or Apify)`, exit 1, CSV untouched; the coverage report `error` column shows the class | 401/403: token. 402 or a limit error: the VdC account's monthly limit or plan. Budget: read the `spent … of 20.00` lines; something cost more than expected |
+| An actor run ends FAILED/TIMED-OUT/ABORTED twice, or the network fails after 3 HTTP attempts (HTTP 429/5xx and truncated responses are retried with 5 s and 10 s waits; a run start only retries 429, a 5xx or lost start counts as one attempt with its cap) | `ApifyRunFailed` for that keyword: logged, `error` column in the coverage report, scraping continues. At the end, if more than 5 % of the Apify searches failed, the run exits 1 (`N of M Apify keyword searches failed (…, max 5%)`) and does not replace the CSV; the partial rows stay in `scraper/competitors_complete.tmp.csv`. Within 5 % the run goes on and logs a warning (`… within the 5% limit`) with the failed keywords | Check the run in the Apify console (actor runs list). Re-run the pipeline by hand when it is fixed (see [Running by hand](#running-by-hand)) |
+| A Noon details run fails | The whole Noon keyword fails (rows are never returned without the details that were asked for) | Same as above |
+| `--output_mode append` onto a CSV with the old 13-column header | `has a different header (pre-F6 file?); use overwrite`, exit 1, nothing written | Use `overwrite` (the pipeline always does) |
+
+In the coverage report, for `amazon` and `noon`, `found` counts the titles sent to the relevance AI: items already dropped by the converter (not SA, sponsored, no price, not SAR, Wayakit, duplicates) or without a size are not in it. The log line `[amazon] N items, drops {...}, R rows` (or `[noon]`) gives the drop reasons per keyword.
+
+### Paid smoke run (only with Mafer's OK)
+
+Costs about USD 0.3 (Apify) plus a few Bedrock calls. Purpose: confirm the real nesting of the junglee `attributes` / `attributesMapped` / `productOverview` fields (the adapter accepts dicts and key/value lists) and that Noon's `shipping_banner_details.global` behaves as an imported flag. From the repo root on Mafer's Mac, after `aws sso login --profile wayakit-vdc` and once `APIFY_API_TOKEN` exists:
+
+```bash
+export AWS_PROFILE=wayakit-vdc
+conda run --no-capture-output -n wayakit-price-prediction python - <<'EOF'
+import sys
+sys.path[:0] = ['scraper', '.']
+from services.apify_client import ApifyClient, load_token, preflight
+from services.ai_service import RelevanceAgent
+from scrapers.amazon_apify import AmazonApifyScraper
+from scrapers.noon_apify import NoonApifyScraper
+
+client = ApifyClient(load_token(), budget_usd=1.5)   # hard cap for this test; the token is never printed
+preflight(client)
+agent = RelevanceAgent()
+agent.preflight()
+for scraper in (AmazonApifyScraper(None, agent, client=client), NoonApifyScraper(None, agent, client=client)):
+    rows = scraper.scrape('pet urine odor remover', 'volume')
+    print(type(scraper).__name__, len(rows), 'rows')
+    for row in rows[:5]:
+        print('  ', row['Company'], '|', row['Seller'], '|', row['Origin'], '|', row['Total quantity'], row['Unit of measurement'], '|', row['Price_SAR'])
+print('spent USD', round(client.spent_usd, 4))
+EOF
+```
+
+Then, in the Apify console (actor runs list of the VdC account), add up the charge of the 2–3 runs this test started and compare it with `spent USD`: they must match (within a cent). The budget counts each run's `usageTotalUsd`; if the console shows a clearly higher charge (both actors are priced per result), the budget undercounts: report it to the developer before pulling F6 onto the instance.
+
+Expected: both scrapers return rows, Amazon sizes look right (a "Pack of 3" counted as 3 times the volume; a pack title whose attributes only give the size of one unit is either multiplied, when the title's own total confirms it, or dropped as `no_size`), some Amazon rows with `local` or `imported` from `Country of Origin`, Noon rows with `imported` when shipped "global", no Wayakit rows, and `spent USD` well under 1. If Amazon returns 0 rows with many `no_size` drops, the attribute nesting is different: report it to the developer with the log line (never paste raw actor data with the token or the console URL).
 
 ---
 
@@ -661,7 +735,7 @@ All PI credentials are in the secret `prod/wayakit-app` (eu-north-1), as key/val
 2. Change only the value of the relevant key. **Do not delete the other rows.** → **Save**.
 3. If it was a replacement, revoke the old key in its service.
 
-- Since F2 the secret is read only by `pi_secrets.py` (`get_secret()`, `get_odoo_credentials()`; name and region in `SECRET_NAME` and `REGION_NAME`). If an Odoo key is missing or empty, the scripts exit 1 with the **names** of the missing keys, never their values. Planned (F6): the Apify key in the same secret.
+- Since F2 the secret is read only by `pi_secrets.py` (`get_secret()`, `get_odoo_credentials()`; name and region in `SECRET_NAME` and `REGION_NAME`). If an Odoo key is missing or empty, the scripts exit 1 with the **names** of the missing keys, never their values. F6 (branch `f6-apify`): the Apify token is the key `APIFY_API_TOKEN` in the same secret (pending, to be added by Mafer); a missing or blank value stops the scraper at the Apify preflight with the key **name** only.
 - After the first successful Bedrock run on the instance: remove `GEMINI_API_KEY` from the secret (the F2 code no longer reads it), revoke the key and clean the logs (see Known issues, *Security*).
 
 ---
@@ -700,8 +774,8 @@ Errors that have already appeared or that are visible in the code, and what to d
 | GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
 | Chrome processes are left open | In SACO, `driver.get` and `_handle_overlays` are outside the `try` (`saco_scraper.py:122-123`) and errors other than Timeout do not close the browser | `pkill -f chrome` when running by hand. The instance shuts down at the end of the scheduled run |
 | Scraping does not start: `Could not install ChromeDriver` | `ChromeDriverManager().install()` resolves the driver on every run and downloads it if it is not cached (`main.py:263`), and depends on the network and the Chrome version | Retry. On the instance: Google Chrome 146.0.7680.177 and webdriver-manager 4.0.2 (F1) |
-| Inflated price per liter on Amazon | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (`amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Planned (F6/F7): pack multiplier in the Apify adapters and robust statistics in Pets |
-| Wayakit products in the Amazon and Noon results | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | Planned (F6): exclude the Wayakit brand and seller, as VdC does |
+| Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (branch `f6-apify`): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
+| Wayakit products in the Amazon and Noon results (pre-F6 code) | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | **Fixed in F6** (branch `f6-apify`): the Apify adapters drop Wayakit by brand, seller, manufacturer or title (drop reason `wayakit`) |
 
 ### ML and Odoo
 
@@ -713,13 +787,16 @@ Errors that have already appeared or that are visible in the code, and what to d
 | Duplicate suggestions | `odoo_api_price_suggestion.py` was run by hand without `--run_mode` (defaults to `partial`) or twice in partial | Re-upload with `--run_mode full`. Since F3 every pipeline run is full, so `wayakit_prediction_report.csv` holds every product; with the pre-F2 code, only if it is from a full run (a partial one only contains new products) |
 | Data from another company in sales or suggestions | No read filters by company (`ml_model/odoo_api_*.py`); the database is KSA only (Mafer, 2026-11-17) | Confirm the KSA company before reading or writing. **F2**: the upload exits 1 if the API user sees more than one company; reads would need a `company_id` filter if a second company ever appears |
 
-### Apify (Planned, F6; seen in the calibration)
+### Apify (F6, branch `f6-apify`; seen in the calibration)
+
+Operating details and failure modes: [Apify (Amazon and Noon, F6)](#apify-amazon-and-noon-f6).
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Noon returns 50 rows even though `maxItems` was 20 | `saswave/noon-product-scraper` delivers the full page | Run once per keyword, with a spending cap (`maxTotalChargeUsd`), and truncate in the converter |
-| On Amazon, sizes do not match between `Item Volume`, `Unit Count` and `Size` (e.g. "5 Liters" vs "907 Grams") | Amazon fills those fields inconsistently | Keep the rule that 2 of 3 sources must agree, or resolve it with the AI model |
-| Country of origin almost never comes through | `Country of Origin` came in 3 of 20 on Amazon and does not come on Noon | Use signals that do come through: seller, Noon "global" shipping, units in fl oz (F7) |
+| Noon returns 50 rows even though `maxItems` was 20 | `saswave/noon-product-scraper` delivers the full page | Done in F6: one run per keyword, `maxTotalChargeUsd` per run, output cut to `APIFY_MAX_RESULTS` in the adapter |
+| On Amazon, sizes do not match between `Item Volume`, `Unit Count` and `Size` (e.g. "5 Liters" vs "907 Grams") | Amazon fills those fields inconsistently | Done in F6: at least 2 of {title, Item Volume, Size, Unit Count} must agree on the pack total, otherwise the row is dropped (`no_size`) before the AI. Per-unit attributes never outvote a title that states a pack. Weights and plain "oz" never count as a size, and a dimension ("40 x 40 cm") is never a pack multiplier |
+| Country of origin almost never comes through | `Country of Origin` came in 3 of 20 on Amazon and does not come on Noon | Done in F6: `origin` also uses "Made in KSA" texts, Noon "global" shipping and fl oz; otherwise `unknown`. Used for Pets in F7b |
+| The scraper exits 1 at the start with `Apify is not available` (F6 code) | `APIFY_API_TOKEN` missing in `prod/wayakit-app`, or the token was rejected | Expected until Mafer adds the key; see [Token](#token) |
 
 ### Security
 

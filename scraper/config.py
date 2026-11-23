@@ -3,13 +3,14 @@ OUTPUT_CSV_FILE = 'scraper/competitors_complete.csv'
 CSV_COLUMNS = [
     'date', 'industry', 'subindustry', 'type_of_product', 'generic_product_type',
     'product', 'price_sar', 'company', 'source', 'url',
-    'unit_of_measurement', 'total_quantity', 'channel'
+    'unit_of_measurement', 'total_quantity', 'channel',
+    'seller', 'origin',                      # F6; origin in {'local', 'imported', 'unknown'}
 ]
 
 TARGET_MAP = {
-    'Home': ['amazon', 'mumzworld', 'saco'],
-    'Automotive': ['amazon', 'saco'],
-    'Pets': ['amazon'],
+    'Home': ['amazon', 'mumzworld', 'saco', 'noon'],
+    'Automotive': ['amazon', 'saco', 'noon'],
+    'Pets': ['amazon', 'noon'],
     'Aviation': ['aerosense'],
     'Airports': ['fine'],
     'Restaurants': ['fine'],
@@ -75,3 +76,15 @@ SACO_EXCLUSIONS = [
 
 # USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+# --- Apify (F6). Account: VdC's. Token: key APIFY_API_TOKEN in prod/wayakit-app, read only via pi_secrets.
+APIFY_AMAZON_ACTOR = 'junglee~amazon-crawler'
+APIFY_NOON_ACTOR = 'saswave~noon-product-scraper'
+APIFY_RUN_BUDGET_USD = 20.0       # all actor runs of one pipeline run (Mafer, 2026-11-22); exceeding it aborts with exit 1
+APIFY_AMAZON_MAX_USD = 0.50       # maxTotalChargeUsd per Amazon run (50 results x USD 0.004 = 0.20 expected)
+APIFY_NOON_MAX_USD = 0.50         # maxTotalChargeUsd per Noon run (search: 50 x USD 0.0009 = 0.045 expected)
+APIFY_MAX_RESULTS = 50            # maxItems / maxItemsPerStartUrl; Noon output is also cut here
+APIFY_RUN_TIMEOUT_S = 1200        # Apify-side run timeout; our own deadline is this + 120 s
+APIFY_MEMORY_MB = 1024            # same as VdC
+APIFY_RUN_ATTEMPTS = 2            # a run that ends FAILED/TIMED-OUT/ABORTED is started once more
+APIFY_MAX_FAILED_KEYWORD_RATE = 0.05  # failed / attempted Apify keyword searches above this: scraper/main.py exits 1

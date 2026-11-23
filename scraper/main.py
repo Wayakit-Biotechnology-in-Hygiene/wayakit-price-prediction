@@ -183,8 +183,10 @@
 #         logger.error(f"[FATAL] Unhandled exception", exc_info=True)
 #         traceback.print_exc()
 
-# scraper/main.py: competitor scraping. Writes to a temporary CSV and replaces the final one only
-# when the run succeeds; exits with 1 on any fatal error; always writes a coverage report.
+# scraper/main.py: competitor scraping (Apify for Amazon and Noon since F6; Selenium for Mumzworld,
+# SACO and the B2B stores). Writes to a temporary CSV and replaces the final one only when the run
+# succeeds; exits with 1 on any fatal error (relevance AI or Apify) or when any Apify keyword
+# failed; always writes a coverage report.
 import argparse
 import csv
 import os
@@ -208,13 +210,15 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from services.ai_service import RelevanceAgent, RelevanceAgentError, RelevanceAgentFatalError
-from scrapers.amazon_scraper import AmazonScraper
+from scrapers.amazon_apify import AmazonApifyScraper
+from scrapers.noon_apify import NoonApifyScraper
 from scrapers.mumzworld_scraper import MumzworldScraper
 from scrapers.saco_scraper import SacoScraper
 from scrapers.fine_scraper import FineScraper
 from scrapers.gogreen_scraper import GoGreenScraper
 from scrapers.officesupply_scraper import OfficeSupplyScraper
 from scrapers.aerosense_scraper import AeroSenseScraper
+from services.apify_client import ApifyError, ApifyFatalError, preflight as apify_preflight_default
 from log_config import get_logger
 
 logger = get_logger()
@@ -230,11 +234,13 @@ KEYWORD_REQUIRED_SITES = ['fine', 'gogreen', 'officesupply', 'aerosense']
 UNITS_MODE_KEYWORDS = ['wipes', 'rags', 'microfiber', 'brush']
 # Scrapers that do not use the relevance agent: everything they return counts as found and relevant.
 SITES_WITHOUT_AI = {'aerosense'}
+# Sites scraped through Apify: failed keywords above config.APIFY_MAX_FAILED_KEYWORD_RATE make the run exit 1.
+APIFY_SITES = ('amazon', 'noon')
 SECONDS_BETWEEN_SUBINDUSTRIES = 5
 
 
 class ScrapingAborted(Exception):
-    """A fatal error (relevance AI) that must stop the whole run."""
+    """A fatal error (relevance AI or Apify) that must stop the whole run."""
 
 
 def parse_args(argv=None):
@@ -330,6 +336,9 @@ def build_row_data(product, industry, sub_industry, type_of_product, generic_typ
         'unit_of_measurement': product.get('Unit of measurement'),
         'total_quantity': product.get('Total quantity'),
         'channel': channel,
+        # F6: only the Apify adapters return them; other sites and older rows get the defaults.
+        'seller': product.get('Seller') or '',
+        'origin': product.get('Origin') or 'unknown',
     }
     return {key: strip_nul(value) for key, value in row.items()}
 
@@ -388,6 +397,20 @@ def build_coverage_report(entries):
     return list(report.values())
 
 
+def apify_failed_keywords(coverage_entries):
+    """Coverage entries of an Apify site that ended with an error (one per failed scrape call)."""
+    return [entry for entry in coverage_entries if entry['site'] in APIFY_SITES and entry['error']]
+
+
+def apify_failures_exceeded(coverage_entries, threshold):
+    """``(failed entries, attempted Apify searches, exceeded)``: exceeded when failed / attempted
+    is strictly above ``threshold`` (same rule as the relevance-AI failure rate). No Apify search
+    means nothing failed."""
+    attempted = sum(1 for entry in coverage_entries if entry['site'] in APIFY_SITES)
+    failed = apify_failed_keywords(coverage_entries)
+    return failed, attempted, bool(attempted) and len(failed) / attempted > threshold
+
+
 def zero_relevant_pairs(report):
     """Report rows with no relevant result: candidates for a better keyword on that site."""
     return [row for row in report if row['relevant'] == 0]
@@ -418,7 +441,9 @@ def install_chromedriver():
 
 def make_scrapers(driver_path, ai_agent):
     return {
-        'amazon': AmazonScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        # Apify adapters: construction reads no secret; the shared client is built on first scrape().
+        'amazon': AmazonApifyScraper(driver_path=driver_path, relevance_agent=ai_agent),
+        'noon': NoonApifyScraper(driver_path=driver_path, relevance_agent=ai_agent),
         'mumzworld': MumzworldScraper(driver_path=driver_path, relevance_agent=ai_agent),
         'saco': SacoScraper(driver_path=driver_path, relevance_agent=ai_agent),
         'fine': FineScraper(driver_path=driver_path, relevance_agent=ai_agent),
@@ -433,7 +458,8 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
     """Scrapes every instruction and writes the rows; returns how many rows were written.
 
     A failing ``scrape()`` call is logged and recorded in ``coverage_entries`` (one site error
-    must not throw away a 30 h run); a fatal relevance-AI error raises ``ScrapingAborted``.
+    must not throw away a 30 h run); a fatal relevance-AI or Apify error (token, HTTP 4xx,
+    budget) raises ``ScrapingAborted``.
     """
     rows_total = 0
     for sub_industry_group, df_industry_instructions in df_instructions.groupby('Sub industry'):
@@ -475,7 +501,7 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
                     raised_fatal = None
                     try:
                         found_products = scraper.scrape(keyword_to_use, search_mode)
-                    except RelevanceAgentFatalError as fatal_error:
+                    except (RelevanceAgentFatalError, ApifyFatalError) as fatal_error:
                         raised_fatal = fatal_error
                         found_products = []
                     except Exception as scrape_error:
@@ -483,14 +509,15 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
                         error = type(scrape_error).__name__
                         found_products = []  # Continue with the next site/keyword
                     uses_ai = site_name not in SITES_WITHOUT_AI
-                    # The scrapers catch every exception internally, so a fatal AI error is
-                    # detected through the agent, not only through the call above.
+                    # The Selenium scrapers catch every exception internally, so a fatal AI error
+                    # is detected through the agent, not only through the call above. The Apify
+                    # adapters let every error propagate (ApifyFatalError is caught above).
                     fatal = ai_agent.fatal_error or raised_fatal
                     if fatal is not None:
                         coverage_entries.append(coverage_entry(
                             sub_industry, plan['type_of_product'], site_name, keyword_to_use,
                             stats_delta(before, ai_agent.stats()), 0,
-                            RelevanceAgentFatalError.__name__, uses_ai=uses_ai,
+                            type(fatal).__name__, uses_ai=uses_ai,
                         ))
                         raise ScrapingAborted(str(fatal))
 
@@ -529,7 +556,8 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
     return rows_total
 
 
-def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep):
+def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep,
+         apify_preflight=apify_preflight_default):
     """The scraping run; returns the exit code. The final CSV is only replaced on success."""
     try:
         df_instructions = pd.read_csv(args.analysis_file)
@@ -557,9 +585,27 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
         logger.critical(f"Relevance AI is not available: {error}")
         return 1
 
+    try:
+        apify_preflight()
+    except ApifyError as error:
+        logger.critical(f"Apify is not available: {error}")
+        return 1
+
     output_file = args.output_file
     temp_file = temp_path_for(output_file)
     file_exists = os.path.exists(output_file)
+    if args.output_mode == 'append' and file_exists:
+        # DictWriter would append 15-column rows under an old 13-column header.
+        try:
+            with open(output_file, newline='', encoding='utf-8') as existing:
+                header = next(csv.reader(existing), [])
+        except (OSError, UnicodeDecodeError, csv.Error):
+            logger.error(f"Could not read the header of '{output_file}'.", exc_info=True)
+            return 1
+        if header != config.CSV_COLUMNS:
+            logger.error(f"'{output_file}' has a different header (pre-F6 file?); use overwrite. "
+                         f"Nothing was written.")
+            return 1
     write_header = (args.output_mode == 'overwrite') or (not file_exists)
     try:
         if args.output_mode == 'append' and file_exists:
@@ -572,7 +618,7 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
             rows_written = run_scraping(df_instructions, writer, ai_agent, scraper_factory,
                                         driver_path, coverage_entries, sleep=sleep, file_handle=f)
     except ScrapingAborted as aborted:
-        logger.critical(f"Scraping aborted by a fatal relevance-AI error: {aborted}. "
+        logger.critical(f"Scraping aborted by a fatal error (relevance AI or Apify): {aborted}. "
                         f"'{output_file}' was not modified.")
         return 1
     except Exception:
@@ -596,17 +642,30 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
         logger.error(f"{error}. '{output_file}' was not modified; partial rows are in '{temp_file}'.")
         return 1
 
+    threshold = config.APIFY_MAX_FAILED_KEYWORD_RATE
+    failed, attempted, exceeded = apify_failures_exceeded(coverage_entries, threshold)
+    details = "; ".join(f"{e['site']} '{e['keyword']}' {e['error']}" for e in failed[:20])
+    if exceeded:
+        logger.error(f"{len(failed)} of {attempted} Apify keyword searches failed "
+                     f"({len(failed) / attempted:.1%}, max {threshold:.0%}): {details}. "
+                     f"'{output_file}' was not modified; partial rows are in '{temp_file}'.")
+        return 1
+    if failed:
+        logger.warning(f"{len(failed)} of {attempted} Apify keyword searches failed "
+                       f"({len(failed) / attempted:.1%}, within the {threshold:.0%} limit): {details}.")
+
     os.replace(temp_file, output_file)
     logger.info(f"{rows_written} rows written. '{output_file}' replaced.")
     return 0
 
 
 def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrapers,
-         driver_installer=install_chromedriver, sleep=time.sleep):
+         driver_installer=install_chromedriver, sleep=time.sleep,
+         apify_preflight=apify_preflight_default):
     """Entry point; returns the exit code (0 only if the output CSV was replaced).
 
     Tests inject ``agent_factory`` (no Bedrock), ``scraper_factory(driver_path, agent)``,
-    ``driver_installer`` (no Chrome) and ``sleep``.
+    ``driver_installer`` (no Chrome), ``sleep`` and ``apify_preflight`` (no secret, no network).
     """
     args = parse_args(argv)
     logger.info(f"Starting scraping. Output mode: {args.output_mode}")
@@ -616,7 +675,8 @@ def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrape
     coverage_entries = []
     exit_code = 1
     try:
-        exit_code = _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep)
+        exit_code = _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep,
+                         apify_preflight=apify_preflight)
     finally:
         # Best effort, also after an error or SIGTERM from "timeout": the report says how far it got.
         try:
