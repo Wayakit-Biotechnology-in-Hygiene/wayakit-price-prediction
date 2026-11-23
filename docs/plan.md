@@ -53,19 +53,19 @@ Reference: the `voz-del-cliente` (VdC) repo. The `infra/` and `docs/` convention
 
 ### Bugs from the property tests (2026-11-17)
 
-Found by `pi-tester` while writing the unit and property tests for the current code (e25e2c9). They were not fixed: each one remains as `xfail(strict=True)` with the minimal counterexample; when it is fixed, the test passes and the `xfail` must be removed. The parsers in `scraper/utils.py` are used by Amazon, Mumzworld, SACO, Fine, GoGreen and OfficeSupply: fixing them changes Mumzworld and SACO rows, so it needs the F6 regression test and a decision from Mafer (question 13).
+Found by `pi-tester` while writing the unit and property tests for the current code (e25e2c9). They were not fixed: each one remains as `xfail(strict=True)` with the minimal counterexample; when it is fixed, the test passes and the `xfail` must be removed. The parsers in `scraper/utils.py` are used by Mumzworld, SACO, Fine, GoGreen and OfficeSupply (and by the Selenium Amazon scraper until F6): fixing them would change Mumzworld and SACO rows. **Decided (question 13, 2026-11-22): `utils.py` is not changed; bugs 1–4 (and 10–11) are fixed only in the Apify adapters' own parsing (`scraper/scrapers/apify_common.py`).** The strict `xfail` tests of `utils.py` stay as they are.
 
 | # | Bug | Counterexample | Where | Phase |
 |---|---|---|---|---|
-| 1 | `litre` is not recognized as liter (the branch looks for "liter") | `'1 litre'` → unit `litre`, normalized 1.0 (should be L and 1000); `'6 x 1 litre'` → normalized 6 | `scraper/utils.py:3` (`parse_volume_string`), `:64` (`parse_volume_with_multiplier`) | F7 (F6 regression) |
-| 2 | `kilograms` is read as grams ("gram" is inside "kilograms" and that branch comes first) | `'2 kilograms'` → unit `g`, normalized 2.0 (should be kg and 2000) | `scraper/utils.py:3` | F7 (F6 regression) |
-| 3 | Thousands separator | `'Shampoo 1,000 ml'` → quantity 0.0 (the regex takes only "000") | `scraper/utils.py:3` | F7 (F6 regression) |
-| 4 | Decimal without leading zero | `'Bleach .5 L'` → quantity 5.0 (5 L instead of 0.5 L) | `scraper/utils.py:3` | F7 (F6 regression) |
-| 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7 (small fixes) |
-| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7, directly for Pets** (small n per type; "robust trimming when n is small"); in Pets (F5), **2 types are emptied** (1 of 19 volumetric and 1 of 3 unit), neither with a Wayakit SKU |
-| 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7 (and the SKU cleanup in section 7.3) |
-| 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7 (small fixes, C18) |
-| 9 | **Possible bug (confirm with Mafer):** the concentration "3X" is taken as 3 pieces | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | F7, depending on question 12 |
+| 1 | `litre` is not recognized as liter (the branch looks for "liter") | `'1 litre'` → unit `litre`, normalized 1.0 (should be L and 1000); `'6 x 1 litre'` → normalized 6 | `scraper/utils.py:3` (`parse_volume_string`), `:64` (`parse_volume_with_multiplier`) | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
+| 2 | `kilograms` is read as grams ("gram" is inside "kilograms" and that branch comes first) | `'2 kilograms'` → unit `g`, normalized 2.0 (should be kg and 2000) | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
+| 3 | Thousands separator | `'Shampoo 1,000 ml'` → quantity 0.0 (the regex takes only "000") | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
+| 4 | Decimal without leading zero | `'Bleach .5 L'` → quantity 5.0 (5 L instead of 0.5 L) | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
+| 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7a (small fixes) |
+| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7a, directly for Pets** (small n per type; "robust trimming when n is small"); in Pets (F5), **2 types are emptied** (1 of 19 volumetric and 1 of 3 unit), neither with a Wayakit SKU |
+| 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7a (and the SKU cleanup in section 7.3) |
+| 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7a (small fixes, C18) |
+| 9 | **Possible bug (confirm with Mafer):** the concentration "3X" is taken as 3 pieces | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | Open (question 12) for the shared parser; the Apify adapters never take "3X" as a multiplier (F6) |
 | 10 | Minor: scientific notation in the multiplier (only with totals < 1e-4 or ≥ 1e16, unrealistic) | `'(2 Bottles x 0.00001 ml)'` → quantity 2e-05 but normalized 5.0 | `scraper/utils.py:64` | No phase (noted) |
 | 11 | Minor: huge numbers in the count parsers raise `ValueError` (`int()` digit limit in Python ≥ 3.10.7); unrealistic in titles | `'9'*4301 + ' wipes'` | `scraper/utils.py:31` (`parse_count_string`) | No phase (noted) |
 
@@ -88,7 +88,7 @@ Found by `pi-tester` while writing the unit and property tests for the current c
 | State | S3 `price-intelligence-<account>`, with the prefixes `data/`, `models/`, `state/`, `logs/` and `releases/` | To recreate the instance without losing anything (criterion of B) |
 | Secrets | **Keep `prod/wayakit-app`**, add the Apify key, centralize in a single module (`pi_secrets.py`) and restrict the role to that secret's ARN | It is the minimum. Applies if nobody else uses that secret (question 4) |
 | Upload to Odoo | First `create` the new batch and, only if it succeeds, `unlink` the previous one (IDs saved, retryable). Add `--dry-run`. Filter by the KSA company | If something fails, the table is never left empty |
-| Pets | See F7. The corrections come from the data (robust statistics and, if the actor provides it, the country of origin). No lists that a person has to maintain | Mafer's decision |
+| Pets | See F7a and F7b. The corrections come from the data (robust statistics and, if the actor provides it, the country of origin). No lists that a person has to maintain | Mafer's decision |
 | Relevance AI | **Bedrock: DeepSeek V3.2 as primary and Haiku 4.5 as fallback**, with the Converse API, JSON schema and **always in batches**. The `RelevanceAgent` interface is kept so the scrapers do not change | Mafer's decision and the benchmark of 2026-11-16 (section 5) |
 
 ---
@@ -194,24 +194,42 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 - volume of Wayakit SKUs versus the competition's range;
 - ratio between the suggested price and the cost, and the current price in Odoo **KSA**.
 
-### F6 · Apify for Amazon and Noon (3 days)
+### F6 · Apify for Amazon and Noon (3 days) — **implemented on branch `f6-apify` (2026-11-22)**
+
+**Status (2026-11-22):** code, docs and tests on `f6-apify`, not merged and not on the instance. It needs the key `APIFY_API_TOKEN` in `prod/wayakit-app` (Mafer adds it; until then `scraper/main.py` on this branch exits 1 at the Apify preflight, on purpose) and a paid smoke run with Mafer's OK (`docs/runbook.md`, *Apify*) before it is pulled onto the instance.
 
 1. **Choose the actor** for Amazon KSA and for Noon KSA (research of 2026-11-16; result in section 5).
-2. **Calibration run** (with OK for the spend): 1 Pets term, about 20 results and a cap of USD 0.50 per actor. It serves to fix the field mapping (price, size, brand, seller, origin) and the real cost.
-3. Copy from VdC (`pipeline/apify.py`) the client with retries, pagination and spend cap. Write `amazon_apify.py` and `noon_apify.py` with the current signature `scrape(keyword, search_mode) -> list[dict]`. Filters: price > 0, pack multiplier, `is_relevant`.
-4. New `seller` and `origin` columns in `CSV_COLUMNS` and `row_data`.
-5. **Regression test:** Mumzworld and SACO with the same keywords, before and after. They must come out identical.
+2. **Calibration run** (with OK for the spend): 1 Pets term, about 20 results and a cap of USD 0.50 per actor. It serves to fix the field mapping (price, size, brand, seller, origin) and the real cost. Done on 2026-11-16 (section 5).
+3. **Client and adapters** (Mafer's answers of 2026-11-22: questions 5, 6 and 13):
+   - `scraper/services/apify_client.py`: REST client on stdlib `urllib` (token only in the `Authorization: Bearer` header), retries on HTTP 429/5xx and network errors (a run start only on 429), polling with `waitForFinish`, dataset pagination, per-run caps (`maxItems`, `maxTotalChargeUsd`, `timeout`, `memory`) and a **process-wide budget of USD 20** (`config.APIFY_RUN_BUDGET_USD`): a run only starts if the spend so far plus its cap fits. A run that ends FAILED/TIMED-OUT/ABORTED is started once more. The token (`APIFY_API_TOKEN`) is read once, through `pi_secrets`, on the first scrape; a preflight (`GET /users/me/limits`) runs before scraping.
+   - `scraper/scrapers/apify_common.py`: the adapters' own parsing (volume, count, pack multiplier, price, currency) with the parser bugs 1–4, 10 and 11 fixed here only (a dimension such as "40 x 40 cm" or a breakdown such as "1.5 L (3 x 500 ml)" never multiplies), the Wayakit exclusion (our own brand), the `origin` rule and the shared step "size gate → one relevance batch (`filter_relevant`) → wipes units batch".
+   - `scraper/scrapers/amazon_apify.py` (`AmazonApifyScraper`, site `amazon`): `junglee~amazon-crawler` with `https://www.amazon.sa/s?k=<keyword>` (never `countryCode`/`zipCode`); drops results not loaded from SA, sponsored, without a current price (`price.value`, never `listPrice`), not in SAR, and Wayakit's. Size: at least 2 of {title, Item Volume, Size, Unit Count} must agree on the pack total, and per-unit attributes never outvote a title that states a pack. `scraper/scrapers/amazon_scraper.py` (Selenium) is deleted.
+   - `scraper/scrapers/noon_apify.py` (`NoonApifyScraper`, new site `noon`): `saswave~noon-product-scraper`, one search run per keyword, output cut to 50 rows, current price `sale_price` else `price`, SAR assumed from `/saudi-en/`, size from the title only; one details run per keyword for the relevant rows only (for `shipping_banner_details.global`).
+   - `scraper/main.py`: `ApifyFatalError` (token, HTTP 4xx, budget) aborts the run like a fatal relevance-AI error; `ApifyRunFailed` is a per-keyword error in the coverage report, and failed Apify keyword searches above 5 % of those attempted (`config.APIFY_MAX_FAILED_KEYWORD_RATE = 0.05`, Mafer, 2026-11-22) make the run exit 1 without replacing the CSV; fewer are logged as a warning. Append mode refuses an output file with a different header.
+4. New `seller` and `origin` columns in `CSV_COLUMNS` and `build_row_data()` (15 columns). `origin` is `local`, `imported` or `unknown`, only from the data, in this order: Amazon `Country of Origin` (Saudi Arabia → local, any other → imported), the text "Made in KSA" / "Made in Saudi Arabia" / "صنع في السعودية" → local, Noon `shipping_banner_details.global` → imported, a size in fl oz → imported, otherwise unknown. Selenium and Odoo rows get `seller = ''` and `origin = 'unknown'`. The ML ignores both columns (`1a_preprocess_data.py:16` selects columns by name); they are used from F7b.
+5. **Regression test:** Mumzworld and SACO with the same keywords, before and after: identical in the 13 original columns; `mumzworld_scraper.py`, `saco_scraper.py` and `scraper/utils.py` byte-identical to the base (`tests/differential/test_scraper_main_differential.py`).
 
-### F7 · Pets and ML tuning (2 days)
+Expected cost: about USD 14–15 per run (Amazon 55 × ~0.20, Noon search 55 × ~0.045, Noon details ~0.5–1), inside the USD 20 cap.
 
-- `origin` = `local`, `imported` or `unknown`, **only with what the data provides**: country of origin or manufacturer in the actor's specifications, or the text "Made in KSA" / "صنع في السعودية". If it is not there, it stays `unknown`. No hand-maintained brand lists.
-- **Only in Pets:**
-  - if there are at least N local rows per type, those rows are used;
-  - if not, the robust market statistic is used (median, without extreme values, without multipacks or sizes of 5 mL or less) with a ceiling of `p75 × volume`;
-  - the price never goes below the 1.30 margin floor.
-- Small fixes: price 0, `kg` treated as volumetric, robust trimming when n is small. They are covered by bugs 5, 6, 7 and 8 of finding 12 (with their strict `xfail` tests). **Bug 6 applies directly to Pets:** with 2 different prices per type, the p10–p90 trimming leaves the type without competitors (14 of 151 volumetric types in F1). The parser bugs (1–4 and 9) go in here only if Mafer decides to change the shared parser (question 13), with the F6 regression.
+### F7a · ML robustness without origin (2 days)
+
+Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here needs the `origin` column.
+
+- **Robust trimming when n is small** (bug 6): with 2 different prices per type, the p10–p90 trimming leaves the type without competitors (14 of 151 volumetric types in F1). Applies directly to Pets.
+- **Robust market range** with a ceiling of `p75 × volume` (median without extreme values, without multipacks or sizes of 5 mL or less).
+- **Act on `volume_outside_market`** (today it is only a flag).
+- **Size matching for small packs.**
+- **Do not upload no-size parent templates** to Odoo.
+- Small fixes: price 0, `kg` treated as volumetric (bug 5), repeated SKUs (bug 7), quantities ≤ 0 (bug 8), each with its strict `xfail` test.
+- The price never goes below the 1.30 margin floor.
 - **Documented decision about the model** (the ticket asks for it): the other improvements (log target, GroupKFold) are left for a phase 2. They move the prices of all lines. The `approved_quote_price` leakage as a feature was already removed in e25e2c9 (`2_train_models.py:160`), together with the clipping to the market range with 3 or more competitors (`3_predicted_prices.py:126-132`).
 - Before/after comparison by subindustry: median of the new/old ratio and % of suggestions above the local p75.
+
+### F7b · Origin-based Pets selection (1 day)
+
+- Uses the F6 `seller` and `origin` columns (`local`, `imported`, `unknown`, only from the data; no hand-maintained brand lists).
+- **Only in Pets:** if there are at least N local rows per type, those rows are used; if not, the F7a robust market statistic.
+- Implementation note: `ml_model/1a_preprocess_data.py:23` must `reindex(..., fill_value='unknown')` before keeping `origin`, because the Odoo competitor CSV (`competitor_products_from_odoo.csv`) has no such column.
 
 ### F8 · Final run and Odoo KSA (1 day + review)
 
@@ -219,7 +237,7 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 2. Puya and Luisa review the Pets list: previous price, new price, local p75 and cost.
 3. With their approval, and with the KSA company confirmed, it is uploaded with the safe scheme.
 
-**Order:** F0 → F1 → F2 → (F3 → F4) in parallel with (F5 → F6 → F7) → F8.
+**Order:** F0 → F1 → F2 → (F3 → F4) in parallel with (F5 → F6 → F7a → F7b) → F8 (Mafer, 2026-11-22: F6 → F7a → F7b → F8).
 
 ---
 
@@ -229,15 +247,15 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 2. ~~Remove the 2 stages?~~ Mafer wants a monthly run, but **the keyword review is needed**: the sites do not find the product by its generic name (e.g. on SACO you have to search "car cleaner" instead of "car disinfectant"). Pending: choose the design of the review (proposal in section 6). Since F3 (Mafer, 2026-11-18) the run has no stages, so the review happens outside the run, on the versioned `modifiers_mapping.csv`.
 3. ~~Which day?~~ The last Thursday of each month: `cron(50 21 ? * 5L *)` in EventBridge Scheduler. Time 21:50 in CDMX time (`America/Mexico_City`), confirmed by Mafer on 2026-11-17.
 4. ~~Secret and company?~~ Only PI uses `prod/wayakit-app`. The Odoo database PI uses is KSA only (Mafer, 2026-11-17).
-5. ~~Apify account?~~ VdC's, with a higher-tier plan. Pending: USD cap per run (proposal: USD 20).
-6. Apify scope: Amazon only for Pets, or also for Home and Automotive? Noon in which subindustries?
-7. ~~What counts as "local"?~~ It is not defined by hand (see F7).
+5. ~~Apify account?~~ VdC's, with a higher-tier plan. ~~USD cap per run?~~ **USD 20 per pipeline run across all Apify actor runs** (Mafer, 2026-11-22); exceeding it aborts the scraping with exit 1, never silently (`config.APIFY_RUN_BUDGET_USD`, F6).
+6. ~~Apify scope?~~ **Amazon (Apify) and Noon in Home, Automotive and Pets**; Apify replaces the Selenium Amazon scraper (Mafer, 2026-11-22; `TARGET_MAP` in F6).
+7. ~~What counts as "local"?~~ It is not defined by hand (see F6 `origin` and F7b).
 8. ~~GitHub admin?~~ Mafer is an admin of the organization. The repo is already in the organization (`Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction`). Pending: does the deploy need manual approval?
 9. ~~Snapshot and start-up?~~ Done on 2026-11-17 (F1): snapshot, SSM access, inventory and data copied to `data/f1_before_2026-11-15/`. The instance runs `server-improvement`, not `main`.
 11. ~~Rebase onto `server-improvement` or discard e25e2c9?~~ Resolved 2026-11-17: PR #1 merged `pi-mejoras` into `server-improvement`, and `pi-improvements` branches from it, so e25e2c9 is kept.
 10. What do we do with the leftovers in me-south-1 (2 roles and the `wayakit/test/credentials` secret)? They could not be inventoried from here.
-12. Should a concentration "3X" in the title ("Detergent 3X concentrate 500 ml") multiply the volume? Today it gives 1500 ml (finding 12, bug 9). It is an assumption of the tests, not a confirmed rule.
-13. The parser bugs of finding 12 (1–4) are in `scraper/utils.py`, which Mumzworld and SACO also use. Are they fixed (Mumzworld and SACO rows change, with the F6 regression and the approved differences) or left as they are and corrected only in the new Apify adapters?
+12. Should a concentration "3X" in the title ("Detergent 3X concentrate 500 ml") multiply the volume? Today the shared parser gives 1500 ml (finding 12, bug 9). It is an assumption of the tests, not a confirmed rule. Still open for `scraper/utils.py`; the F6 Apify adapters never treat "3X" as a multiplier (the `x` must be followed by a number).
+13. ~~Fix the parser bugs 1–4 in `scraper/utils.py` or only in the Apify adapters?~~ **Only in the new Apify adapters' own parsing** (`scraper/scrapers/apify_common.py`); `scraper/utils.py` is unchanged, so Mumzworld and SACO rows do not change (Mafer, 2026-11-22).
 
 ---
 
@@ -321,7 +339,7 @@ The raw data stayed outside the repo, in the session scratchpad. Cost: about USD
 | Relevance | There are off-topic results (air purifiers, dog pens), so the AI filter is essential |
 | Other sellers | Wayakit and SACO also sell on Noon |
 
-**Conclusion for F7:** the country of origin almost never comes. To separate imported from local, signals that always come are used: the seller (known import resellers, derived from the data), Noon's "global" shipping, fl oz units and the country of origin when it appears. Everything comes from the data, with no hand-made lists.
+**Conclusion for F6–F7b:** the country of origin almost never comes. To separate imported from local, signals that always come are used: the seller (known import resellers, derived from the data), Noon's "global" shipping, fl oz units and the country of origin when it appears. Everything comes from the data, with no hand-made lists.
 
 **Apify spend:** about **USD 14 per month** (Amazon about USD 11 and Noon about USD 2.5). It goes on the VdC account, with a higher-tier plan.
 

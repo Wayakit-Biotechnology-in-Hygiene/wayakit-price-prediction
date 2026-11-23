@@ -11,8 +11,15 @@ What it proves:
   CSV is byte-for-byte untouched; the coverage report is still written;
 - append mode copies the previous rows and adds no second header;
 - one `scrape()` exception is not fatal: logged, counted in the coverage `error` column;
-- C08: `build_row_data` keys are exactly `config.CSV_COLUMNS` and survive a DictWriter round trip;
-- the TARGET_MAP lookup and the Mumzworld/SACO exclusions are unchanged (C06 is not fixed here).
+- C08: `build_row_data` keys are exactly `config.CSV_COLUMNS` (15 since F6: + seller, origin) and
+  survive a DictWriter round trip; rows without Seller/Origin get '' and 'unknown';
+- the TARGET_MAP lookup and the Mumzworld/SACO exclusions are unchanged (C06 is not fixed here);
+  F6 adds 'noon' to Home, Automotive and Pets only;
+- F6 Apify paths: an Apify preflight failure exits 1 before any scraper is built; an
+  `ApifyFatalError` (incl. `ApifyBudgetExceeded`) aborts like a fatal AI error; an `ApifyRunFailed`
+  is a per-keyword error, but failed / attempted Apify searches above
+  `APIFY_MAX_FAILED_KEYWORD_RATE` (5 %) exit 1 with the temp file kept; append onto a file with another header (pre-F6) exits 1 and writes nothing;
+  `make_scrapers` builds the Apify adapters without reading any secret.
 """
 from __future__ import annotations
 
@@ -30,10 +37,17 @@ pytestmark = pytest.mark.unit
 
 m = load_module("scraper/main.py")
 config = m.config
-# The same ai_service module object main.py uses (load_module would create a second copy).
+# The same ai_service / apify_client module objects main.py uses (load_module would create copies).
 ai = sys.modules[m.RelevanceAgent.__module__]
+from services import apify_client as ac  # noqa: E402
+from scrapers import amazon_apify, noon_apify  # noqa: E402
 
-OLD_CSV = "date,product\n2026-11-07,previous run row\n"
+# A previous output with the current header, so append-mode failure cases reach their own failure
+# (a file with another header is refused earlier, see test_append_onto_a_pre_f6_file_is_refused).
+OLD_CSV = ",".join(config.CSV_COLUMNS) + "\n" + ",".join(["previous run row"] * len(config.CSV_COLUMNS)) + "\n"
+PRE_F6_COLUMNS = ["date", "industry", "subindustry", "type_of_product", "generic_product_type", "product",
+                  "price_sar", "company", "source", "url", "unit_of_measurement", "total_quantity", "channel"]
+SITES = ("amazon", "noon", "mumzworld", "saco", "fine", "gogreen", "officesupply", "aerosense")
 INSTRUCTIONS = [
     {"Type of product": "H1-Floor cleaner", "Sub industry": "Home", "Industry": "Home care",
      "Generic product type": "Floor cleaner", "Search Modifiers": ""},
@@ -92,8 +106,11 @@ class FakeScraper:
 
 
 def _product(site, keyword, tag):
-    return {"Product": f"{tag} {site} {keyword}", "Price_SAR": 12.5, "Company": "Fake brand",
-            "URL": f"https://{site}.example.invalid/{tag}", "Unit of measurement": "ml", "Total quantity": 500}
+    product = {"Product": f"{tag} {site} {keyword}", "Price_SAR": 12.5, "Company": "Fake brand",
+               "URL": f"https://{site}.example.invalid/{tag}", "Unit of measurement": "ml", "Total quantity": 500}
+    if site in m.APIFY_SITES:  # only the Apify adapters return Seller and Origin
+        product.update({"Seller": f"Seller of {site}", "Origin": "imported"})
+    return product
 
 
 def _factory(behaviors=None, created=None):
@@ -102,7 +119,7 @@ def _factory(behaviors=None, created=None):
     def factory(driver_path, agent):
         assert driver_path == "/fake/chromedriver"
         scrapers = {s: FakeScraper(s, None if s in m.SITES_WITHOUT_AI else agent, behaviors.get(s))
-                    for s in ("amazon", "mumzworld", "saco", "fine", "gogreen", "officesupply", "aerosense")}
+                    for s in SITES}
         if created is not None:
             created.append(scrapers)
         return scrapers
@@ -116,13 +133,15 @@ def paths(tmp_path):
     return {"instr": instr, "out": tmp_path / "competitors_complete.csv", "cov": tmp_path / "cov" / "coverage.csv"}
 
 
-def _main(paths, mode="overwrite", agent=None, factory=None, installer=None, sleeps=None):
+def _main(paths, mode="overwrite", agent=None, factory=None, installer=None, sleeps=None,
+          apify_preflight=lambda: None):
     agent = agent or FakeAgent()
     argv = ["--analysis_file", str(paths["instr"]), "--output_mode", mode, "--output_file", str(paths["out"]),
             "--coverage_file", str(paths["cov"])]
     return m.main(argv, agent_factory=lambda: agent, scraper_factory=factory or _factory(),
                   driver_installer=installer or (lambda: "/fake/chromedriver"),
-                  sleep=(sleeps.append if sleeps is not None else (lambda s: None)))
+                  sleep=(sleeps.append if sleeps is not None else (lambda s: None)),
+                  apify_preflight=apify_preflight)
 
 
 def _rows(path):
@@ -141,7 +160,7 @@ def test_success_replaces_the_csv_and_leaves_no_temp(paths):
     assert _main(paths, sleeps=sleeps) == 0
     rows = _rows(paths["out"])
     assert list(rows[0]) == config.CSV_COLUMNS
-    assert {r["source"] for r in rows} == {"amazon", "mumzworld", "saco", "aerosense"}
+    assert {r["source"] for r in rows} == {"amazon", "noon", "mumzworld", "saco", "aerosense"}
     assert all(r["product"].startswith("good") for r in rows if r["source"] != "aerosense")
     assert not (paths["out"].parent / "competitors_complete.tmp.csv").exists()
     assert sleeps == [m.SECONDS_BETWEEN_SUBINDUSTRIES] * 3
@@ -190,7 +209,7 @@ FAILURES = {
     "preflight": dict(agent=FakeAgent(preflight_error=m.RelevanceAgentFatalError("fake: no access"))),
     "factory": dict(factory=_boom),
     "zero-rows": dict(factory=_factory({s: (lambda self, k, mode: []) for s in
-                                        ("amazon", "mumzworld", "saco", "aerosense")})),
+                                        ("amazon", "noon", "mumzworld", "saco", "aerosense")})),
     "failure-rate": dict(agent=FakeAgent(rate_error=True)),
 }
 
@@ -256,7 +275,8 @@ def test_coverage_report_counts_found_relevant_and_rows(paths):
     keys = [(r["subindustry"], r["type_of_product"], r["site"], r["keyword"]) for r in cov]
     assert len(keys) == len(set(keys))
     pets = [r for r in cov if r["subindustry"] == "Pets"]
-    assert [r["keyword"] for r in pets] == ["pet wipes", "dog wipes"]
+    assert [(r["site"], r["keyword"]) for r in pets] == [("amazon", "pet wipes"), ("amazon", "dog wipes"),
+                                                         ("noon", "pet wipes")]
     for r in cov:
         if r["site"] == "aerosense":  # no AI: everything it returns is found and relevant
             assert r["found"] == r["relevant"] == r["rows_written"] == "2"
@@ -301,10 +321,9 @@ def test_row_data_keys_are_csv_columns_and_round_trip(tmp_path):
     assert _rows(p) == [{k: str(v) for k, v in row.items()}]
 
 
-def test_csv_columns_are_unchanged():
-    assert config.CSV_COLUMNS == ["date", "industry", "subindustry", "type_of_product", "generic_product_type",
-                                  "product", "price_sar", "company", "source", "url", "unit_of_measurement",
-                                  "total_quantity", "channel"]
+def test_csv_columns_are_the_13_originals_plus_seller_and_origin():
+    """F6 (Mafer, 2026-11-22): seller and origin are appended; the 13 original columns keep their order."""
+    assert config.CSV_COLUMNS == PRE_F6_COLUMNS + ["seller", "origin"]
 
 
 def test_target_map_lookup_is_still_case_sensitive_c06():
@@ -354,3 +373,208 @@ def test_a_title_with_nul_does_not_abort_the_run(paths):
 def test_strip_nul_keeps_other_types():
     assert m.strip_nul("a\x00b\x00") == "ab"
     assert m.strip_nul(None) is None and m.strip_nul(12.5) == 12.5 and m.strip_nul(3) == 3
+
+
+# --- F6: Apify ------------------------------------------------------------------------------------
+TEMP_NAME = "competitors_complete.tmp.csv"
+
+
+def _raise(error, keywords=None):
+    """Scraper behavior: raise ``error`` (for every keyword, or only for ``keywords``)."""
+    def behavior(self, keyword, mode):
+        if keywords is None or keyword in keywords:
+            raise error
+        return None  # default products
+    return behavior
+
+
+@pytest.mark.parametrize("error", [ac.ApifyFatalError("fake Apify POST /acts/x/runs: HTTP 401"),
+                                   ac.ApifyBudgetExceeded("fake Apify budget USD 20.00 would be exceeded")])
+@pytest.mark.parametrize("mode", ["overwrite", "append"])
+def test_apify_fatal_error_aborts_and_keeps_the_previous_csv(paths, error, mode):
+    paths["out"].write_text(OLD_CSV, encoding="utf-8")
+    created = []
+    assert _main(paths, mode=mode, factory=_factory({"amazon": _raise(error)}, created)) == 1
+    assert paths["out"].read_text(encoding="utf-8") == OLD_CSV
+    cov = _coverage(paths)
+    assert (cov[-1]["site"], cov[-1]["error"], cov[-1]["rows_written"]) == ("amazon", type(error).__name__, "0")
+    # Subindustries run in groupby order (Aviation, Home, Pets): amazon is the first Home site.
+    assert len(created) == 2, "Pets is never reached"
+    assert all(scrapers[s].calls == [] for scrapers in created for s in ("mumzworld", "saco", "noon")), \
+        "nothing is scraped after the fatal error"
+
+
+def test_apify_run_failed_is_per_keyword_but_fails_the_run(paths):
+    paths["out"].write_text(OLD_CSV, encoding="utf-8")
+    created = []
+    factory = _factory({"noon": _raise(ac.ApifyRunFailed("fake Apify run FAILED"), {"floor cleaner"})}, created)
+    assert _main(paths, factory=factory) == 1
+    assert paths["out"].read_text(encoding="utf-8") == OLD_CSV, "the output is not replaced"
+    temp = paths["out"].parent / TEMP_NAME
+    assert temp.is_file(), "the partial rows stay in the temp file"
+    sources = {r["source"] for r in _rows(temp)}
+    assert {"amazon", "mumzworld", "saco", "aerosense"} <= sources, "scraping went on after the failure"
+    noon_calls = [c for scrapers in created for c in scrapers["noon"].calls]
+    assert [k for k, _ in noon_calls] == ["floor cleaner", "pet wipes"], "noon kept being used after the failure"
+    cov = _coverage(paths)
+    failed = [r for r in cov if r["error"]]
+    assert [(r["site"], r["keyword"], r["error"]) for r in failed] == [("noon", "floor cleaner", "ApifyRunFailed")]
+
+
+def test_apify_failed_keywords_up_to_the_limit_are_tolerated(paths, monkeypatch):
+    monkeypatch.setattr(config, "APIFY_MAX_FAILED_KEYWORD_RATE", 0.5)
+    warnings = []
+    monkeypatch.setattr(m.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    factory = _factory({"noon": _raise(ac.ApifyRunFailed("fake Apify run FAILED"), {"floor cleaner"})})
+    assert _main(paths, factory=factory) == 0
+    assert "noon" in {r["source"] for r in _rows(paths["out"])}  # the Pets keyword still worked
+    assert not (paths["out"].parent / TEMP_NAME).exists()
+    assert any("within the 50% limit" in w and "floor cleaner" in w for w in warnings), "a tolerated failure is logged"
+
+
+def test_apify_failures_over_the_rate_exit_1(paths, monkeypatch):
+    monkeypatch.setattr(config, "APIFY_MAX_FAILED_KEYWORD_RATE", 0.5)
+    factory = _factory({"noon": _raise(ac.ApifyRunFailed("fake")), "amazon": _raise(TimeoutError(), {"pet wipes"})})
+    assert _main(paths, factory=factory) == 1
+    assert not paths["out"].exists()
+
+
+def test_a_selenium_site_error_is_not_counted_as_an_apify_failure(paths):
+    assert config.APIFY_MAX_FAILED_KEYWORD_RATE == 0.05
+    assert _main(paths, factory=_factory({"saco": _raise(TimeoutError("fake selenium timeout"))})) == 0
+    cov = _coverage(paths)
+    assert any(r["site"] == "saco" and r["error"] == "TimeoutError" for r in cov)
+    assert m.apify_failed_keywords(cov) == []
+
+
+@pytest.mark.parametrize("ok, bad, exceeded", [
+    (19, 1, False),   # 1 / 20 = 5 %: not above the limit
+    (19, 2, True),    # 2 / 21 > 5 %
+    (0, 1, True),     # every Apify search failed
+    (0, 0, False),    # no Apify search at all
+    (100, 5, False),  # 5 / 105 < 5 %
+])
+def test_apify_failures_exceeded_uses_a_strict_rate(ok, bad, exceeded):
+    entries = ([m.coverage_entry("S", "T", "amazon", f"ok{i}", {}, 1) for i in range(ok)]
+               + [m.coverage_entry("S", "T", "noon", f"bad{i}", {}, 0, "ApifyRunFailed") for i in range(bad)]
+               + [m.coverage_entry("S", "T", "saco", "x", {}, 0, "TimeoutError")] * 7)  # Selenium: ignored
+    failed, attempted, result = m.apify_failures_exceeded(entries, 0.05)
+    assert (len(failed), attempted, result) == (bad, ok + bad, exceeded)
+
+
+def test_apify_failed_keywords_helper():
+    entries = [m.coverage_entry("S", "T", site, "k", {}, 0, error) for site, error in [
+        ("amazon", ""), ("amazon", "ApifyRunFailed"), ("noon", "TimeoutError"), ("saco", "TimeoutError"),
+        ("mumzworld", "ApifyRunFailed")]]
+    assert [(e["site"], e["error"]) for e in m.apify_failed_keywords(entries)] == [
+        ("amazon", "ApifyRunFailed"), ("noon", "TimeoutError")]
+    assert m.APIFY_SITES == ("amazon", "noon")
+
+
+@pytest.mark.parametrize("error", [ac.ApifyFatalError("fake Apify GET /users/me/limits: HTTP 401"),
+                                   ac.ApifyRunFailed("fake Apify GET /users/me/limits: URLError")])
+def test_apify_preflight_failure_exits_1_before_building_scrapers(paths, error):
+    paths["out"].write_text(OLD_CSV, encoding="utf-8")
+    created = []
+
+    def preflight():
+        raise error
+
+    assert _main(paths, factory=_factory(created=created), apify_preflight=preflight) == 1
+    assert created == [], "no scraper is built"
+    assert paths["out"].read_text(encoding="utf-8") == OLD_CSV
+    assert not (paths["out"].parent / TEMP_NAME).exists()
+
+
+def test_apify_preflight_runs_after_the_ai_preflight(paths):
+    calls = []
+    agent = FakeAgent(preflight_error=m.RelevanceAgentFatalError("fake: no access"))
+    assert _main(paths, agent=agent, apify_preflight=lambda: calls.append(1)) == 1
+    assert calls == []
+    assert _main(paths, apify_preflight=lambda: calls.append(1)) == 0
+    assert calls == [1], "called once per run"
+
+
+def test_main_uses_the_real_apify_preflight_by_default():
+    import inspect
+    assert inspect.signature(m.main).parameters["apify_preflight"].default is ac.preflight
+
+
+def test_row_data_copies_seller_and_origin_or_uses_the_defaults():
+    args = ("Home care", "Home", "H1-Floor cleaner", "Floor cleaner", "noon", "B2C", "2026-11-22")
+    with_new = m.build_row_data({**_product("saco", "k", "good"), "Seller": "Shop\x00 N", "Origin": "local"}, *args)
+    assert (with_new["seller"], with_new["origin"]) == ("Shop N", "local")
+    without = m.build_row_data(_product("saco", "k", "good"), *args)
+    assert (without["seller"], without["origin"]) == ("", "unknown")
+    empty = m.build_row_data({**_product("saco", "k", "good"), "Seller": None, "Origin": ""}, *args)
+    assert (empty["seller"], empty["origin"]) == ("", "unknown")
+    assert list(with_new) == list(without) == config.CSV_COLUMNS
+    assert {k: v for k, v in with_new.items() if k in PRE_F6_COLUMNS} == \
+        {k: v for k, v in without.items() if k in PRE_F6_COLUMNS}
+
+
+def test_selenium_rows_get_the_default_seller_and_origin(paths):
+    assert _main(paths) == 0
+    for r in _rows(paths["out"]):
+        if r["source"] in m.APIFY_SITES:
+            assert (r["seller"], r["origin"]) == (f"Seller of {r['source']}", "imported")
+        else:
+            assert (r["seller"], r["origin"]) == ("", "unknown")
+
+
+def test_append_onto_a_pre_f6_file_is_refused(paths):
+    old = ",".join(PRE_F6_COLUMNS) + "\n" + ",".join(["x"] * len(PRE_F6_COLUMNS)) + "\n"
+    paths["out"].write_text(old, encoding="utf-8")
+    created = []
+    assert _main(paths, mode="append", factory=_factory(created=created)) == 1
+    assert paths["out"].read_text(encoding="utf-8") == old
+    assert not (paths["out"].parent / TEMP_NAME).exists()
+    assert created == [], "nothing is scraped"
+
+
+def test_overwrite_onto_a_pre_f6_file_replaces_it(paths):
+    paths["out"].write_text(",".join(PRE_F6_COLUMNS) + "\n", encoding="utf-8")
+    assert _main(paths) == 0
+    assert list(_rows(paths["out"])[0]) == config.CSV_COLUMNS
+
+
+def test_target_map_noon_only_in_home_automotive_and_pets():
+    assert {k for k, v in config.TARGET_MAP.items() if "noon" in v} == {"Home", "Automotive", "Pets"}
+    assert config.TARGET_MAP["Home"] == ["amazon", "mumzworld", "saco", "noon"]
+    assert config.TARGET_MAP["Automotive"] == ["amazon", "saco", "noon"]
+    assert config.TARGET_MAP["Pets"] == ["amazon", "noon"]
+    assert {k for k, v in config.TARGET_MAP.items() if "amazon" in v} == {"Home", "Automotive", "Pets"}
+
+
+def test_apify_config_values():
+    """Values decided by Mafer (2026-11-22) and docs/plan.md section 5; changing them needs her OK."""
+    assert config.APIFY_AMAZON_ACTOR == "junglee~amazon-crawler"
+    assert config.APIFY_NOON_ACTOR == "saswave~noon-product-scraper"
+    assert config.APIFY_RUN_BUDGET_USD == 20.0
+    assert config.APIFY_MAX_FAILED_KEYWORD_RATE == 0.05
+    assert config.APIFY_RUN_ATTEMPTS == 2
+    assert config.APIFY_MAX_RESULTS == 50
+    assert 0 < config.APIFY_AMAZON_MAX_USD <= config.APIFY_RUN_BUDGET_USD
+    assert 0 < config.APIFY_NOON_MAX_USD <= config.APIFY_RUN_BUDGET_USD
+
+
+def test_make_scrapers_builds_the_apify_adapters_without_reading_secrets(monkeypatch):
+    def no_secret(*a, **k):
+        raise AssertionError("make_scrapers must not read the Apify token")
+
+    monkeypatch.setattr(ac, "_SHARED", None)
+    monkeypatch.setattr(ac, "load_token", no_secret)
+    agent = FakeAgent()
+    scrapers = m.make_scrapers("/x", agent)
+    assert set(scrapers) == set(SITES)
+    assert isinstance(scrapers["amazon"], amazon_apify.AmazonApifyScraper)
+    assert isinstance(scrapers["noon"], noon_apify.NoonApifyScraper)
+    assert scrapers["amazon"].relevance_agent is agent and scrapers["noon"].relevance_agent is agent
+    assert ac._SHARED is None
+
+
+def test_the_selenium_amazon_scraper_is_gone():
+    """Apify replaces the Selenium Amazon scraper (Mafer, 2026-11-22); git history is the rollback."""
+    from pathlib import Path
+    assert not Path(m.SCRAPER_DIR, "scrapers", "amazon_scraper.py").exists()
+    assert not hasattr(m, "AmazonScraper")
