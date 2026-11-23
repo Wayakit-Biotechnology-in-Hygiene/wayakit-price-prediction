@@ -19,6 +19,11 @@ base one projected onto the base header, source by source and in the same order;
 equality no longer applies (REVIEW rule 7: the per-source equality on the 13 original columns, plus
 the new checks below, is at least as strict for Mumzworld and SACO as before).
 
+Since F6 was merged into `server-improvement` (2026-11-23) the base itself can have the F6 shape
+(`main(..., apify_preflight=...)`, 15 columns, Noon in TARGET_MAP). Then both versions run with the
+same F6 fakes and the CSVs must be identical byte for byte; the per-source projection above only
+applies to a pre-F6 base.
+
 A second test proves the Selenium side of ticket A did not move: `mumzworld_scraper.py`,
 `saco_scraper.py` and `utils.py` are identical to the base, and so are the Mumzworld / SACO
 exclusion lists and every TARGET_MAP entry except the 'noon' additions.
@@ -31,6 +36,7 @@ import contextlib
 import csv
 import hashlib
 import importlib.util
+import inspect
 import re
 import runpy
 import subprocess
@@ -135,7 +141,8 @@ def _materialize_base(tmp: Path) -> Path:
         pytest.fail(f"cannot extract '{ref}' (git fetch origin?): {error}", pytrace=False)
 
 
-def _run_base(base_root: Path, tmp: Path, out: Path) -> None:
+def _run_base(base_root: Path, tmp: Path, out: Path) -> bool:
+    """Runs the base scraper into ``out``. Returns True when the base already has the F6 shape."""
     script = base_root / "scraper" / "main.py"
     source = script.read_text(encoding="utf-8")
     with isolated_scraper_tree(base_root):
@@ -146,14 +153,21 @@ def _run_base(base_root: Path, tmp: Path, out: Path) -> None:
             spec.loader.exec_module(base)
             assert Path(base.config.__file__).resolve() == (base_root / "scraper" / "config.py").resolve(), \
                 "the base must run with its own config"
+            is_f6 = "apify_preflight" in inspect.signature(base.main).parameters
+            kwargs = dict(agent_factory=FakeAgent,
+                          scraper_factory=lambda d, a: {s: FakeScraper(s) for s in SITES},
+                          driver_installer=lambda: "/fake/chromedriver", sleep=lambda s: None)
+            if is_f6:
+                # F6 shape: same fakes as the new version, and no real Apify preflight.
+                kwargs.update(scraper_factory=lambda d, a: {s: FakeScraper(s, with_new_keys=s in APIFY_SITES)
+                                                            for s in NEW_SITES},
+                              apify_preflight=lambda: None)
             with mock.patch.object(base, "time", FAKE_TIME):
                 code = base.main(["--analysis_file", str(ANALYSIS), "--output_mode", "overwrite",
                                   "--output_file", str(out), "--coverage_file", str(tmp / "base_coverage.csv")],
-                                 agent_factory=FakeAgent,
-                                 scraper_factory=lambda d, a: {s: FakeScraper(s) for s in SITES},
-                                 driver_installer=lambda: "/fake/chromedriver", sleep=lambda s: None)
+                                 **kwargs)
             assert code == 0, f"base scraper/main.py returned {code!r}"
-            return
+            return is_f6
         # Pre-F2 shape (e.g. 8c278ca): argv is parsed at import time and the collaborators are globals.
         argv = [str(script), "--analysis_file", str(ANALYSIS), "--output_mode", "overwrite", "--output_file", str(out)]
         with mock.patch.object(sys, "argv", argv):
@@ -165,6 +179,7 @@ def _run_base(base_root: Path, tmp: Path, out: Path) -> None:
             real_globals[cls] = (lambda s: (lambda driver_path, relevance_agent=None: FakeScraper(s)))(site)
         real_globals["time"] = FAKE_TIME
         real_globals["main"]()
+        return False
 
 
 def _run_new(out: Path, cov: Path) -> int:
@@ -189,16 +204,20 @@ def _read(path: Path) -> tuple[list[str], list[dict]]:
 def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp_path):
     base_root = _materialize_base(tmp_path)
     base_out, new_out = tmp_path / "base.csv", tmp_path / "new.csv"
-    _run_base(base_root, tmp_path, base_out)
+    base_is_f6 = _run_base(base_root, tmp_path, base_out)
     assert _run_new(new_out, tmp_path / "coverage.csv") == 0
     base_header, base_rows = _read(base_out)
     new_header, new_rows = _read(new_out)
 
-    assert new_header == base_header + ["seller", "origin"]
-    for source in SITES:
-        b = [r for r in base_rows if r["source"] == source]
-        n = [{k: r[k] for k in base_header} for r in new_rows if r["source"] == source]
-        assert n == b, f"{source} rows changed on the base columns ({len(b)} base, {len(n)} new)"
+    if base_is_f6:
+        # The base already has F6: same fakes, so the CSV must not change at all.
+        assert new_out.read_bytes() == base_out.read_bytes(), "the CSV changed against an F6 base"
+    else:
+        assert new_header == base_header + ["seller", "origin"]
+        for source in SITES:
+            b = [r for r in base_rows if r["source"] == source]
+            n = [{k: r[k] for k in base_header} for r in new_rows if r["source"] == source]
+            assert n == b, f"{source} rows changed on the base columns ({len(b)} base, {len(n)} new)"
     for source in ("mumzworld", "saco"):
         n = [r for r in new_rows if r["source"] == source]
         assert n, f"the test would prove nothing: no {source} rows"
@@ -207,10 +226,11 @@ def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp
         assert all((r["seller"], r["origin"]) == ("", "unknown") for r in new_rows if r["source"] == source)
     amazon = [r for r in new_rows if r["source"] == "amazon"]
     assert amazon and all(r["seller"].startswith("Seller") for r in amazon), "Apify Seller reaches the CSV"
-    assert {r["source"] for r in base_rows} <= set(SITES)
-    assert not [r for r in base_rows if r["source"] == "noon"]
-    assert [r for r in new_rows if r["source"] == "noon"], "noon rows exist only in the new version"
-    assert len(new_rows) == len(base_rows) + sum(r["source"] == "noon" for r in new_rows)
+    assert [r for r in new_rows if r["source"] == "noon"], "the new version writes noon rows"
+    if not base_is_f6:
+        assert {r["source"] for r in base_rows} <= set(SITES)
+        assert not [r for r in base_rows if r["source"] == "noon"], "noon rows exist only in the new version"
+        assert len(new_rows) == len(base_rows) + sum(r["source"] == "noon" for r in new_rows)
 
     _, cov = _read(tmp_path / "coverage.csv")
     assert sum(int(r["rows_written"]) for r in cov) == len(new_rows)
@@ -235,6 +255,11 @@ def test_selenium_scrapers_parsers_and_exclusions_are_unchanged(tmp_path):
     assert new_config.SACO_EXCLUSIONS == base_config.SACO_EXCLUSIONS
     assert new_config.USER_AGENT == base_config.USER_AGENT  # used by both Selenium scrapers
     assert set(new_config.TARGET_MAP) == set(base_config.TARGET_MAP)
+    base_has_noon = any("noon" in sites for sites in base_config.TARGET_MAP.values())
     for key, base_sites in base_config.TARGET_MAP.items():
-        assert [s for s in new_config.TARGET_MAP[key] if s != "noon"] == base_sites, f"TARGET_MAP[{key!r}] changed"
+        new_sites = new_config.TARGET_MAP[key]
+        if base_has_noon:  # the base already has F6: no site may change at all
+            assert new_sites == base_sites, f"TARGET_MAP[{key!r}] changed"
+        else:
+            assert [s for s in new_sites if s != "noon"] == base_sites, f"TARGET_MAP[{key!r}] changed"
     assert new_config.CSV_COLUMNS[:len(base_config.CSV_COLUMNS)] == base_config.CSV_COLUMNS
