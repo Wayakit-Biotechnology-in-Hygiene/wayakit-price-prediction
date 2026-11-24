@@ -653,13 +653,13 @@ How to read it:
 
 ## Apify (Amazon and Noon, F6)
 
-Implemented on branch `f6-apify` (2026-11-22); **not on the instance**. Amazon KSA (`junglee~amazon-crawler`, site `amazon`) and Noon KSA (`saswave~noon-product-scraper`, site `noon`) are scraped through the Apify REST API in Home, Automotive and Pets; the Selenium Amazon scraper is deleted. Mumzworld, SACO and the B2B stores stay on Selenium. Code: `scraper/services/apify_client.py` (client, caps, budget), `scraper/scrapers/apify_common.py` (parsing, Wayakit exclusion, `origin`), `scraper/scrapers/amazon_apify.py`, `scraper/scrapers/noon_apify.py`. Decisions: [decisions.md](decisions.md), 2026-11-22 rows.
+Implemented on 2026-11-22 and merged into `server-improvement` (PR #10; smoke fixes in PR #12, merged 2026-11-24); **not on the instance**, which runs `server-improvement` at 0221cfc. Amazon KSA (`junglee~amazon-crawler`, site `amazon`) and Noon KSA (`saswave~noon-product-scraper`, site `noon`) are scraped through the Apify REST API in Home, Automotive and Pets; the Selenium Amazon scraper is deleted. Mumzworld, SACO and the B2B stores stay on Selenium. Code: `scraper/services/apify_client.py` (client, caps, budget), `scraper/scrapers/apify_common.py` (parsing, Wayakit exclusion, `origin`), `scraper/scrapers/amazon_apify.py`, `scraper/scrapers/noon_apify.py`. Decisions: [decisions.md](decisions.md), 2026-11-22 rows.
 
-**Do not pull F6 onto the instance until `APIFY_API_TOKEN` exists in `prod/wayakit-app` and the paid smoke run below passed** (Mafer's OK for both). Without the key the scraper exits 1 at the Apify preflight, so the monthly run would stop at `3. Run scraping` with nothing uploaded.
+**Pulling F6 onto the instance is Mafer's decision, and never on the day of a monthly run.** `APIFY_API_TOKEN` exists in `prod/wayakit-app` (Mafer, 2026-11-23) and two paid smoke runs passed (2026-11-23). Without the key the scraper exits 1 at the Apify preflight, so the monthly run would stop at `3. Run scraping` with nothing uploaded.
 
 ### Token
 
-- Key `APIFY_API_TOKEN` in `prod/wayakit-app` (eu-north-1), a token of the VdC account. **Pending: Mafer adds it** (see [Changing a key](#changing-a-key)). PI never reads `voz-del-cliente/api-keys`.
+- Key `APIFY_API_TOKEN` in `prod/wayakit-app` (eu-north-1), a token of the VdC account, added by Mafer on 2026-11-23 (to change it, see [Changing a key](#changing-a-key)). PI never reads `voz-del-cliente/api-keys`.
 - Read only through `pi_secrets.get_secret`, once per scraper process, on the first Apify call (never at import or when the scrapers are built). The instance role already reads `prod/wayakit-app`; nothing to change in IAM.
 - Before scraping starts, `scraper/main.py` runs the Apify preflight (`GET /users/me/limits`): a missing key, a blank value or a rejected token stops the run with exit 1 before any scraping. The log says `Apify token OK; account monthly usage USD x.xx` (the account is shared with VdC, so that number includes VdC's spend).
 - The token travels only in the `Authorization: Bearer` header. It is never in a URL, a log line, an exception or `repr()`. Never print it to check it.
@@ -695,7 +695,7 @@ In the coverage report, for `amazon` and `noon`, `found` counts the titles sent 
 
 ### Paid smoke run (only with Mafer's OK)
 
-Costs about USD 0.3 (Apify) plus a few Bedrock calls. Purpose: confirm on real data that both actors answer, the junglee attribute nesting is still read, Amazon sizes look right and the spend stays small. First run 2026-11-23 (USD 0.26 charged): see `docs/plan.md`, F6 status; a second run is due after the `f6-smoke-fixes` changes. From the repo root on Mafer's Mac, after `aws sso login --profile wayakit-vdc` and once `APIFY_API_TOKEN` exists:
+Costs about USD 0.3 (Apify) plus a few Bedrock calls. Purpose: confirm on real data that both actors answer, the junglee attribute nesting is still read, Amazon sizes look right and the spend stays small. First run 2026-11-23 (USD 0.26 charged): see `docs/plan.md`, F6 status; a second run the same day, after the fixes now in PR #12, passed. From the repo root on Mafer's Mac, after `aws sso login --profile wayakit-vdc` and once `APIFY_API_TOKEN` exists:
 
 ```bash
 export AWS_PROFILE=wayakit-vdc
@@ -734,7 +734,7 @@ All PI credentials are in the secret `prod/wayakit-app` (eu-north-1), as key/val
 2. Change only the value of the relevant key. **Do not delete the other rows.** → **Save**.
 3. If it was a replacement, revoke the old key in its service.
 
-- Since F2 the secret is read only by `pi_secrets.py` (`get_secret()`, `get_odoo_credentials()`; name and region in `SECRET_NAME` and `REGION_NAME`). If an Odoo key is missing or empty, the scripts exit 1 with the **names** of the missing keys, never their values. F6 (branch `f6-apify`): the Apify token is the key `APIFY_API_TOKEN` in the same secret (pending, to be added by Mafer); a missing or blank value stops the scraper at the Apify preflight with the key **name** only.
+- Since F2 the secret is read only by `pi_secrets.py` (`get_secret()`, `get_odoo_credentials()`; name and region in `SECRET_NAME` and `REGION_NAME`). If an Odoo key is missing or empty, the scripts exit 1 with the **names** of the missing keys, never their values. F6: the Apify token is the key `APIFY_API_TOKEN` in the same secret (added by Mafer on 2026-11-23); a missing or blank value stops the scraper at the Apify preflight with the key **name** only.
 - After the first successful Bedrock run on the instance: remove `GEMINI_API_KEY` from the secret (the F2 code no longer reads it), revoke the key and clean the logs (see Known issues, *Security*).
 
 ---
@@ -773,8 +773,8 @@ Errors that have already appeared or that are visible in the code, and what to d
 | GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
 | Chrome processes are left open | In SACO, `driver.get` and `_handle_overlays` are outside the `try` (`saco_scraper.py:122-123`) and errors other than Timeout do not close the browser | `pkill -f chrome` when running by hand. The instance shuts down at the end of the scheduled run |
 | Scraping does not start: `Could not install ChromeDriver` | `ChromeDriverManager().install()` resolves the driver on every run and downloads it if it is not cached (`main.py:263`), and depends on the network and the Chrome version | Retry. On the instance: Google Chrome 146.0.7680.177 and webdriver-manager 4.0.2 (F1) |
-| Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (branch `f6-apify`): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
-| Wayakit products in the Amazon and Noon results (pre-F6 code) | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | **Fixed in F6** (branch `f6-apify`): the Apify adapters drop Wayakit by brand, seller, manufacturer or title (drop reason `wayakit`) |
+| Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (in `server-improvement`, not on the instance): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
+| Wayakit products in the Amazon and Noon results (pre-F6 code) | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | **Fixed in F6** (in `server-improvement`, not on the instance): the Apify adapters drop Wayakit by brand, seller, manufacturer or title (drop reason `wayakit`) |
 
 ### ML and Odoo
 
@@ -786,7 +786,7 @@ Errors that have already appeared or that are visible in the code, and what to d
 | Duplicate suggestions | `odoo_api_price_suggestion.py` was run by hand without `--run_mode` (defaults to `partial`) or twice in partial | Re-upload with `--run_mode full`. Since F3 every pipeline run is full, so `wayakit_prediction_report.csv` holds every product; with the pre-F2 code, only if it is from a full run (a partial one only contains new products) |
 | Data from another company in sales or suggestions | No read filters by company (`ml_model/odoo_api_*.py`); the database is KSA only (Mafer, 2026-11-17) | Confirm the KSA company before reading or writing. **F2**: the upload exits 1 if the API user sees more than one company; reads would need a `company_id` filter if a second company ever appears |
 
-### Apify (F6, branch `f6-apify`; seen in the calibration)
+### Apify (F6; seen in the calibration)
 
 Operating details and failure modes: [Apify (Amazon and Noon, F6)](#apify-amazon-and-noon-f6).
 
