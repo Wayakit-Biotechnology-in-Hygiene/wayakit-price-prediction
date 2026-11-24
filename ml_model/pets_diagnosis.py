@@ -7,15 +7,17 @@ never touches Odoo or the network):
    (loaded with importlib, run with the data folder as the working directory) so the rows,
    price cleaning and unit lower-casing are exactly the pipeline's. The scraper's ``product``
    title is aligned back by position (1a concatenates the scraper rows first, then the Odoo
-   ``competitor.product`` rows). Each raw row is assigned to a model with 1a's rule: unit in
-   ``ml``, ``l``, ``fl oz``, ``g`` -> volumetric, anything else -> units.
+   ``competitor.product`` rows). Each raw row is assigned to a model with 1a's rule: a volume or
+   mass unit (``ml``, ``l`` and its spellings, ``fl oz``, ``g``, ``kg``...) -> volumetric (1a then
+   drops the mass rows), anything else -> units.
 2. Processed competitor rows (``competitor_volumetric_processed.csv`` /
    ``competitor_unit_processed.csv``): price per liter / per piece as training reads it.
    ``n_raw - n_before_trim`` shows the rows 1a dropped (for example ``g`` rows, missing prices).
 3. Trimming. Calls ``filter_outliers_with_percentiles()`` from ``ml_model/2_train_models.py``
-   on the full processed files (not only the subindustry), so "after trimming" is exactly what
-   training and the market stats (``*_market_stats.joblib``) saw. A type with rows before and
-   none after was emptied by the p10-p90 trimming (finding 12, bug 6).
+   on the full processed files (not only the subindustry), after ``drop_implausible_sizes()``
+   for the volumetric rows (F7a), so "after trimming" is exactly what training saw (the market
+   rows, ``*_market_rows.joblib``, are those rows minus multipacks). A type with rows before and
+   none after was emptied by the p10-p90 trimming (finding 12, bug 6; fixed in F7a).
 4. Wayakit products of the subindustry (``wayakit_products_to_predict_odoo.csv``) joined with
    the production prediction report (``wayakit_prediction_report.csv``, what the run produced;
    local re-runs differ by float noise, finding 13) and the approved quotes
@@ -77,9 +79,12 @@ import pandas as pd
 CODE_DIR = Path(__file__).resolve().parent  # ml_model/ of the code (not of --data-dir)
 REPO_ROOT = CODE_DIR.parent
 
-# Same rule as ml_model/1a_preprocess_data.py main(): these units go to the volumetric model.
-VOLUMETRIC_UNITS = ['ml', 'l', 'fl oz', 'g']
+# Same rule as ml_model/1a_preprocess_data.py main() (LITERS_PER_UNIT | MASS_UNITS since F7a):
+# these units go to the volumetric step, which then drops the mass rows.
+VOLUMETRIC_UNITS = ['ml', 'l', 'litre', 'litres', 'liter', 'liters', 'fl oz',
+                    'g', 'gr', 'gram', 'grams', 'kg', 'kgs', 'kilogram', 'kilograms', 'mg']
 FL_OZ_ML = 29.5735
+LITER_SPELLINGS = ('litre', 'litres', 'liter', 'liters')
 # 2 fl oz (59.1 mL) and 22 fl oz (650.6 mL) are left out: they collide with the metric 60 mL and
 # 650 mL bottles (e.g. Dr. Beckmann 650 mL).
 US_SIZES_FL_OZ = [4, 8, 10, 12, 16, 20, 24, 32, 64, 128]
@@ -181,6 +186,7 @@ def size_in_ml(unit, quantity):
     unit = '' if pd.isna(unit) else str(unit).strip().lower()
     if pd.isna(quantity):
         return np.nan
+    unit = 'l' if unit in LITER_SPELLINGS else unit  # 1a reads these as liters since F7a
     return {'ml': quantity, 'l': quantity * 1000, 'fl oz': quantity * FL_OZ_ML}.get(unit, np.nan)
 
 
@@ -201,7 +207,7 @@ def add_raw_facts(raw):
     raw['size_ml'] = [size_in_ml(u, q) for u, q in zip(raw['unit_of_measurement'], raw['total_quantity'])]
     unit = raw['unit_of_measurement'].astype('string').str.strip().str.lower()
     raw['is_fl_oz'] = unit.eq('fl oz').fillna(False)
-    raw['is_us_size_ml'] = unit.isin(['ml', 'l']).fillna(False) & raw['size_ml'].map(is_us_size_ml)
+    raw['is_us_size_ml'] = unit.isin(['ml', 'l', *LITER_SPELLINGS]).fillna(False) & raw['size_ml'].map(is_us_size_ml)
     raw['has_title'] = raw['product'].map(lambda t: t is not None and not pd.isna(t) and str(t).strip() != '')
     raw['is_multipack'] = raw['product'].map(has_pack_marker)
     raw['price_zero'] = raw['price_sar'].eq(0).fillna(False)
@@ -227,10 +233,14 @@ def _brand_count(df):
     return int(df['company'].dropna().str.casefold().nunique()) if len(df) else 0
 
 
-def trim_processed(vol_processed, unit_processed, trim_fn):
-    """Applies the pipeline's trimming to the full processed files (as 2_train_models main())."""
+def trim_processed(vol_processed, unit_processed, trim_fn, drop_sizes_fn=None):
+    """Applies the pipeline's trimming to the full processed files (as 2_train_models main():
+    since F7a the volumetric rows of 5 mL or less are dropped first, with `drop_sizes_fn`)."""
+    volumetric = vol_processed.copy()
+    if drop_sizes_fn is not None:
+        volumetric = drop_sizes_fn(volumetric)
     return {
-        'volumetric': trim_fn(vol_processed.copy(), METRIC['volumetric']),
+        'volumetric': trim_fn(volumetric, METRIC['volumetric']),
         'units': trim_fn(unit_processed.copy(), METRIC['units']),
     }
 
@@ -510,8 +520,11 @@ def run(args, trim_fn=None, preprocess_module=None):
     check_out_dir(args.out_dir, data_dir)
     if preprocess_module is None:
         preprocess_module = load_pipeline_module('1a_preprocess_data.py')
+    drop_sizes_fn = None
     if trim_fn is None:
-        trim_fn = load_pipeline_module('2_train_models.py').filter_outliers_with_percentiles
+        training = load_pipeline_module('2_train_models.py')
+        trim_fn = training.filter_outliers_with_percentiles
+        drop_sizes_fn = training.drop_implausible_sizes
 
     raw = add_raw_facts(load_raw_competitors(data_dir, preprocess_module))
     raw_s = raw[in_subindustry(raw, args.subindustry)]
@@ -522,7 +535,7 @@ def run(args, trim_fn=None, preprocess_module=None):
     unit_processed = read_csv(data_dir / INPUTS['unit_processed'])
     # Trim the files as training reads them (labels untouched), then normalize labels for grouping.
     trimmed = {model: normalize_labels(df)
-               for model, df in trim_processed(vol_processed, unit_processed, trim_fn).items()}
+               for model, df in trim_processed(vol_processed, unit_processed, trim_fn, drop_sizes_fn).items()}
     processed = {'volumetric': normalize_labels(vol_processed), 'units': normalize_labels(unit_processed)}
     wayakit = prepare_wayakit(read_csv(data_dir / INPUTS['to_predict']), read_csv(data_dir / INPUTS['report']),
                               read_csv(data_dir / INPUTS['quotes']), args.subindustry)

@@ -13,6 +13,18 @@ from log_config import get_logger
 
 logger = get_logger()
 
+# F7a robustness rules (docs/plan.md, F7a; docs/decisions.md, 2026-11-24).
+# p10-p90 trimming only for types with at least this many competitor rows: with 2 different
+# prices the bounds fell strictly between them and emptied the type (bug 6). From 3 rows the
+# trimming always keeps the median row, so it never empties a type; it stays as before there
+# (keeping all 3-4 rows let single absurd rows into training: x181 on one type in the F1 data).
+MIN_ROWS_TO_TRIM = 3
+# Competitor sizes of 5 mL or less are not plausible liquids (samples, typos such as 1 mL at
+# 59.98 SAR); they are dropped before the quantiles so they cannot move the bounds either.
+MIN_VOLUME_LITERS = 0.005
+# Market rows (the rows 3_predicted_prices.py computes each SKU's market band from).
+MARKET_ROWS_COLUMNS = ['type_of_product', 'price_per_unit', 'size']
+
 def load_training_data():
     """Loads all CSV files necessary for training."""
     logger.info("--- 1. Loading base files ---")
@@ -34,6 +46,19 @@ def prepare_wayakit_training_data(df_quotes_raw, df_wayakit_products):
         'Generic product type': 'generic_product_type', 'Type_of_product': 'type_of_product'
     })
 
+    # A SKU repeated in the catalog would duplicate its quotes in the merge (bug 7). One row per
+    # SKU is kept: the first one with a size (volume or pieces), else the first one.
+    has_size = pd.Series(False, index=df_wayakit_products_renamed.index)
+    for column in ('Volume_Liters', 'Pack_quantity_Units'):
+        if column in df_wayakit_products_renamed:
+            has_size |= pd.to_numeric(df_wayakit_products_renamed[column], errors='coerce').fillna(0) > 0
+    ordered = df_wayakit_products_renamed.assign(_sized=has_size).sort_values('_sized', ascending=False, kind='stable')
+    duplicated = ordered.duplicated(subset='Product_ID', keep='first')
+    if duplicated.any():
+        logger.warning(f"{int(duplicated.sum())} repeated Product_ID rows in the catalog: "
+                       "one row per SKU (the first with a size) is used to join the quotes.")
+    df_wayakit_products_renamed = ordered[~duplicated].drop(columns='_sized').sort_index()
+
     df_wayakit_train_base = pd.merge(df_quotes_raw, df_wayakit_products_renamed, on='Product_ID', how='inner')
     df_wayakit_train_base['company'] = 'Wayakit'
     
@@ -43,21 +68,54 @@ def prepare_wayakit_training_data(df_quotes_raw, df_wayakit_products):
     logger.info(f"✅ Prepared {len(df_wayakit_train_base)} Wayakit quotations.")
     return df_wayakit_train_base
 
+def drop_implausible_sizes(df_vol):
+    """Drops volumetric competitor rows of 5 mL or less (MIN_VOLUME_LITERS), before any quantile."""
+    keep = df_vol['volume_liters'] > MIN_VOLUME_LITERS
+    logger.info(f"Excluded {int((~keep).sum())} volumetric competitor rows of {MIN_VOLUME_LITERS * 1000:g} mL or less.")
+    return df_vol[keep].copy()
+
+
 def filter_outliers_with_percentiles(df_comp, metric_col, p_lower=0.10, p_upper=0.90):
+    """Per type_of_product, keeps the rows between the p10 and p90 of `metric_col` (inclusive).
+
+    Types with fewer than MIN_ROWS_TO_TRIM rows are kept whole (bug 6: with 2 different prices
+    the bounds fell strictly between them and the type lost every competitor). Rows without a
+    type or without a metric never pass.
     """
-    Filters competitor data to remove outliers using percentiles.
-    This is your quantile handling logic.
-    """
-    logger.info(f"--- 3. Filtering outliers for '{metric_col}' using percentiles {p_lower}-{p_upper} ---")
-    lower_bound = df_comp.groupby('type_of_product')[metric_col].transform('quantile', p_lower)
-    upper_bound = df_comp.groupby('type_of_product')[metric_col].transform('quantile', p_upper)
-    
+    logger.info(f"--- 3. Filtering outliers for '{metric_col}' using percentiles {p_lower}-{p_upper} "
+                f"(types with >= {MIN_ROWS_TO_TRIM} rows) ---")
+    groups = df_comp.groupby('type_of_product')[metric_col]
+    lower_bound = groups.transform('quantile', p_lower)
+    upper_bound = groups.transform('quantile', p_upper)
+    group_size = groups.transform('count')
+
     original_rows = len(df_comp)
-    df_cleaned = df_comp[(df_comp[metric_col] >= lower_bound) & (df_comp[metric_col] <= upper_bound)].copy()
-    
+    in_bounds = (df_comp[metric_col] >= lower_bound) & (df_comp[metric_col] <= upper_bound)
+    small_group = group_size < MIN_ROWS_TO_TRIM
+    has_values = df_comp[metric_col].notna() & group_size.notna()
+    df_cleaned = df_comp[has_values & (in_bounds | small_group)].copy()
+
     logger.info(f"Rows before: {original_rows} | Rows after: {len(df_cleaned)}")
     df_cleaned['approved_quote_price'] = 0.0
     return df_cleaned
+
+
+def build_market_rows(df_comp_cleaned, metric_col, size_col):
+    """The competitor rows the market band is computed from: the trimmed rows minus multipacks.
+
+    Returns `MARKET_ROWS_COLUMNS`: type, price per liter or per piece, and size (liters or pieces).
+    Rows from a processed file without `is_multipack` (pre-F7a) count as single products.
+    """
+    multipack = df_comp_cleaned['is_multipack'] if 'is_multipack' in df_comp_cleaned else False
+    multipack = pd.Series(multipack, index=df_comp_cleaned.index).fillna(False).astype(bool)
+    rows = df_comp_cleaned[~multipack]
+    logger.info(f"Market rows ({metric_col}): {len(rows)} ({int(multipack.sum())} multipacks left out).")
+    return pd.DataFrame({
+        'type_of_product': rows['type_of_product'].values,
+        'price_per_unit': rows[metric_col].astype(float).values,
+        'size': rows[size_col].astype(float).values,
+    }, columns=MARKET_ROWS_COLUMNS)
+
 
 def train_and_evaluate(X, y, label):
     """Trains a RandomForest, logs 80/20 holdout metrics and returns the final model trained on all the data."""
@@ -79,38 +137,27 @@ def train_and_evaluate(X, y, label):
     logger.info(f"📊 OOB R² ({label}, final model): {final_model.oob_score_:.3f}")
     return final_model
 
-def save_market_stats(df_vol, df_unit, model_dir):
-    """
-    Computes and saves market statistics (Min, Max, Count) per product type.
-    This will serve as 'Evidence' for the Guardrails in Odoo.
-    """
-    logger.info("--- 5a. Saving Market Stats for Guardrails ---")
-    
-    # 1. Volumetric Statistics (Price per Liter)
-    # We group by 'type_of_product' and compute min, max and count
-    vol_stats = df_vol.groupby('type_of_product').agg(
-        market_min=('price_per_liter', 'min'),
-        market_max=('price_per_liter', 'max'),
-        competitor_count=('price_per_liter', 'count'),
-        # Observed volume range: outside it the price/liter extrapolation is not reliable
-        vol_min=('volume_liters', 'min'),
-        vol_max=('volume_liters', 'max')
+def market_stats(market_rows):
+    """Per type: min, max and count of the price per unit, and the size range of the market rows."""
+    return market_rows.groupby('type_of_product').agg(
+        market_min=('price_per_unit', 'min'),
+        market_max=('price_per_unit', 'max'),
+        competitor_count=('price_per_unit', 'count'),
+        # Observed size range: outside it the price per liter or per piece is not extrapolated
+        vol_min=('size', 'min'),
+        vol_max=('size', 'max'),
     ).reset_index()
 
-    # 2. Unit Statistics (Price per Item)
-    unit_stats = df_unit.groupby('type_of_product').agg(
-        market_min=('price_per_item', 'min'),
-        market_max=('price_per_item', 'max'),
-        competitor_count=('price_per_item', 'count'),
-        vol_min=('total_quantity', 'min'),
-        vol_max=('total_quantity', 'max')
-    ).reset_index()
 
-    # We save these "dictionaries" to disk
-    joblib.dump(vol_stats, os.path.join(model_dir, 'vol_market_stats.joblib'))
-    joblib.dump(unit_stats, os.path.join(model_dir, 'unit_market_stats.joblib'))
-    
-    logger.info("✅ Market stats saved (Min, Max, Count per product type).")
+def save_market_stats(vol_rows, unit_rows, model_dir):
+    """Saves the market rows (what prediction computes each SKU's band from) and, as a summary
+    for the logs and diagnosis, the per-type stats (min, max, count, size range)."""
+    logger.info("--- 5a. Saving market rows and stats for the guardrails ---")
+    joblib.dump(vol_rows, os.path.join(model_dir, 'vol_market_rows.joblib'))
+    joblib.dump(unit_rows, os.path.join(model_dir, 'unit_market_rows.joblib'))
+    joblib.dump(market_stats(vol_rows), os.path.join(model_dir, 'vol_market_stats.joblib'))
+    joblib.dump(market_stats(unit_rows), os.path.join(model_dir, 'unit_market_stats.joblib'))
+    logger.info("✅ Market rows and stats saved.")
 
 def main():
     """
@@ -123,7 +170,8 @@ def main():
     # Wayakit data preparation
     df_wayakit_base = prepare_wayakit_training_data(df_quotes, df_products)
 
-    # **HERE IS YOUR PERCENTILE LOGIC, INTACT**
+    # Trimming per type (not for small types), after dropping implausible sizes.
+    df_vol_comp = drop_implausible_sizes(df_vol_comp)
     df_vol_comp_cleaned = filter_outliers_with_percentiles(df_vol_comp, 'price_per_liter')
     df_unit_comp_cleaned = filter_outliers_with_percentiles(df_unit_comp, 'price_per_item')
 
@@ -173,8 +221,10 @@ def main():
     joblib.dump(X_vol_encoded.columns.tolist(), os.path.join(model_dir, 'volumetric_model_columns.joblib'))
     joblib.dump(model_unit, os.path.join(model_dir, 'unit_model.joblib'))
     joblib.dump(X_unit_encoded.columns.tolist(), os.path.join(model_dir, 'unit_model_columns.joblib'))
-    # Market stats from competitors only: the market range must not include Wayakit's own prices
-    save_market_stats(df_vol_comp_cleaned, df_unit_comp_cleaned, model_dir)
+    # Market rows from competitors only: the market range must not include Wayakit's own prices
+    save_market_stats(build_market_rows(df_vol_comp_cleaned, 'price_per_liter', 'volume_liters'),
+                      build_market_rows(df_unit_comp_cleaned, 'price_per_item', 'total_quantity'),
+                      model_dir)
     
     logger.info("🎉 Models and columns successfully saved.")
 

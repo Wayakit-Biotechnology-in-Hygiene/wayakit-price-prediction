@@ -5,8 +5,50 @@ import sys
 # Add the root directory to the path so log_config can be imported
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from log_config import get_logger
+# Pure title parsing shared with the Apify adapters (no I/O); used here only to flag multipacks.
+from scraper.scrapers.apify_common import pack_count, volume_pack
 
 logger = get_logger()
+
+# Unit (lower-cased, stripped) -> liters per unit. These rows go to the volumetric model.
+LITERS_PER_UNIT = {
+    'ml': 0.001,
+    'l': 1.0, 'litre': 1.0, 'litres': 1.0, 'liter': 1.0, 'liters': 1.0,
+    'fl oz': 0.0295735,
+}
+# Mass units: never a competitor size (Wayakit sells liquids only, and a weight cannot be priced
+# per liter or per piece). The volumetric step drops them with a log line. Before F7a only `g` was
+# dropped and `kg` fell into the per-piece model as if it were pieces (bug 5).
+MASS_UNITS = {'g', 'gr', 'gram', 'grams', 'kg', 'kgs', 'kilogram', 'kilograms', 'mg'}
+
+
+def normalize_unit(unit_column):
+    return unit_column.astype('string').str.lower().str.strip()
+
+
+def flag_multipacks(titles, units, quantities):
+    """True for a row whose title states a pack of 2 or more of the same product.
+
+    Only scraper rows have a title; Odoo `competitor.product` rows (no title) are never flagged.
+    Volume rows use the adapters' volume-mode pack reader ("Twin Pack", "500ml x 2"...), the
+    others the units-mode one; a per-piece row is a multipack only when the pack count is not its
+    piece count ("Pack of 6, 480 wipes" is; "Wipes Pack of 72" with 72 pieces is one pack). The
+    price stays the pack's total: the flag only keeps the row out of the market range (F7a), not
+    out of training.
+    """
+    flags = []
+    for title, unit, quantity in zip(titles, units, quantities):
+        if title is None or pd.isna(title):
+            flags.append(False)
+            continue
+        if not pd.isna(unit) and str(unit) in LITERS_PER_UNIT:
+            flags.append(bool(volume_pack(title) > 1))
+            continue
+        pack = pack_count(title)
+        pieces = pd.to_numeric(quantity, errors='coerce')
+        flags.append(bool(pack > 1 and not (pd.notna(pieces) and pieces == pack)))
+    return flags
+
 
 def load_and_clean_raw_data():
     logger.info("--- 1. Loading and cleaning raw competitor data ---")
@@ -14,6 +56,7 @@ def load_and_clean_raw_data():
     df_prod = pd.read_csv('ml_model/competitor_products_from_odoo.csv')
 
     df_test4_clean = df_test4[['industry', 'subindustry', 'type_of_product', 'generic_product_type', 'price_sar', 'company', 'unit_of_measurement', 'total_quantity', 'channel']].copy()
+    titles = df_test4['product'].tolist() if 'product' in df_test4 else [None] * len(df_test4)
     df_prod_clean = df_prod.rename(columns={
         'Industry': 'industry', 'Sub industry': 'subindustry', 'Type of product': 'type_of_product',
         'Generic product type': 'generic_product_type', 'Price per unit SAR': 'price_sar',
@@ -27,57 +70,77 @@ def load_and_clean_raw_data():
     df_test4_clean['price_sar'] = clean_price(df_test4_clean['price_sar'])
     df_prod_clean['price_sar'] = clean_price(df_prod_clean['price_sar'])
 
-    def clean_units(unit_column):
-        return unit_column.str.lower().str.strip()
-    df_test4_clean['unit_of_measurement'] = clean_units(df_test4_clean['unit_of_measurement'])
-    df_prod_clean['unit_of_measurement'] = clean_units(df_prod_clean['unit_of_measurement'])
-    
+    df_test4_clean['unit_of_measurement'] = normalize_unit(df_test4_clean['unit_of_measurement'])
+    df_prod_clean['unit_of_measurement'] = normalize_unit(df_prod_clean['unit_of_measurement'])
+    df_test4_clean['is_multipack'] = flag_multipacks(titles, df_test4_clean['unit_of_measurement'].tolist(),
+                                                     df_test4_clean['total_quantity'].tolist())
+    df_prod_clean['is_multipack'] = False
+
     competitor_data = pd.concat([df_test4_clean, df_prod_clean], ignore_index=True)
     logger.info(f"✅ Raw data combined. Total: {len(competitor_data)} rows.")
     return competitor_data
 
+
+def _drop_invalid_prices(df):
+    """Price must be a number > 0 (C18): a price of 0 gives 0 SAR per liter or per piece and
+    pulls the type's low bound down."""
+    price = pd.to_numeric(df['price_sar'], errors='coerce')
+    keep = (price > 0).fillna(False).astype(bool)
+    dropped = int((~keep).sum())
+    if dropped:
+        logger.info(f"Excluded {dropped} rows with a missing, zero or negative price.")
+    return df[keep]
+
+
 def process_volumetric_data(df):
     logger.info("--- 2a. Processing volumetric products ---")
-    df['unit_of_measurement'] = df['unit_of_measurement'].str.lower().str.strip()
-    
-    original_rows = len(df)
-    df = df[df['unit_of_measurement'] != 'g']
-    logger.info(f"Excluded {original_rows - len(df)} products measured in grams.")
+    df['unit_of_measurement'] = normalize_unit(df['unit_of_measurement'])
 
-    def convert_to_liters(row):
-        if row['unit_of_measurement'] == 'ml': return row['total_quantity'] / 1000
-        if row['unit_of_measurement'] == 'fl oz': return row['total_quantity'] * 0.0295735
-        if row['unit_of_measurement'] == 'l': return row['total_quantity']
-        return None
-    df['volume_liters'] = df.apply(convert_to_liters, axis=1)
+    is_mass = df['unit_of_measurement'].isin(MASS_UNITS).fillna(False).astype(bool)
+    logger.info(f"Excluded {int(is_mass.sum())} products measured by mass (g, kg...).")
+    df = df[df['unit_of_measurement'].isin(LITERS_PER_UNIT.keys()).fillna(False).astype(bool)].copy()
+    # One spelling per unit in the output (litre, liters... -> l).
+    df['unit_of_measurement'] = df['unit_of_measurement'].map(
+        lambda unit: unit if unit in ('ml', 'fl oz') else 'l').astype(object)
 
-    df.dropna(subset=['volume_liters'], inplace=True)
+    df['total_quantity'] = pd.to_numeric(df['total_quantity'], errors='coerce')
+    valid_quantity = (df['total_quantity'] > 0).fillna(False).astype(bool)
+    if (~valid_quantity).any():  # bug 8: quantities <= 0 never reach training
+        logger.info(f"Excluded {int((~valid_quantity).sum())} volumetric rows with a missing or non-positive quantity.")
+    df = _drop_invalid_prices(df[valid_quantity]).copy()
+
+    df['volume_liters'] = df['total_quantity'] * df['unit_of_measurement'].map(LITERS_PER_UNIT).astype(float)
     df['price_per_liter'] = df['price_sar'] / df['volume_liters']
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=['price_per_liter'], inplace=True)
-    
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['price_per_liter'])
+    df = df[df['price_per_liter'] > 0]  # a tiny price can underflow to 0 per unit
+
     df.to_csv('ml_model/competitor_volumetric_processed.csv', index=False)
     logger.info("✅ File 'competitor_volumetric_processed.csv' saved.")
+
 
 def process_unit_data(df):
     logger.info("--- 2b. Processing unit products ---")
     df['total_quantity'] = pd.to_numeric(df['total_quantity'], errors='coerce')
-    df.dropna(subset=['total_quantity'], inplace=True)
+    df = df.dropna(subset=['total_quantity'])
     df = df[df['total_quantity'] > 0]
-    
+    df = _drop_invalid_prices(df).copy()
+
     df['price_per_item'] = df['price_sar'] / df['total_quantity']
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=['price_per_item'], inplace=True)
-    
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['price_per_item'])
+    df = df[df['price_per_item'] > 0]  # a tiny price can underflow to 0 per unit
+
     df.to_csv('ml_model/competitor_unit_processed.csv', index=False)
     logger.info("✅ File 'competitor_unit_processed.csv' saved.")
+
 
 def main():
     """Errors propagate (no swallowing): the `__main__` block logs them and exits with 1."""
     competitor_data = load_and_clean_raw_data()
 
-    volumetric_units = ['ml', 'l', 'fl oz', 'g']
-    is_volumetric = competitor_data['unit_of_measurement'].str.lower().isin(volumetric_units)
+    # Volume and mass units go to the volumetric step (which drops the mass rows); anything else
+    # (units, pieces...) is priced per piece.
+    unit = normalize_unit(competitor_data['unit_of_measurement'])
+    is_volumetric = unit.isin(set(LITERS_PER_UNIT) | MASS_UNITS).fillna(False).astype(bool)
 
     process_volumetric_data(competitor_data[is_volumetric].copy())
     process_unit_data(competitor_data[~is_volumetric].copy())

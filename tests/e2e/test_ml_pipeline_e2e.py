@@ -20,11 +20,12 @@ from tests.e2e import _helpers as h
 
 pytestmark = pytest.mark.e2e
 
-# Report price columns (`ml_model/3_predicted_prices.py:139-152`).
+# Report price columns (`generate_predictions` in `ml_model/3_predicted_prices.py`).
 PRICE_COLUMNS = ["cost_per_unit", "predicted_price", "predicted_price_per_unit",
-                 "porcentaje_de_ganancia", "market_min_found", "market_max_found", "model_confidence"]
-FLOOR_FACTOR = 1.30  # `3_predicted_prices.py:135`
-MIN_COMPETITORS_FOR_CLAMP = 3  # `3_predicted_prices.py:129`
+                 "porcentaje_de_ganancia", "market_min_found", "market_max_found", "model_confidence",
+                 "market_median_found", "market_p75_found"]
+FLOOR_FACTOR = 1.30  # `MARGIN_FLOOR` in `3_predicted_prices.py`
+MIN_COMPETITORS_FOR_CLAMP = 3  # `MIN_COMPETITORS_FOR_CLAMP` in `3_predicted_prices.py`
 # The report rounds to 2 decimals and goes through CSV; 0.01 covers rounding on both sides.
 ROUND_TOL = 0.01
 
@@ -69,7 +70,9 @@ def test_processed_competitors_are_consistent(run):
     vol = pd.read_csv(run.path(h.VOL_PROCESSED))
     unit = pd.read_csv(run.path(h.UNIT_PROCESSED))
     assert len(vol) > 0 and len(unit) > 0
-    assert not vol["unit_of_measurement"].isin(["g"]).any(), "the volumetric set must not contain grams"
+    assert not vol["unit_of_measurement"].isin(["g", "kg"]).any(), "the volumetric set must not contain masses"
+    assert (vol["price_sar"] > 0).all() and (unit["price_sar"] > 0).all(), "price 0 must not reach training (C18)"
+    assert vol["is_multipack"].dtype == bool and unit["is_multipack"].dtype == bool
     assert set(vol["unit_of_measurement"]) <= {"ml", "l", "fl oz"}
     for df, col in ((vol, "price_per_liter"), (unit, "price_per_item")):
         values = df[col].to_numpy(dtype=float)
@@ -103,9 +106,9 @@ def test_report_has_no_nan_prices(report):
 
 
 def test_final_price_respects_the_margin_floor(report):
-    # predicted_price = round(max(model, cost × 1.30), 2), so it never drops by more than half a cent.
+    # Since F7a the floor is rounded up to the cent: the price is never below cost × 1.30.
     floor = report["cost_per_unit"] * FLOOR_FACTOR
-    bad = report["predicted_price"] < floor - 0.005 - 1e-9
+    bad = report["predicted_price"] < floor - 1e-9 * np.maximum(1.0, floor)
     assert not bad.any(), _fail_rows(report, bad, ["Product_ID", "cost_per_unit", "predicted_price"],
                                      f"final price < cost × {FLOOR_FACTOR}")
 
@@ -117,13 +120,17 @@ def test_clamp_to_market_range(report):
     assert not bad_flag.any(), _fail_rows(report, bad_flag, ["Product_ID", "competitors_count"],
                                           "clamped with fewer than 3 competitors")
 
-    # With >= 3 competitors and a model price > 0, the price stays within the market [min, max],
-    # unless the margin floor lifts it above the maximum (the floor always wins).
+    # With >= 3 competitors and a model price > 0, the price stays within the SKU's band
+    # [min, p75 x size] (F7a), unless the margin floor lifts it above the ceiling (the floor always
+    # wins). The ceiling applies at every size; a size above the market's size range is never
+    # lifted to the minimum (the report does not say which side, so outside rows skip that check).
+    assert (report["market_p75_found"] <= report["market_max_found"] + ROUND_TOL).all()
     clamped_rows = ~few & (report["predicted_price_per_unit"] > 0)
     assert clamped_rows.any(), "no product went through the clamp; the check would prove nothing"
     floor = report["cost_per_unit"] * FLOOR_FACTOR
-    upper = np.maximum(report["market_max_found"], floor)
-    below = clamped_rows & (report["predicted_price"] < report["market_min_found"] - ROUND_TOL)
+    upper = np.maximum(report["market_p75_found"], floor)
+    below = (clamped_rows & ~report["volume_outside_market"]
+             & (report["predicted_price"] < report["market_min_found"] - ROUND_TOL))
     above = clamped_rows & (report["predicted_price"] > upper + ROUND_TOL)
     cols = ["Product_ID", "predicted_price", "market_min_found", "market_max_found", "cost_per_unit"]
     assert not below.any(), _fail_rows(report, below, cols, "price below the market minimum")
@@ -135,6 +142,19 @@ def test_confidence_and_counts_in_range(report):
     assert (report["competitors_count"] >= 0).all()
     assert report["clamped_to_market"].dtype == bool
     assert report["volume_outside_market"].dtype == bool
+    assert report["volume_capped"].dtype == bool and report["has_size"].dtype == bool
+    assert not (report["volume_capped"] & ~report["volume_outside_market"]).any()
+
+
+def test_products_without_a_size_get_only_the_floor(report):
+    """No-size parent templates: flagged has_size False, priced at the floor, never clamped; the
+    upload skips them (F7a)."""
+    no_size = ~report["has_size"]
+    assert no_size.any(), "the F1 data has 26 products without a size; the check would prove nothing"
+    rows = report[no_size]
+    assert (rows["volume"] == "0 units").all() and (rows["competitors_count"] == 0).all()
+    floor = rows["cost_per_unit"] * FLOOR_FACTOR
+    assert ((rows["predicted_price"] - floor).abs() <= 0.01 + 1e-9).all()
 
 
 def test_models_saved_and_loadable(run):
@@ -150,3 +170,8 @@ def test_models_saved_and_loadable(run):
         stats = joblib.load(model_dir / name)
         assert {"type_of_product", "market_min", "market_max", "competitor_count"} <= set(stats.columns)
         assert len(stats) > 0 and not math.isnan(float(stats["market_min"].min()))
+    for name in ("vol_market_rows.joblib", "unit_market_rows.joblib"):
+        rows = joblib.load(model_dir / name)
+        assert rows.columns.tolist() == ["type_of_product", "price_per_unit", "size"]
+        assert len(rows) > 0 and (rows["price_per_unit"] > 0).all() and (rows["size"] > 0).all()
+    assert (joblib.load(model_dir / "vol_market_rows.joblib")["size"] > 0.005).all(), "5 mL or less is dropped"

@@ -89,10 +89,15 @@ def dry_run(code_copy, tmp_path_factory):
     return r, report, out, ids
 
 
-def test_dry_run_on_the_frozen_report_builds_one_record_per_row(dry_run):
+def test_dry_run_on_the_frozen_report_builds_one_record_per_row_with_a_size(dry_run):
+    """One record per report row, except products without a size ("0 units"), which are not
+    uploaded since F7a (26 in the frozen report)."""
     r, report, out, ids = dry_run
     assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
     df_report, df_out = pd.read_csv(report), pd.read_csv(out)
+    no_size = df_report["volume"].astype(str).str.startswith("0 ")
+    assert no_size.sum() == 26
+    df_report = df_report[~no_size]
     assert len(df_out) == len(df_report) > 0
     assert df_out["product_id_str"].astype(str).tolist() == df_report["Product_ID"].astype(str).tolist()
     assert df_out["suggested_price"].tolist() == pytest.approx(df_report["predicted_price"].tolist())

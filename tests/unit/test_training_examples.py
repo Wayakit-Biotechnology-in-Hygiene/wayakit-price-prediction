@@ -41,14 +41,19 @@ def test_filter_drops_rows_without_product_type():
     assert output["type_of_product"].tolist() == ["A"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a type_of_product with exactly 2 rows of different prices ends up with no rows. Counterexample: "
-    "'A' with [1.0, 2.0] -> limits 1.1 and 1.9 -> 0 rows (finding for pi-dev)",
-)
 def test_group_of_two_prices_does_not_disappear():
+    """Bug 6 (fixed in F7a): limits 1.1 and 1.9 used to leave the type with 0 rows."""
     df = pd.DataFrame({"type_of_product": ["A", "A"], "price_per_liter": [1.0, 2.0]})
-    assert len(filter_outliers(df, "price_per_liter")) > 0
+    assert filter_outliers(df, "price_per_liter")["price_per_liter"].tolist() == [1.0, 2.0]
+
+
+def test_groups_of_three_or_more_are_still_trimmed():
+    """From MIN_ROWS_TO_TRIM (3) rows p10-p90 applies as before: it always keeps the median row."""
+    df = pd.DataFrame({"type_of_product": ["A"] * 3 + ["B"] * 4,
+                       "price_per_liter": [1.0, 2.0, 1000.0, 1.0, 2.0, 3.0, 4.0]})
+    output = filter_outliers(df, "price_per_liter")
+    assert output.loc[output["type_of_product"] == "A", "price_per_liter"].tolist() == [2.0]
+    assert output.loc[output["type_of_product"] == "B", "price_per_liter"].tolist() == [2.0, 3.0]
 
 
 def _products(ids, subindustries):
@@ -82,14 +87,8 @@ def test_prepare_quotations_channel_is_case_sensitive():
     assert base["channel"].tolist() == ["B2B"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: if a SKU repeats in wayakit_products_to_predict_odoo.csv, the merge duplicates its "
-    "quotations and they weigh double in training. Counterexample: 1 quotation for 'P1' and 'P1' "
-    "twice in products -> 2 rows. The F1 data has 4 repeated SKUs and 162 quotations "
-    "give 163 rows (finding for pi-dev)",
-)
 def test_each_quotation_appears_only_once():
+    """Bug 7 (fixed in F7a): a SKU repeated in the catalog used to duplicate its quotes."""
     quotations = pd.DataFrame({"Product_ID": ["P1"], "approved_quote_price": [10.0]})
     products = _products(["P1", "P1"], ["Home", "Home"])
     assert len(training.prepare_wayakit_training_data(quotations, products)) == 1
@@ -114,3 +113,35 @@ def test_train_and_evaluate_is_deterministic():
     a.set_params(n_jobs=1)
     b.set_params(n_jobs=1)
     np.testing.assert_array_equal(a.predict(X), b.predict(X))
+
+
+def test_repeated_sku_keeps_the_row_with_a_size():
+    """Bug 7: of two catalog rows of one SKU, the one with a size joins the quotes, even if it is
+    not the first (otherwise the quote would fall out of both training sets)."""
+    quotations = pd.DataFrame({"Product_ID": ["P1"], "approved_quote_price": [10.0]})
+    products = _products(["P1", "P1"], ["Home", "Home"]).assign(Volume_Liters=[0.0, 1.0], Pack_quantity_Units=[0, 0])
+    base = training.prepare_wayakit_training_data(quotations, products)
+    assert base["Volume_Liters"].tolist() == [1.0]
+
+
+def test_drop_implausible_sizes_removes_5_ml_or_less():
+    df = pd.DataFrame({"type_of_product": ["A"] * 4, "volume_liters": [0.001, 0.005, 0.0051, 1.0],
+                       "price_per_liter": [59980.0, 2000.0, 1000.0, 10.0]})
+    assert training.drop_implausible_sizes(df)["volume_liters"].tolist() == [0.0051, 1.0]
+
+
+def test_market_rows_leave_multipacks_out_and_stats_summarize_them():
+    df = pd.DataFrame({"type_of_product": ["A", "A", "A", "B"], "price_per_liter": [10.0, 20.0, 5.0, 7.0],
+                       "volume_liters": [0.5, 1.0, 2.0, 4.0], "is_multipack": [False, False, True, False]})
+    rows = training.build_market_rows(df, "price_per_liter", "volume_liters")
+    assert rows.columns.tolist() == training.MARKET_ROWS_COLUMNS
+    assert rows.values.tolist() == [["A", 10.0, 0.5], ["A", 20.0, 1.0], ["B", 7.0, 4.0]]
+    stats = training.market_stats(rows).set_index("type_of_product")
+    assert stats.loc["A"].tolist() == [10.0, 20.0, 2, 0.5, 1.0]
+
+
+def test_market_rows_without_multipack_column_keep_every_row():
+    """A processed file from before F7a has no is_multipack column: every row is a single product."""
+    df = pd.DataFrame({"type_of_product": ["A"], "price_per_item": [1.5], "total_quantity": [20.0]})
+    rows = training.build_market_rows(df, "price_per_item", "total_quantity")
+    assert rows.values.tolist() == [["A", 1.5, 20.0]]

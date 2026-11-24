@@ -61,10 +61,10 @@ Found by `pi-tester` while writing the unit and property tests for the current c
 | 2 | `kilograms` is read as grams ("gram" is inside "kilograms" and that branch comes first) | `'2 kilograms'` → unit `g`, normalized 2.0 (should be kg and 2000) | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
 | 3 | Thousands separator | `'Shampoo 1,000 ml'` → quantity 0.0 (the regex takes only "000") | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
 | 4 | Decimal without leading zero | `'Bleach .5 L'` → quantity 5.0 (5 L instead of 0.5 L) | `scraper/utils.py:3` | Shared parser unchanged (question 13); fixed only in the Apify adapters (`scraper/scrapers/apify_common.py`, F6) |
-| 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7a (small fixes) |
-| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7a, directly for Pets** (small n per type; "robust trimming when n is small"); in Pets (F5), **2 types are emptied** (1 of 19 volumetric and 1 of 3 unit), neither with a Wayakit SKU |
-| 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7a (and the SKU cleanup in section 7.3) |
-| 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7a (small fixes, C18) |
+| 5 | `1a` sends `kg` and `litre` to the per-piece model: it only recognizes `ml`, `l`, `fl oz` and `g` as volume | `'Powder 2 kg'` at 30 SAR → `competitor_unit_processed.csv` with total_quantity 2 and price_per_item 15 | `ml_model/1a_preprocess_data.py:79-80` | F7a (small fixes) — **fixed in F7a** (2026-11-24): mass units are dropped, `litre`/`liter` are liters |
+| 6 | **The p10–p90 trimming empties groups with 2 different prices** (bounds 1.1 and 1.9 for [1.0, 2.0]; the filter is inclusive and nothing remains) | In the F1 data, **14 of 151 volumetric types and 1 of 15 unit types end up with no competitor at all** in training | `ml_model/2_train_models.py:46-60` | **F7a, directly for Pets** (small n per type; "robust trimming when n is small"); in Pets (F5), **2 types are emptied** (1 of 19 volumetric and 1 of 3 unit), neither with a Wayakit SKU — **fixed in F7a** (2026-11-24): types with fewer than 3 rows are not trimmed |
+| 7 | Repeated SKUs duplicate quotes (the `merge` on `Product_ID`) | A quote for `P1` with `P1` twice in products → 2 rows. In F1: 4 repeated SKUs, 162 quotes → 163 rows | `ml_model/2_train_models.py:37` (`prepare_wayakit_training_data`) | F7a (and the SKU cleanup in section 7.3) — **fixed in F7a** (2026-11-24): one catalog row per SKU joins the quotes (the first one with a size, else the first); the Odoo cleanup is still section 7.3 |
+| 8 | `process_volumetric_data` does not drop quantities ≤ 0 (the unit one does) | `ml`, total_quantity −500, price 1 → volume_liters −0.5 and price_per_liter −2.0, which go into training | `ml_model/1a_preprocess_data.py:39-59` | F7a (small fixes, C18) — **fixed in F7a** (2026-11-24), together with price 0 in both paths |
 | 9 | **Possible bug (confirm with Mafer):** the concentration "3X" is taken as 3 pieces | `'Detergent 3X concentrate 500 ml'` → 1500 ml | `scraper/utils.py:64` | Open (question 12) for the shared parser; the Apify adapters never take "3X" as a multiplier (F6) |
 | 10 | Minor: scientific notation in the multiplier (only with totals < 1e-4 or ≥ 1e16, unrealistic) | `'(2 Bottles x 0.00001 ml)'` → quantity 2e-05 but normalized 5.0 | `scraper/utils.py:64` | No phase (noted) |
 | 11 | Minor: huge numbers in the count parsers raise `ValueError` (`int()` digit limit in Python ≥ 3.10.7); unrealistic in titles | `'9'*4301 + ' wipes'` | `scraper/utils.py:31` (`parse_count_string`) | No phase (noted) |
@@ -211,9 +211,25 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 
 Expected cost: about USD 13.5 per run (Amazon 55 × ~0.20, Noon search 55 × ~0.045), inside the USD 20 cap (the budget counts about 25 % less than the real charge; accepted, see `docs/decisions.md`, 2026-11-23).
 
-### F7a · ML robustness without origin (2 days)
+### F7a · ML robustness without origin (2 days) — **implemented on branch `feat/f7a-ml-robustness` (2026-11-24); Mafer approved applying it to every subindustry and the ML differential the same day; PR to `server-improvement` not merged yet**
 
 Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here needs the `origin` column.
+
+**Status (2026-11-24):** every item below is implemented (rules in `docs/decisions.md`, 2026-11-24; how the band works in `docs/runbook.md`, *Reviewing results in Odoo*). Bugs 5, 6, 7 and 8 and the price-0 case (C18) are fixed and their strict `xfail` tests are now passing tests; so is the minor "product without measure with empty pieces" crash. Not merged and not on the instance: the first monthly run (2026-11-26) still uses the pre-F7a ML. Before/after on the frozen F1 data, offline (`ml_model/compare_reports.py`, old and new flows each in a temporary copy):
+
+| Subindustry | Products | Median new/old | Above local p75, before → after |
+|---|---|---|---|
+| Airports | 8 | 1.106 | – (no type with 3+ market rows) |
+| Automotive | 89 | 0.973 | 0.0 % → 0.0 % |
+| Aviation | 22 | 1.202 | 0.0 % → 0.0 % |
+| Facilities management | 83 | 1.015 | 39.4 % → 0.0 % |
+| Home | 415 | 0.980 | 17.9 % → 1.7 % |
+| Hotels | 8 | 1.006 | – |
+| Pets | 22 | 1.000 | 9.1 % → 0.0 % |
+| Restaurants | 65 | 1.003 | 50.0 % → 7.1 % |
+| All | 712 | 0.986 | 16.7 % → 1.4 % |
+
+"Above local p75" counts sized products whose type has 3 or more market rows, against the new report's size-matched p75; what remains above it is set by the cost × 1.30 floor. Retrain noise of about ±4 % per SKU applies (finding 13 and F5 limitations). Pets by type: urine odor remover 4 L ×0.51 (capped at its 0.7 L price per liter), deodorizing wipes ×0.85 (p75 ceiling over every row of the type: fewer than 3 packs of 10–40 pieces), flea and tick ×1.08 (within noise; its competitor set is the F7b problem), the rest 0.96–1.01.
 
 - **Robust trimming when n is small** (bug 6): with 2 different prices per type, the p10–p90 trimming leaves the type without competitors (14 of 151 volumetric types in F1). Applies directly to Pets.
 - **Robust market range** with a ceiling of `p75 × volume` (median without extreme values, without multipacks or sizes of 5 mL or less).
@@ -234,7 +250,7 @@ Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here ne
 ### F8 · Final run and Odoo KSA (1 day + review)
 
 1. Full run with `--dry-run`.
-2. Puya and Luisa review the Pets list: previous price, new price, local p75 and cost.
+2. Puya and Luisa review the Pets list: previous price, new price, local p75 and cost. **Also the large movers outside Pets** (Mafer, 2026-11-24, when approving F7a for every subindustry): `ml_model/compare_reports.py` lists them; on the F1 data, 4 L sizes no longer lifted to small-bottle per-liter minimums go down to ×0.12, and the types that bug 6 had emptied go up to ×3.9 (Aviation leather conditioner).
 3. With their approval, and with the KSA company confirmed, it is uploaded with the safe scheme.
 
 **Order:** F0 → F1 → F2 → (F3 → F4) in parallel with (F5 → F6 → F7a → F7b) → F8 (Mafer, 2026-11-22: F6 → F7a → F7b → F8).
