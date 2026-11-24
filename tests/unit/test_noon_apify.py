@@ -6,9 +6,12 @@
   `APIFY_MAX_RESULTS` locally;
 - product URLs from slug + sku; no sku, no price, non-SAR currency and Wayakit's own products
   (brand, store or name: C09) are dropped; SACO as a Noon store is kept; sale_price before price;
-- details run only for relevant rows that have no shipping info, in one run per keyword, and give
-  the `global` (imported) flag; a details failure fails the keyword loudly;
-- size comes from the title only.
+- exactly one actor run per keyword (no details run, 2026-11-23); `shipping_banner_details` never
+  decides origin and neither does a fl oz size: a "made in KSA" title is local, anything else
+  unknown;
+- size comes from the title only: ml, liters or fl oz (a plain "oz" or a gallon alone is not
+  enough); an ambiguous title (a kit of different products, a count, a dose...) has none; a
+  multipack of the same product is kept with its total.
 """
 from __future__ import annotations
 
@@ -66,11 +69,6 @@ def test_search_input_is_exact():
     }
 
 
-def test_details_input_is_exact():
-    urls = [url_of("A1"), url_of("B2")]
-    assert noon_apify.build_details_input(urls) == {"search_urls": [], "max_pages": 1, "product_urls": urls}
-
-
 def test_one_search_run_per_keyword():
     client = FakeClient([], [])
     scraper = noon_apify.NoonApifyScraper(None, agent(), client=client)
@@ -89,7 +87,7 @@ def test_one_search_run_per_keyword():
 def test_output_is_cut_to_the_cap_locally():
     items = [shipped(f"good car wax {i} 500 ml", f"S{i:03d}") for i in range(60)]
     rows, client = scrape(items)
-    assert len(client.calls) == 1, "every row had shipping info: no details run"
+    assert len(client.calls) == 1, "one search run, never a details run"
     assert len(rows) == config.APIFY_MAX_RESULTS == 50
     assert {r["URL"] for r in rows} == {url_of(f"S{i:03d}") for i in range(50)}
 
@@ -164,83 +162,40 @@ def test_company_and_seller():
     assert (candidate["Company"], candidate["Seller"]) == ("Company not found", "")
 
 
-# --- 6. details -------------------------------------------------------------------------------------
-def test_details_run_only_for_relevant_rows():
+# --- 6. one run, origin from the title ---------------------------------------------------------------
+def test_relevant_rows_need_no_details_run():
     search = [item("good car wax 500 ml", "A1"), item("bad car wax 500 ml", "B2"),
               item("good car wax", "C3")]  # no size: dropped before the AI
-    details = [{"sku": "A1", "shipping_banner_details": {"global": True}, "specifications": []}]
-    rows, client = scrape(search, details)
-    assert len(client.calls) == 2
-    det = client.calls[1]
-    assert det["actor"] == config.APIFY_NOON_ACTOR
-    assert det["input"] == {"search_urls": [], "max_pages": 1, "product_urls": [url_of("A1")]}
-    assert det["max_items"] == 1 and det["max_usd"] == config.APIFY_NOON_MAX_USD
-    assert [(r["URL"], r["Origin"]) for r in rows] == [(url_of("A1"), "imported")]
+    rows, client = scrape(search)
+    assert len(client.calls) == 1
+    assert [(r["URL"], r["Origin"]) for r in rows] == [(url_of("A1"), "unknown")]
     assert set(rows[0]) == ROW_KEYS
 
 
-def test_no_details_run_when_nothing_is_relevant():
-    rows, client = scrape([item("bad car wax 500 ml", "B2")])
-    assert rows == [] and len(client.calls) == 1
-
-
-def test_no_details_run_when_every_relevant_row_has_shipping_info():
-    rows, client = scrape([shipped("good car wax 500 ml", "A1", global_flag=True),
-                           shipped("good car polish 250 ml", "A2", global_flag=False),
-                           item("bad car wax 500 ml", "B2")])
+@pytest.mark.parametrize("banner", [{"global": True}, {"global": False}, None, "", [], "yes"])
+def test_the_shipping_banner_never_decides_origin(banner):
+    """2026-11-23 smoke run: `global` was the same generic fee message on every product, local
+    ones (sold by SACO) included, so it is not an origin signal (Mafer, 2026-11-23)."""
+    rows, client = scrape([item("good car wax 500 ml", "A1", shipping_banner_details=banner),
+                           item("good car polish 16 fl oz", "A2", shipping_banner_details=banner),
+                           item("good car shampoo 1 L Made in KSA", "A3", shipping_banner_details=banner)])
     assert len(client.calls) == 1
-    assert [r["Origin"] for r in rows] == ["imported", "unknown"]
+    assert [r["Origin"] for r in rows] == ["unknown", "unknown", "local"]
 
 
-def test_details_only_for_the_rows_without_shipping_info():
-    search = [shipped("good car wax 500 ml", "A1", global_flag=True), item("good car polish 250 ml", "A2")]
-    rows, client = scrape(search, [{"sku": "A2", "shipping_banner_details": {"global": False}}])
-    assert client.calls[1]["input"]["product_urls"] == [url_of("A2")]
-    assert client.calls[1]["max_items"] == 1
-    assert [r["Origin"] for r in rows] == ["imported", "unknown"]
-
-
-def test_made_in_ksa_in_the_name_beats_global():
-    rows, _ = scrape([item("good car wax 500 ml Made in KSA", "A1")],
-                     [{"sku": "A1", "shipping_banner_details": {"global": True}}])
+def test_made_in_ksa_in_the_name_is_local():
+    rows, _ = scrape([item("good car wax 500 ml Made in KSA", "A1")])
     assert [r["Origin"] for r in rows] == ["local"]
 
 
-def test_made_in_ksa_in_the_specifications_is_local():
-    rows, _ = scrape([item("good car wax 500 ml", "A1")],
-                     [{"sku": "A1", "shipping_banner_details": {"global": False},
-                       "specifications": [{"name": "Origin", "value": "Made in Saudi Arabia"}]}])
-    assert [r["Origin"] for r in rows] == ["local"]
+def test_seller_comes_from_the_search_item():
+    rows, _ = scrape([item("good car wax 500 ml", "A1", store_name=" Search Store "),
+                      item("good car polish 250 ml", "A2", store_name=None)])
+    assert [r["Seller"] for r in rows] == ["Search Store", ""]
 
 
-def test_details_are_joined_by_the_sku_in_the_url():
-    rows, _ = scrape([item("good car wax 500 ml", "A1")],
-                     [{"url": url_of("A1"), "shipping_banner_details": {"global": True}}])
-    assert [r["Origin"] for r in rows] == ["imported"]
-
-
-def test_details_fill_an_empty_seller_and_unmatched_rows_keep_search_values():
-    search = [item("good car wax 500 ml", "A1", store_name=""), item("good car polish 250 ml", "A2")]
-    details = [{"sku": "A1", "store_name": "Details Store", "shipping_banner_details": {"global": False}}]
-    rows, _ = scrape(search, details)
-    by_url = {r["URL"]: r for r in rows}
-    assert by_url[url_of("A1")]["Seller"] == "Details Store"
-    assert by_url[url_of("A2")]["Seller"] == "Fake Store" and by_url[url_of("A2")]["Origin"] == "unknown"
-
-
-def test_details_never_overwrite_a_search_seller():
-    rows, _ = scrape([item("good car wax 500 ml", "A1", store_name="Search Store")],
-                     [{"sku": "A1", "store_name": "Details Store"}])
-    assert [r["Seller"] for r in rows] == ["Search Store"]
-
-
-@pytest.mark.parametrize("error", [ac.ApifyRunFailed("fake details FAILED"), ac.ApifyBudgetExceeded("fake")])
-def test_details_failure_propagates(error):
-    with pytest.raises(type(error)):
-        scrape([item("good car wax 500 ml", "A1")], error)
-
-
-@pytest.mark.parametrize("error", [ac.ApifyFatalError("fake HTTP 403"), ac.ApifyRunFailed("fake")])
+@pytest.mark.parametrize("error", [ac.ApifyFatalError("fake HTTP 403"), ac.ApifyRunFailed("fake"),
+                                   ac.ApifyBudgetExceeded("fake")])
 def test_search_failure_propagates(error):
     with pytest.raises(type(error)):
         scrape(error)
@@ -265,20 +220,55 @@ def test_title_without_a_size_is_dropped_in_volume_mode():
     assert rows == [] and len(client.calls) == 1 and relevance.stats()["evaluated"] == 0
 
 
-def test_details_do_not_change_the_size():
-    rows, _ = scrape([item("good car wax 500 ml", "A1")],
-                     [{"sku": "A1", "name": "car wax 1 L", "specifications": [{"name": "Volume", "value": "1 L"}]}])
-    assert [r["Total quantity"] for r in rows] == [pytest.approx(500.0)]
-
-
 def test_units_mode_counts_from_the_title():
     rows, _ = scrape([shipped("good microfiber cloths 12 pcs", "A1")], keyword="microfiber", mode="units")
     assert [(r["Unit of measurement"], r["Total quantity"]) for r in rows] == [("units", 12)]
 
 
-def test_fl_oz_title_is_imported():
+def test_a_fl_oz_title_is_not_imported():
+    """A size in fl oz does not prove a product is imported (Mafer, 2026-11-23)."""
     rows, _ = scrape([shipped("good car wax 16 fl oz", "A1")])
-    assert [(r["Unit of measurement"], r["Origin"]) for r in rows] == [("fl oz", "imported")]
+    assert [(r["Unit of measurement"], r["Origin"]) for r in rows] == [("fl oz", "unknown")]
+
+
+@pytest.mark.parametrize("name", ["good car wax 32oz", "good car wax 32 Ounces", "good car wash soap 1 Gallon",
+                                  "good disinfectant spray 19 oz"])
+def test_plain_oz_and_gallon_titles_have_no_size(name):
+    """Noon has only the title: nothing confirms a plain oz (it may be a net weight) or a gallon,
+    so the row is dropped (Mafer, 2026-11-23)."""
+    relevance = agent()
+    rows, _ = scrape([item(name, "A1")], relevance=relevance)
+    assert rows == [] and relevance.stats()["evaluated"] == 0
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("good car wax 24oz - 709ml", ("ml", 709.0)),              # the ml in the same title says it
+    ("good car wax 16.9 fl oz", ("fl oz", 16.9)),
+    ("good car shampoo 400ml Twinpack", ("ml", 800.0)),        # a multipack of the same product is kept
+    ("good car shampoo 1 Liter Pack of Six", ("ml", 6000.0)),
+    ("good car shampoo 500ML*2", ("ml", 1000.0)),
+])
+def test_explicit_sizes_and_same_product_multipacks(name, expected):
+    rows, _ = scrape([item(name, "A1")])
+    assert [(r["Unit of measurement"], r["Total quantity"], r["Origin"]) for r in rows] == \
+        [(expected[0], pytest.approx(expected[1]), "unknown")]
+
+
+@pytest.mark.parametrize("name", ["good car wax 28 oz, 4 Count", "good car wash pods 16 ct 15.2 oz",
+                                  "good car wax 1/2 Gallon", "good car wax 12/19 oz",
+                                  # conservative mode (Mafer, 2026-11-23)
+                                  "good car shampoo 1 L makes 100 L", "good snow foam 1 oz per gallon, 32 oz",
+                                  "good car wash 1 gal Bottle, 6/Carton", "good glass cleaner 32 oz Twin Pack",
+                                  "good car wash soap 64 oz with 2 Pack Wash Mitts", "good car wash pods 16 oz",
+                                  # a kit of different products is not stored (Mafer, 2026-11-23)
+                                  "good car wash kit 500 ml shampoo, wax and microfiber",
+                                  "good car shampoo 1L with Pack of 3 Microfiber Towels",
+                                  "good leather cleaner 250 ml and conditioner 250 ml",
+                                  "good car shampoo 500ml and 1L Refill", "good car wax paste 11 oz"])
+def test_ambiguous_count_and_fraction_titles_have_no_size(name):
+    relevance = agent()
+    rows, _ = scrape([item(name, "A1")], relevance=relevance)
+    assert rows == [] and relevance.stats()["evaluated"] == 0
 
 
 def test_client_is_resolved_lazily(monkeypatch):
@@ -292,30 +282,6 @@ def test_client_is_resolved_lazily(monkeypatch):
 
 
 # --- review round 1 ---------------------------------------------------------------------------------
-@pytest.mark.parametrize("detail", [
-    {"sku": "Z1", "store_name": "WAYAKIT", "shipping_banner_details": {"global": False}},
-    {"sku": "Z1", "store_name": "Some Store", "brand": "Waya Kit"},
-    {"url": url_of("Z1"), "store_name": "wayakit official"},
-])
-def test_a_wayakit_seller_or_brand_seen_only_in_details_is_dropped(detail):
-    """C09: the search item had no store_name, so the exclusion must run again on the details."""
-    search = [item("good floor cleaner 1 L", "Z1", store_name=None, brand=None),
-              item("good car polish 250 ml", "A2")]
-    rows, client = scrape(search, [detail])
-    assert len(client.calls) == 2
-    assert [r["URL"] for r in rows] == [url_of("A2")]
-    assert not any(common.WAYAKIT_RE.search(r["Seller"] + " " + r["Company"]) for r in rows)
-
-
-@pytest.mark.parametrize("value", [None, "", [], "yes"])
-def test_a_non_object_shipping_banner_still_asks_for_details(value):
-    """A uniform schema with `shipping_banner_details: null` carries no flag."""
-    rows, client = scrape([item("good car wax 500 ml", "A1", shipping_banner_details=value)],
-                          [{"sku": "A1", "shipping_banner_details": {"global": True}}])
-    assert len(client.calls) == 2
-    assert [r["Origin"] for r in rows] == ["imported"]
-
-
 @pytest.mark.parametrize("url, expected", [
     ("/saudi-en/dry-shampoo/ZX/p/", "https://www.noon.com/saudi-en/dry-shampoo/ZX/p/"),
     ("saudi-en/dry-shampoo/ZX/p/", "https://www.noon.com/saudi-en/dry-shampoo/ZX/p/"),

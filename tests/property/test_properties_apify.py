@@ -6,10 +6,11 @@
 - C10: "n x v ml" is n*v ml (the pack multiplies), while a dimension ("a x b cm") anywhere in
   the text never changes `parse_volume` or `parse_count`; every row `AmazonApifyScraper.scrape`
   returns has a finite quantity > 0, a price > 0 and a unit in {ml, fl oz, units}.
-- `derive_origin` always returns local / imported / unknown.
+- `derive_origin` always returns local / imported / unknown, and imported only from a country of
+  origin; an ambiguous title (count, unread pack, bundle, dose, capacity) never gives a size.
 - C09: Wayakit (any casing or spacing) in brand, seller or title is always dropped with reason
-  "wayakit" by both converters; no kept candidate has a Wayakit Company or Seller; a Wayakit
-  seller or brand that only the Noon details run shows never reaches a row.
+  "wayakit" by both converters; no kept candidate has a Wayakit Company or Seller.
+- Noon makes exactly one actor run per keyword and `shipping_banner_details` never decides origin.
 - Budget: for any sequence of run costs, `spent_usd` never exceeds the budget and
   `ApifyBudgetExceeded` is raised exactly when spent + next cap > budget, before any request.
 - No token in the text of any exception the client raises, including a token with whitespace or
@@ -108,11 +109,47 @@ def test_a_dimension_alone_is_never_a_pack_or_a_count(v, dim):
     assert common.parse_volume(f"Bottle {v} ml {dim}") == ("ml", float(v))
 
 
-@given(st.one_of(st.none(), any_text), st.lists(any_text, max_size=3), st.one_of(st.none(), st.booleans()),
-       st.sampled_from([None, "ml", "fl oz", "units", "L"]))
-def test_derive_origin_is_one_of_three(country, texts, noon_global, unit):
-    assert common.derive_origin(country_of_origin=country, texts=tuple(texts), noon_global=noon_global,
-                                unit=unit) in {"local", "imported", "unknown"}
+@given(st.one_of(st.none(), any_text), st.lists(any_text, max_size=3))
+def test_derive_origin_is_one_of_three(country, texts):
+    origin = common.derive_origin(country_of_origin=country, texts=tuple(texts))
+    assert origin in {"local", "imported", "unknown"}
+    if not (country or "").strip():
+        assert origin != "imported", "only a country of origin can say imported (2026-11-23)"
+
+
+# --- conservative mode (Mafer, 2026-11-23): an ambiguous title never gives a size --------------------
+ambiguity = st.sampled_from([", 4 Count", ", 6/Carton", ", Case of 6", " Duo", " + 3 Refills",
+                             " with 2 Wash Mitts", ", 1 oz per Gallon", ", makes 100 L", ", 1 oz/gallon",
+                             ", Treats up to 50 Gallons", " for 55 Gallon Tanks", ", Mix 1 oz with water",
+                             " Kit", " Bundle", " and 3 Pack Microfiber Towels", " and 7 L Refill"])
+
+
+@given(any_text)
+def test_title_volume_is_parse_volume_or_none(text):
+    result = common.title_volume(text)
+    assert result is None or result == common.parse_volume(text)
+
+
+@given(st.integers(1, 5000), st.sampled_from(["ml", "L", "fl oz", "oz", "Gallon"]), ambiguity, st.booleans())
+def test_an_ambiguity_signal_removes_the_title_size(v, unit, signal, before):
+    title = f"Cleaner{signal} {v} {unit}" if before else f"Cleaner {v} {unit}{signal}"
+    assert common.title_volume(title) is None
+    assert common.title_volume(title, explicit_only=True) is None
+
+
+@given(any_text)
+def test_an_explicit_only_title_size_is_never_a_plain_oz_or_a_gallon(text):
+    """With nothing to confirm it (Noon), a title size comes from ml, liters or fl oz only."""
+    result = common.title_volume(text, explicit_only=True)
+    if result is not None:
+        kinds = [t[0] for t in common._size_tokens(text)]
+        assert common.EXPLICIT in kinds and kinds[0] != common.UNUSABLE
+
+
+@given(st.integers(1, 5000), st.sampled_from(["oz", "Ounces", "Gallon", "gal"]))
+def test_noon_never_sizes_a_plain_oz_or_gallon_title(v, unit):
+    candidate, _ = noon_apify.convert_item(_noon(name=f"good car wax {v} {unit}"), "volume")
+    assert candidate["Total quantity"] is None
 
 
 # --- C09: Wayakit is never a competitor -------------------------------------------------------------
@@ -156,20 +193,19 @@ def test_no_kept_candidate_is_wayakit(brand, seller, title):
             assert not common.WAYAKIT_RE.search(candidate["Product"])
 
 
-@given(wayakit, st.sampled_from(["store_name", "brand"]), st.booleans())
-@example("WAYAKIT", "store_name", True)
-def test_a_wayakit_seller_from_noon_details_never_reaches_a_row(mark, where, by_url):
-    search = [_noon(name="good floor cleaner 1 L", brand=None, store=None),
-              dict(_noon(name="good car wax 500 ml"), sku="N2", url="car-wax")]
-    detail = {where: mark, "shipping_banner_details": {"global": False}}
-    detail.update({"url": "https://www.noon.com/saudi-en/car-wax/N1/p/"} if by_url else {"sku": "N1"})
+@given(st.one_of(st.none(), st.booleans(), any_text, st.dictionaries(any_text, st.booleans(), max_size=3)),
+       st.sampled_from(["good car wax 500 ml", "good car wax 16 fl oz", "good car wax made in KSA 1 L"]))
+@example({"global": True}, "good car wax 500 ml")
+def test_noon_makes_one_run_and_the_shipping_banner_never_decides_origin(banner, name):
+    """2026-11-23: `shipping_banner_details` is not an origin signal and there is no details run."""
+    search = [dict(_noon(name=name), shipping_banner_details=banner)]
     relevance = ai.RelevanceAgent(client=FakeBedrock(), sleep=lambda s: None, rng=random.Random(0))
-    client = FakeClient(search, [detail])
-    rows = noon_apify.NoonApifyScraper(None, relevance, client=client).scrape("floor cleaner", "volume")
-    assert len(client.calls) == 2
-    assert [r["Product"] for r in rows] == ["good car wax 500 ml"]
-    for row in rows:
-        assert not common.WAYAKIT_RE.search(row["Seller"]) and not common.WAYAKIT_RE.search(row["Company"])
+    client = FakeClient(search)
+    rows = noon_apify.NoonApifyScraper(None, relevance, client=client).scrape("car wax", "volume")
+    assert len(client.calls) == 1
+    expected = {"good car wax 500 ml": "unknown", "good car wax 16 fl oz": "unknown",
+                "good car wax made in KSA 1 L": "local"}[name]
+    assert [r["Origin"] for r in rows] == [expected]
 
 
 # --- C10: every Amazon row is usable by the ML ------------------------------------------------------

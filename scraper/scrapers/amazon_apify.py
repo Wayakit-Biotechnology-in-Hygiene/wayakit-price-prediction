@@ -5,9 +5,12 @@ One actor run per `scrape()` call, with the search URL `https://www.amazon.sa/s?
 
 Conversion (`convert_item`) drops, in order: results not loaded from Saudi Arabia, sponsored
 results, items without a title, without a current price (`price.value`; `listPrice` is never
-read) or not in SAR, and Wayakit's own products. The size follows the 2-of-N rule: at least two
-of {title, Item Volume, Size, Unit Count} must agree on the pack total, and per-unit attributes
-never outvote a title that states a pack (`amazon_size`). Then the shared step in
+read) or not in SAR, and Wayakit's own products. The size (`amazon_size`, conservative): two of
+{title, Item Volume, Size, Unit Count} agreeing on the pack total (a plain "oz" needs a
+confirmation that is not another plain "oz"), else the title's size when it is in ml, liters or
+fl oz and no attribute contradicts it; an ambiguous title (a kit of different products, a count,
+a dose...), a solid Item Form or an attribute multipack the title does not state gives no size,
+and per-unit attributes never outvote a title that states a pack. Then the shared step in
 `apify_common.select_relevant` drops rows without a size and asks the relevance agent.
 
 Contract: `__init__(driver_path, relevance_agent, client=None)`; `scrape(keyword, search_mode)`
@@ -21,9 +24,9 @@ import urllib.parse
 
 import config
 from log_config import get_logger
-from scrapers.apify_common import (agreed_source, clean, flatten_text, is_sar, is_wayakit,
-                                   pack_count, parse_count, parse_price, parse_volume,
-                                   select_relevant, sizes_agree, to_row)
+from scrapers.apify_common import (PLAIN_OZ, clean, first_agreeing, flatten_text, is_sar, is_wayakit,
+                                   parse_count, parse_price, parse_volume, select_relevant, sizes_agree,
+                                   title_is_ambiguous, title_volume, to_row, volume_kind, volume_pack)
 from services import apify_client
 
 logger = get_logger()
@@ -109,31 +112,141 @@ def _number_of_items(value):
     return n if n >= 1 else None
 
 
+# An Item Form that is only a solid: its oz are weights, never a volume, and Wayakit sells liquids
+# only. Amazon's Item Form can list several forms ("Bar, Liquid"): any liquid form wins.
+_SOLID_FORM_RE = re.compile(
+    r"\b(?:powders?|tablets?|pods?|pacs?|granules?|granular|crystals?|capsules?|flakes?|cubes?|solid|bars?"
+    r"|sticks?|paste|wax|beads?)\b", re.I)
+_LIQUID_FORM_RE = re.compile(r"\b(?:liquids?|spray|gel|foam|aerosol|cream|lotion|concentrate)\b", re.I)
+_AEROSOL_RE = re.compile(r"\baerosols?\b", re.I)
+# "1 17 ounce can" (Included Components): a can sized in oz is a net weight, like an aerosol
+# (2026-11-23 smoke runs: a 17 oz can stored as 17 fl oz at a case price).
+_OZ_CAN_RE = re.compile(r"\d\s*(?:-\s*)?(?:oz|ounces?)\.?\s+(?:aerosol\s+)?cans?\b", re.I)
+_UNIT_COUNT_RE = re.compile(r"^\s*(\d{1,4})(?:\.0+)?\s*count\b", re.I)
+
+
+def _is_solid_form(item_form):
+    item_form = str(item_form or "")
+    return bool(_SOLID_FORM_RE.search(item_form)) and not _LIQUID_FORM_RE.search(item_form)
+
+
+def _attribute_pack(attrs):
+    """The largest multipack an attribute states: Size "(Pack of N)" or Unit Count "N Count"; 1 if
+    none. Number of Items is not here: it is often wrong (`amazon_size`)."""
+    packs = [1]
+    if attrs.get("size"):
+        packs.append(volume_pack(attrs["size"]))
+    match = _UNIT_COUNT_RE.match(str(attrs.get("unit count") or ""))
+    if match:
+        packs.append(int(match.group(1)))
+    return max(packs)
+
+
+def _ml_label_fix(size, title_size):
+    """Amazon often writes the fl oz number with a ml label ("16 Milliliters" in Unit Count for a
+    title that says 16oz). An attribute in ml is read as fl oz only when the title states that
+    same number (within 1 %) in fl oz; the title decides, never another attribute."""
+    unit, amount = size
+    if (unit == "ml" and title_size is not None and title_size[0] == "fl oz"
+            and abs(title_size[1] - amount) <= 0.01 * amount):
+        return "fl oz", amount
+    return size
+
+
+def _label_conflict(size, sources):
+    """True if `size` is in ml and another source states the same number in fl oz: one of the
+    two labels is wrong and nothing says which."""
+    unit, amount = size
+    return unit == "ml" and any(s is not None and s[0] == "fl oz" and abs(s[1] - amount) <= 0.01 * amount
+                                for s in sources)
+
+
 def amazon_size(title, attrs: dict):
     """Volume-mode size of an Amazon item: `("ml" | "fl oz", pack total)` or None (dropped as
-    'no_size').
+    'no_size'). Conservative (Mafer, 2026-11-23): when the sources leave any doubt, None.
 
-    2-of-N rule: at least two of {title, Item Volume, Size, Unit Count} agree on the pack total.
-    Amazon often fills Item Volume and Size per unit for a multipack, so two attributes can agree
-    on the size of one unit while the title states the pack ("500ml, Pack of 3"). When the agreed
-    value comes from the attributes and the title states a pack (> 1), it is only used if the
-    attributes times the title's pack equal the title's own total (then that total is returned);
-    otherwise the item is ambiguous and dropped. A per-unit size is never returned for a pack.
+    No size at all when the title is ambiguous (`apify_common.title_is_ambiguous`: a count, an
+    unread pack notation, a kit of different products, a dose or capacity, two different sizes),
+    when the Item Form is a solid (powder, tablets, paste, bar...; Wayakit sells liquids only), or
+    when an attribute states a multipack (Size "(Pack of N)", Unit Count "N Count") that the
+    title does not state (or states with another number). Number of Items is weaker (the
+    2026-11-23 smoke run had a single 4 L bottle with Number of Items 2, checked by Mafer on the
+    page): it only blocks when the title's own size does not agree with an attribute.
+
+    Sources: title, Item Volume, Size, Unit Count. An attribute in ml is read as fl oz when the
+    title states that number in fl oz (`_ml_label_fix`).
+
+    1. 2-of-N rule (the old Selenium rule, with Size and Unit Count added): two sources agreeing
+       on the pack total give the size. A plain "oz" needs a confirmation that is not another
+       plain "oz" (or a relabeled ml): two plain-oz sources never make a pair, because the oz may
+       be a net weight. When the agreed value comes from the attributes and the title states a
+       pack (> 1), it is only used if the attributes times the title's pack equal the title's own
+       total (then that total is returned). Two attributes that agree with each other but not
+       with a size the title states give no size. A ml result is dropped when another source
+       states the same number in fl oz and the title does not confirm the ml value.
+    2. Otherwise the title's size, only when it is in ml, liters or fl oz (never a plain oz or a
+       gallon alone) and no attribute volume contradicts it; when the title states a pack, an
+       attribute must confirm it (the total, or one unit of the pack).
+    An aerosol (Item Form or title), or a can sized in oz (title or Included Components,
+    "1 17 ounce can"), never gets a size in fl oz: its oz are a net weight.
     """
-    found = agreed_source([title, attrs.get("item volume") or attrs.get("volume"),
-                           attrs.get("size"), attrs.get("unit count")])
-    if found is None:
+    title = str(title or "")
+    item_form = str(attrs.get("item form") or "")
+    if _is_solid_form(item_form) or title_is_ambiguous(title):
         return None
-    index, size = found
-    if index == 0:
-        return size  # the title agrees with an attribute
-    pack = pack_count(title)
-    if pack <= 1:
-        return size
-    title_size = parse_volume(title)
-    if title_size is not None and sizes_agree((size[0], size[1] * pack), title_size):
-        return title_size
-    return None
+    sources = [title] + [None if value is None else str(value)
+                         for value in (attrs.get("item volume") or attrs.get("volume"),
+                                       attrs.get("size"), attrs.get("unit count"))]
+    title_size = title_volume(title)
+    parsed = [parse_volume(source) for source in sources[1:]]
+    sizes = [title_size] + [_ml_label_fix(p, title_size) if p is not None else None for p in parsed]
+    # A source is "plain" when its fl oz comes from a plain oz or from a relabeled ml.
+    plain = [volume_kind(sources[0]) == PLAIN_OZ] + [
+        volume_kind(source) == PLAIN_OZ or (p is not None and fixed != p)
+        for source, p, fixed in zip(sources[1:], parsed, sizes[1:])]
+    pack = volume_pack(title)
+    attr_pack = _attribute_pack(attrs)
+    if attr_pack > 1 and attr_pack != pack:
+        return None  # an attribute states a multipack the title does not (or a different one)
+    items = _number_of_items(attrs.get("number of items")) or 1
+    unconfirmed_items = items > 1 and items != pack  # only the title agreeing with an attribute overrides it
+    result = None
+    found = first_agreeing(sizes, allowed=lambda i, j: not (plain[i] and plain[j]))
+    if found is not None:
+        index, size = found
+        if index != 0 and unconfirmed_items:
+            return None
+        if index != 0 and pack > 1:
+            if title_size is None or not sizes_agree((size[0], size[1] * pack), title_size):
+                return None  # per-unit attributes of a pack the title does not total
+            result = title_size
+        elif index != 0 and title_size is not None and not sizes_agree(size, title_size):
+            return None  # two attributes agree with each other but not with the title's own size
+        elif _label_conflict(size, sizes) and not (title_size is not None and sizes_agree(size, title_size)):
+            return None
+        else:
+            result = size
+    else:
+        explicit = title_volume(title, explicit_only=True)  # "24oz - 709ml" -> 709 ml
+        if explicit is None or unconfirmed_items:
+            return None
+        confirmed = False
+        for size in sizes[1:]:
+            if size is None:
+                continue
+            if sizes_agree(size, explicit) or (pack > 1 and sizes_agree((size[0], size[1] * pack), explicit)):
+                confirmed = True  # the total, or one unit of the title's pack
+                continue
+            return None  # an attribute contradicts the title
+        if pack > 1 and not confirmed:
+            return None  # a pack needs an attribute to confirm it
+        result = explicit
+    if result is not None and result[0] == "fl oz":
+        if _AEROSOL_RE.search(item_form + " " + title):
+            return None
+        if _OZ_CAN_RE.search(title + " " + str(attrs.get("included components") or "")):
+            return None
+    return result
 
 
 def convert_item(item: dict, search_mode: str):
@@ -192,7 +305,6 @@ def convert_item(item: dict, search_mode: str):
             "country_of_origin": country,
             "texts": (product, flatten_text(attrs), flatten_text(item.get("description")),
                       flatten_text(item.get("features"))),
-            "noon_global": None,
         },
     }
     return candidate, ""

@@ -119,8 +119,8 @@ The final Pets upload is reviewed by Puya and Luisa before writing to Odoo KSA (
 | Field | Value |
 |---|---|
 | Account | VdC's (Mafer's decision). The Starter plan is upgraded to cover PI's spend; the new tier is pending |
-| Actors | `junglee/amazon-crawler` (Amazon KSA, amazon.sa; `config.APIFY_AMAZON_ACTOR`) and `saswave/noon-product-scraper` (Noon KSA, one search run per keyword plus one details run for the relevant rows; `config.APIFY_NOON_ACTOR`), the same ones VdC uses |
-| Approx. cost | ~USD 14–15 / monthly run: Amazon ~USD 11 (55 keywords × 50 results at USD 0.004), Noon search ~USD 2.5 and Noon details for relevant rows ~USD 0.5–1. Do not pass `countryCode` or `zipCode` to junglee (it would add ~USD 137 / month) |
+| Actors | `junglee/amazon-crawler` (Amazon KSA, amazon.sa; `config.APIFY_AMAZON_ACTOR`) and `saswave/noon-product-scraper` (Noon KSA, one search run per keyword; `config.APIFY_NOON_ACTOR`), the same ones VdC uses |
+| Approx. cost | ~USD 13.5 / monthly run: Amazon ~USD 11 (55 keywords × 50 results at USD 0.004) and Noon search ~USD 2.5 (the 2026-11-23 smoke run charged USD 0.26 for one keyword on both, including a Noon details run that no longer exists). Do not pass `countryCode` or `zipCode` to junglee (it would add ~USD 137 / month) |
 | Caps | **USD 20 per pipeline run** across all actor runs (`config.APIFY_RUN_BUDGET_USD`; Mafer, 2026-11-22; exceeding it aborts with exit 1). Per actor run: `maxTotalChargeUsd` USD 0.50 (`APIFY_AMAZON_MAX_USD`, `APIFY_NOON_MAX_USD`), 50 results (`APIFY_MAX_RESULTS`), 1200 s timeout, 1024 MB, one re-run on failure |
 | Calibration run | Done on 2026-11-16, keyword "pet urine odor remover", ~USD 0.08 |
 | Token | Key `APIFY_API_TOKEN` in `prod/wayakit-app`, **pending, to be added by Mafer** (a token of the VdC account; PI never reads `voz-del-cliente/api-keys`). Sent only in the `Authorization: Bearer` header |
