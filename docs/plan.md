@@ -211,11 +211,11 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 
 Expected cost: about USD 13.5 per run (Amazon 55 × ~0.20, Noon search 55 × ~0.045), inside the USD 20 cap (the budget counts about 25 % less than the real charge; accepted, see `docs/decisions.md`, 2026-11-23).
 
-### F7a · ML robustness without origin (2 days) — **implemented on branch `feat/f7a-ml-robustness` (2026-11-24); Mafer approved applying it to every subindustry and the ML differential the same day; PR to `server-improvement` not merged yet**
+### F7a · ML robustness without origin (2 days) — **merged into `server-improvement` (PR #15, 2026-11-24); not on the instance yet**
 
 Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here needs the `origin` column.
 
-**Status (2026-11-24):** every item below is implemented (rules in `docs/decisions.md`, 2026-11-24; how the band works in `docs/runbook.md`, *Reviewing results in Odoo*). Bugs 5, 6, 7 and 8 and the price-0 case (C18) are fixed and their strict `xfail` tests are now passing tests; so is the minor "product without measure with empty pieces" crash. Not merged and not on the instance: the first monthly run (2026-11-26) still uses the pre-F7a ML. Before/after on the frozen F1 data, offline (`ml_model/compare_reports.py`, old and new flows each in a temporary copy):
+**Status (2026-11-24):** every item below is implemented (rules in `docs/decisions.md`, 2026-11-24; how the band works in `docs/runbook.md`, *Reviewing results in Odoo*). Bugs 5, 6, 7 and 8 and the price-0 case (C18) are fixed and their strict `xfail` tests are now passing tests; so is the minor "product without measure with empty pieces" crash. Mafer approved applying it to every subindustry and the ML differential on 2026-11-24, and merged PR #15 into `server-improvement` the same day (CI green). Not on the instance: it still runs 6d97e78, so the first monthly run (2026-11-26) uses the pre-F7a ML. Pulling it onto the instance needs Mafer's OK and is never done on a monthly-run day. Before/after on the frozen F1 data, offline (`ml_model/compare_reports.py`, old and new flows each in a temporary copy):
 
 | Subindustry | Products | Median new/old | Above local p75, before → after |
 |---|---|---|---|
