@@ -211,11 +211,11 @@ With the F1 snapshot (`data/f1_before_2026-11-15/`; note: that run brought no Pe
 
 Expected cost: about USD 13.5 per run (Amazon 55 × ~0.20, Noon search 55 × ~0.045), inside the USD 20 cap (the budget counts about 25 % less than the real charge; accepted, see `docs/decisions.md`, 2026-11-23).
 
-### F7a · ML robustness without origin (2 days) — **merged into `server-improvement` (PR #15, 2026-11-24); not on the instance yet**
+### F7a · ML robustness without origin (2 days) — **on the instance since 2026-11-24 (`server-improvement` @ a97b4b1)**
 
 Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here needs the `origin` column.
 
-**Status (2026-11-24):** every item below is implemented (rules in `docs/decisions.md`, 2026-11-24; how the band works in `docs/runbook.md`, *Reviewing results in Odoo*). Bugs 5, 6, 7 and 8 and the price-0 case (C18) are fixed and their strict `xfail` tests are now passing tests; so is the minor "product without measure with empty pieces" crash. Mafer approved applying it to every subindustry and the ML differential on 2026-11-24, and merged PR #15 into `server-improvement` the same day (CI green). Not on the instance: it still runs 6d97e78, so the first monthly run (2026-11-26) uses the pre-F7a ML. Pulling it onto the instance needs Mafer's OK and is never done on a monthly-run day. Before/after on the frozen F1 data, offline (`ml_model/compare_reports.py`, old and new flows each in a temporary copy):
+**Status (2026-11-24):** every item below is implemented (rules in `docs/decisions.md`, 2026-11-24; how the band works in `docs/runbook.md`, *Reviewing results in Odoo*). Bugs 5, 6, 7 and 8 and the price-0 case (C18) are fixed and their strict `xfail` tests are now passing tests; so is the minor "product without measure with empty pieces" crash. Mafer approved applying it to every subindustry and the ML differential on 2026-11-24, and merged PR #15 into `server-improvement` the same day (CI green). On the instance since 2026-11-24 (Mafer's OK): manual pull of `server-improvement` from 6d97e78 to a97b4b1 (F7a and F7b), so the first monthly run (2026-11-26) uses them. Checked on the instance: imports, and the ML flow 1a → 3 in a temporary copy with the instance's own data (724 report rows, 0 NaN prices, 0 below the floor; above the local p75 16.8 % → 1.4 % against the last production report); `check_pi` 74 OK, 0 WARN, 0 FAIL before and after; instance stopped again. Before/after on the frozen F1 data, offline (`ml_model/compare_reports.py`, old and new flows each in a temporary copy):
 
 | Subindustry | Products | Median new/old | Above local p75, before → after |
 |---|---|---|---|
@@ -241,7 +241,7 @@ Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here ne
 - **Documented decision about the model** (the ticket asks for it): the other improvements (log target, GroupKFold) are left for a phase 2. They move the prices of all lines. The `approved_quote_price` leakage as a feature was already removed in e25e2c9 (`2_train_models.py:160`), together with the clipping to the market range with 3 or more competitors (`3_predicted_prices.py:126-132`).
 - Before/after comparison by subindustry: median of the new/old ratio and % of suggestions above the local p75.
 
-### F7b · Saudi reference ceiling for B2C (1 day) — **merged into `server-improvement` (PR #17, 2026-11-24, CI green); not on the instance yet**
+### F7b · Saudi reference ceiling for B2C (1 day) — **on the instance since 2026-11-24 (`server-improvement` @ a97b4b1; merged with PR #17)**
 
 Scope set by Mafer on 2026-11-24, replacing "only in Pets, N local rows": every **B2C** subindustry (Home, Automotive, Pets; baby products have no subindustry or type of their own in the F1 data, so they are covered wherever they are in B2C), because the complaints about high prices come from imported listings in Pets and baby products alike, and B2B prices are fine.
 
