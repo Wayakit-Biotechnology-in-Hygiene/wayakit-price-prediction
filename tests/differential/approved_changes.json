@@ -13,145 +13,46 @@
   "changes": [
     {
       "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "predicted_price",
-      "expected_cells": 688,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). Before/after in docs/plan.md, F7a.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "predicted_price_per_unit",
-      "expected_cells": 708,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). The model is retrained on a different competitor set.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "porcentaje_de_ganancia",
-      "expected_cells": 706,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). Follows predicted_price.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "model_confidence",
-      "expected_cells": 444,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). The model is retrained on a different competitor set.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "clamped_to_market",
-      "expected_cells": 186,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). Market band [type minimum, p75 x size] replaces [min, max]; no lift above the size range.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "competitors_count",
-      "expected_cells": 63,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). Counts the market rows (trimmed, no multipacks, no 5 mL or less); 2-row types are no longer emptied.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "market_max_found",
-      "expected_cells": 61,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). From the market rows instead of the old trimmed rows.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "market_min_found",
-      "expected_cells": 53,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). From the market rows instead of the old trimmed rows.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "value_changed",
-      "column": "volume_outside_market",
-      "expected_cells": 24,
-      "reason": "F7a ML robustness for every subindustry (Mafer, 2026-11-24): retraining without the emptied 2-row types (bug 6), duplicated quotes (bug 7) and rows of 5 mL or less, and the per-SKU market band (p75 ceiling, size cap, floor rounded up). Size range of the market rows.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
       "type": "column_added",
-      "column": "has_size",
+      "column": "ceiling_source",
       "expected_cells": 1,
-      "reason": "F7a: new report column (not uploaded to Odoo); see docs/runbook.md, Reviewing results in Odoo.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "column_added",
-      "column": "market_match",
-      "expected_cells": 1,
-      "reason": "F7a: new report column (not uploaded to Odoo); see docs/runbook.md, Reviewing results in Odoo.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "column_added",
-      "column": "market_median_found",
-      "expected_cells": 1,
-      "reason": "F7a: new report column (not uploaded to Odoo); see docs/runbook.md, Reviewing results in Odoo.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "column_added",
-      "column": "market_p75_found",
-      "expected_cells": 1,
-      "reason": "F7a: new report column (not uploaded to Odoo); see docs/runbook.md, Reviewing results in Odoo.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "column_added",
-      "column": "volume_capped",
-      "expected_cells": 1,
-      "reason": "F7a: new report column (not uploaded to Odoo); see docs/runbook.md, Reviewing results in Odoo.",
+      "reason": "F7b: where each B2C ceiling came from ('reference': Saudi reference prices; 'all'; '' without a band). Not uploaded to Odoo.",
       "date": "2026-11-24",
       "approved_by": "Mafer"
     },
     {
       "file": "ml_model/competitor_volumetric_processed.csv",
       "type": "column_added",
-      "column": "is_multipack",
+      "column": "origin",
       "expected_cells": 1,
-      "reason": "F7a: multipack flag from the scraper title; keeps packs out of the market rows, not out of training.",
+      "reason": "F7b: scraper origin (local / imported / unknown) carried by 1a; 'unknown' for Odoo rows and pre-F6 files.",
+      "date": "2026-11-24",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/competitor_volumetric_processed.csv",
+      "type": "column_added",
+      "column": "source_channel",
+      "expected_cells": 1,
+      "reason": "F7b: raw Odoo channel (retail / ecommerce / b2b) carried by 1a; empty for scraper rows and pre-F7b Odoo files.",
       "date": "2026-11-24",
       "approved_by": "Mafer"
     },
     {
       "file": "ml_model/competitor_unit_processed.csv",
       "type": "column_added",
-      "column": "is_multipack",
+      "column": "origin",
       "expected_cells": 1,
-      "reason": "F7a: multipack flag from the scraper title; keeps packs out of the market rows, not out of training.",
+      "reason": "F7b: scraper origin (local / imported / unknown) carried by 1a; 'unknown' for Odoo rows and pre-F6 files.",
+      "date": "2026-11-24",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/competitor_unit_processed.csv",
+      "type": "column_added",
+      "column": "source_channel",
+      "expected_cells": 1,
+      "reason": "F7b: raw Odoo channel (retail / ecommerce / b2b) carried by 1a; empty for scraper rows and pre-F7b Odoo files.",
       "date": "2026-11-24",
       "approved_by": "Mafer"
     }

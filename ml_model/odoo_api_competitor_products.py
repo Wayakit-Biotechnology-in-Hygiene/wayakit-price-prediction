@@ -66,6 +66,11 @@ FINAL_COLUMNS_ORDER = [
     'Industry', 'Generic product type', 'Total quantity',
     'Unit of measurement [mL,g,units]', 'Price per unit SAR', 'Company'
 ]
+# Since F7b: the raw `product_channel` code ('retail', 'ecommerce', 'b2b'; '' when empty), kept
+# because 'Channel' folds retail and ecommerce into B2C. 'retail' is a price seen in a physical
+# store in Saudi Arabia, one of the "Saudi reference" prices of the B2C market ceiling (F7b).
+# Last column, so every earlier column keeps its bytes.
+SOURCE_CHANNEL_COLUMN = 'Source channel'
 
 
 def fetch_competitor_products(session: OdooSession) -> list:
@@ -80,7 +85,8 @@ def records_to_dataframe(records: list) -> pd.DataFrame:
     """Turns `competitor.product` records into the CSV layout. Pure: no I/O.
 
     Many2one fields (`[id, 'name']`) keep only the name; channel and unit codes are mapped
-    to their labels ('Unknown' when not recognized); the date becomes DD/MM/YYYY.
+    to their labels ('Unknown' when not recognized); the date becomes DD/MM/YYYY. The raw
+    channel code is kept in the last column, `Source channel` (F7b).
     """
     df = pd.DataFrame(records)
 
@@ -88,7 +94,10 @@ def records_to_dataframe(records: list) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].apply(lambda x: x[1] if isinstance(x, list) and len(x) == 2 else None)
     if 'product_channel' in df.columns:
-        df['product_channel'] = df['product_channel'].map(CHANNEL_MAP).fillna('Unknown')
+        raw_channel = df['product_channel']
+        df['product_channel'] = raw_channel.map(CHANNEL_MAP).fillna('Unknown')
+    else:
+        raw_channel = pd.Series([None] * len(df), index=df.index)
     if 'uom' in df.columns:
         df['uom'] = df['uom'].map(UOM_MAP).fillna('Unknown')
 
@@ -100,6 +109,8 @@ def records_to_dataframe(records: list) -> pd.DataFrame:
 
     df_final = df_renamed[FINAL_COLUMNS_ORDER].copy()
     df_final['Date'] = pd.to_datetime(df_final['Date']).dt.strftime('%d/%m/%Y')
+    df_final[SOURCE_CHANNEL_COLUMN] = [
+        str(v).strip().lower() if isinstance(v, str) else '' for v in raw_channel]
     return df_final
 
 

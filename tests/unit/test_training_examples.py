@@ -135,7 +135,7 @@ def test_market_rows_leave_multipacks_out_and_stats_summarize_them():
                        "volume_liters": [0.5, 1.0, 2.0, 4.0], "is_multipack": [False, False, True, False]})
     rows = training.build_market_rows(df, "price_per_liter", "volume_liters")
     assert rows.columns.tolist() == training.MARKET_ROWS_COLUMNS
-    assert rows.values.tolist() == [["A", 10.0, 0.5], ["A", 20.0, 1.0], ["B", 7.0, 4.0]]
+    assert rows.values.tolist() == [["A", 10.0, 0.5, False], ["A", 20.0, 1.0, False], ["B", 7.0, 4.0, False]]
     stats = training.market_stats(rows).set_index("type_of_product")
     assert stats.loc["A"].tolist() == [10.0, 20.0, 2, 0.5, 1.0]
 
@@ -144,4 +144,17 @@ def test_market_rows_without_multipack_column_keep_every_row():
     """A processed file from before F7a has no is_multipack column: every row is a single product."""
     df = pd.DataFrame({"type_of_product": ["A"], "price_per_item": [1.5], "total_quantity": [20.0]})
     rows = training.build_market_rows(df, "price_per_item", "total_quantity")
-    assert rows.values.tolist() == [["A", 1.5, 20.0]]
+    assert rows.values.tolist() == [["A", 1.5, 20.0, False]]
+
+
+def test_saudi_reference_rows_are_odoo_retail_or_local_origin():
+    """F7b: only a physical-store Odoo price or a scraped 'local' origin is a Saudi reference."""
+    df = pd.DataFrame({
+        "type_of_product": ["A"] * 6, "price_per_liter": [1.0] * 6, "volume_liters": [1.0] * 6,
+        "source_channel": ["retail", " RETAIL ", "ecommerce", "b2b", "", None],
+        "origin": ["unknown", "unknown", "unknown", "unknown", "local", "imported"],
+    })
+    assert training.is_saudi_reference(df).tolist() == [True, True, False, False, True, False]
+    rows = training.build_market_rows(df, "price_per_liter", "volume_liters")
+    assert rows["is_reference"].tolist() == [True, True, False, False, True, False]
+    assert not training.is_saudi_reference(df.drop(columns=["source_channel", "origin"])).any()

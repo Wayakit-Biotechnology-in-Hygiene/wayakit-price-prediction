@@ -108,6 +108,8 @@ def test_competitor_products_map_channel_uom_and_date():
          "company": False},
     ])
     assert df["Channel"].tolist() == ["B2C", "Unknown"]
+    # F7b: the raw channel survives the B2C folding, as the last column.
+    assert df["Source channel"].tolist() == ["retail", "weird"] and df.columns[-1] == "Source channel"
     assert df["Unit of measurement [mL,g,units]"].tolist() == ["mL", "Unknown"]
     assert df["Date"].tolist() == ["14/11/2026", "02/01/2026"]
     assert df.loc[1, "Type of product"] is None

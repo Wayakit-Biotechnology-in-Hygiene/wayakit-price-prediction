@@ -44,11 +44,12 @@ def _scraper_row(product, price, unit, quantity):
     }
 
 
-def _run_main(tmp_path, monkeypatch, scraper_rows, odoo_rows=(ODOO_ROW,), scraper_columns=SCRAPER_COLUMNS):
+def _run_main(tmp_path, monkeypatch, scraper_rows, odoo_rows=(ODOO_ROW,), scraper_columns=SCRAPER_COLUMNS,
+              odoo_columns=ODOO_COLUMNS):
     (tmp_path / "scraper").mkdir()
     (tmp_path / "ml_model").mkdir()
     pd.DataFrame(list(scraper_rows), columns=scraper_columns).to_csv(tmp_path / "scraper/competitors_complete.csv", index=False)
-    pd.DataFrame(list(odoo_rows), columns=ODOO_COLUMNS).to_csv(tmp_path / "ml_model/competitor_products_from_odoo.csv", index=False)
+    pd.DataFrame(list(odoo_rows), columns=odoo_columns).to_csv(tmp_path / "ml_model/competitor_products_from_odoo.csv", index=False)
     monkeypatch.chdir(tmp_path)
     preprocessing.main()
     volume = pd.read_csv("ml_model/competitor_volumetric_processed.csv")
@@ -150,10 +151,10 @@ def test_process_volumetric_data_without_valid_rows_does_not_fail(tmp_path, monk
     assert pd.read_csv("ml_model/competitor_volumetric_processed.csv").empty
 
 
-def test_f6_seller_and_origin_columns_are_inert_c08(tmp_path, monkeypatch):
-    """C08 (F6): a pre-F6 13-column file and a 15-column file (+ seller, origin) with the same rows
-    give the same processed CSVs: old rows stay readable and the new columns (and the source) are
-    not used by 1a. Using origin is F7b."""
+def test_f6_seller_and_origin_columns_are_read_c08(tmp_path, monkeypatch):
+    """C08 (F6) and F7b: a pre-F6 13-column file and a 15-column file (+ seller, origin) with the
+    same rows give the same processed CSVs except `origin`: old rows stay readable (origin
+    'unknown'), the seller and the source are not used, and the origin is carried (F7b)."""
     rows = [
         _scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0),
         _scraper_row("Cleaner 2 L", 20.0, "L", 2.0),
@@ -164,10 +165,27 @@ def test_f6_seller_and_origin_columns_are_inert_c08(tmp_path, monkeypatch):
     old_dir.mkdir()
     new_dir.mkdir()
     old_volume, old_units = _run_main(old_dir, monkeypatch, rows)
-    new_rows = [{**r, "source": "noon", "seller": "Shop", "origin": "imported"} for r in rows]
+    new_rows = [{**r, "source": "noon", "seller": "Shop", "origin": o}
+                for r, o in zip(rows, [" Local", "imported", None, "local"])]
     new_volume, new_units = _run_main(new_dir, monkeypatch, new_rows,
                                       scraper_columns=SCRAPER_COLUMNS + ["seller", "origin"])
-    assert "seller" not in new_volume.columns and "origin" not in new_volume.columns
-    pd.testing.assert_frame_equal(old_volume, new_volume)
-    pd.testing.assert_frame_equal(old_units, new_units)
+    assert "seller" not in new_volume.columns
+    assert old_volume["origin"].tolist() == ["unknown"] * 4
+    assert new_volume["origin"].tolist() == ["local", "imported", "unknown", "unknown"]  # last: Odoo row
+    assert new_units["origin"].tolist() == ["local"]
+    pd.testing.assert_frame_equal(old_volume.drop(columns="origin"), new_volume.drop(columns="origin"))
+    pd.testing.assert_frame_equal(old_units.drop(columns="origin"), new_units.drop(columns="origin"))
     assert len(new_volume) == 4 and len(new_units) == 1  # 3 scraped + the Odoo row; 1 per-piece row
+
+
+def test_odoo_source_channel_is_carried_and_older_files_get_empty(tmp_path, monkeypatch):
+    """F7b: the raw Odoo channel (retail / ecommerce / b2b) reaches the processed files; scraper
+    rows and an Odoo CSV from before F7b (no `Source channel` column) get ''."""
+    (tmp_path / "a").mkdir()
+    retail = {**ODOO_ROW, "Source channel": " Retail "}
+    volume, _ = _run_main(tmp_path / "a", monkeypatch, [_scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0)],
+                          [retail], odoo_columns=ODOO_COLUMNS + ["Source channel"])
+    assert volume["source_channel"].fillna("").tolist() == ["", "retail"]
+    (tmp_path / "b").mkdir()
+    volume, _ = _run_main(tmp_path / "b", monkeypatch, [_scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0)])
+    assert volume["source_channel"].fillna("").tolist() == ["", ""]

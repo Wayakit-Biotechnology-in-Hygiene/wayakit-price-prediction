@@ -23,7 +23,8 @@ MIN_ROWS_TO_TRIM = 3
 # 59.98 SAR); they are dropped before the quantiles so they cannot move the bounds either.
 MIN_VOLUME_LITERS = 0.005
 # Market rows (the rows 3_predicted_prices.py computes each SKU's market band from).
-MARKET_ROWS_COLUMNS = ['type_of_product', 'price_per_unit', 'size']
+# `is_reference` (F7b): a Saudi reference price, used for the B2C ceiling (see is_saudi_reference).
+MARKET_ROWS_COLUMNS = ['type_of_product', 'price_per_unit', 'size', 'is_reference']
 
 def load_training_data():
     """Loads all CSV files necessary for training."""
@@ -100,20 +101,38 @@ def filter_outliers_with_percentiles(df_comp, metric_col, p_lower=0.10, p_upper=
     return df_cleaned
 
 
+def is_saudi_reference(df):
+    """True for a price that is known to be from the Saudi market itself (F7b, Mafer 2026-11-24):
+    an Odoo `competitor.product` price seen in a physical store (`source_channel` 'retail'), or a
+    scraped product whose data says it is made in Saudi Arabia (`origin` 'local', F6). Odoo
+    e-commerce prices are not (they can be the same imported listings), nor B2B ones. Only from
+    the data; no brand lists. Files without the columns (pre-F7b) have no reference rows.
+    """
+    def text(column):
+        if column not in df:
+            return pd.Series('', index=df.index)
+        return df[column].astype('string').str.strip().str.lower().fillna('')
+    return ((text('source_channel') == 'retail') | (text('origin') == 'local')).astype(bool)
+
+
 def build_market_rows(df_comp_cleaned, metric_col, size_col):
     """The competitor rows the market band is computed from: the trimmed rows minus multipacks.
 
-    Returns `MARKET_ROWS_COLUMNS`: type, price per liter or per piece, and size (liters or pieces).
-    Rows from a processed file without `is_multipack` (pre-F7a) count as single products.
+    Returns `MARKET_ROWS_COLUMNS`: type, price per liter or per piece, size (liters or pieces)
+    and `is_reference` (`is_saudi_reference`). Rows from a processed file without `is_multipack`
+    (pre-F7a) count as single products.
     """
     multipack = df_comp_cleaned['is_multipack'] if 'is_multipack' in df_comp_cleaned else False
     multipack = pd.Series(multipack, index=df_comp_cleaned.index).fillna(False).astype(bool)
     rows = df_comp_cleaned[~multipack]
-    logger.info(f"Market rows ({metric_col}): {len(rows)} ({int(multipack.sum())} multipacks left out).")
+    reference = is_saudi_reference(rows)
+    logger.info(f"Market rows ({metric_col}): {len(rows)} ({int(multipack.sum())} multipacks left out; "
+                f"{int(reference.sum())} Saudi reference prices).")
     return pd.DataFrame({
         'type_of_product': rows['type_of_product'].values,
         'price_per_unit': rows[metric_col].astype(float).values,
         'size': rows[size_col].astype(float).values,
+        'is_reference': reference.values,
     }, columns=MARKET_ROWS_COLUMNS)
 
 
