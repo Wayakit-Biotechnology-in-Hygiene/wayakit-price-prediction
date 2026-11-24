@@ -41,7 +41,7 @@ NUMERIC_COLUMNS = [
 ]
 FLOOR_FACTOR = 1.30
 CENT = 0.01  # rounding to the cent; the floor is rounded up, so up to a whole cent
-MARKET_COLUMNS = ["type_of_product", "price_per_unit", "size"]
+MARKET_COLUMNS = ["type_of_product", "price_per_unit", "size", "is_reference"]
 
 
 class FakeTree:
@@ -83,7 +83,7 @@ def products(draw):
         "industry": "Transportation",
         "generic_product_type": "Cleaner",
         "company": "Wayakit",
-        "channel": "B2B",
+        "channel": draw(st.sampled_from(["B2B", "B2C"])),
         "Volume_Liters": volume,
         "Pack_quantity_Units": pieces,
         # Cost 0 exists in F1 (6 products); otherwise, at least 0.001 SAR (a subnormal
@@ -99,7 +99,7 @@ def market_rows(draw):
     rows = []
     for product_type in draw(st.lists(st.sampled_from(TYPES), unique=True, max_size=len(TYPES))):
         for _ in range(draw(st.integers(1, 8))):
-            rows.append((product_type, draw(st.floats(0.01, 1e3)), draw(st.floats(0.005, 1000))))
+            rows.append((product_type, draw(st.floats(0.01, 1e3)), draw(st.floats(0.005, 1000)), draw(st.booleans())))
     return pd.DataFrame(rows, columns=MARKET_COLUMNS)
 
 
@@ -125,8 +125,17 @@ def _run(product_list, vol_market, unit_market, trees):
     )
 
 
+def _p75(rows, size):
+    similar = rows[(rows["size"] * 2 >= size) & (rows["size"] <= size * 2)]
+    used = similar if len(similar) >= 3 else rows
+    return float(np.quantile(used["price_per_unit"], 0.75))
+
+
 def _band(product, vol_market, unit_market):
-    """Independent oracle of the market band: (count, low, p75, size_min, size_max) or None."""
+    """Independent oracle of the market band: (count, low, p75, size_min, size_max) or None.
+
+    F7b: for a B2C product with 3 or more Saudi reference rows of its type, the p75 comes from
+    those rows only; the minimum always comes from every row."""
     column, size = _size(product)
     if column is None:
         return None
@@ -134,10 +143,15 @@ def _band(product, vol_market, unit_market):
     rows = market[market["type_of_product"] == product["type_of_product"]]
     if rows.empty:
         return None
-    similar = rows[(rows["size"] * 2 >= size) & (rows["size"] <= size * 2)]
-    used = similar if len(similar) >= 3 else rows
-    return (len(rows), rows["price_per_unit"].min(), float(np.quantile(used["price_per_unit"], 0.75)),
-            rows["size"].min(), rows["size"].max())
+    reference = rows[rows["is_reference"].astype(bool)] if "is_reference" in rows else rows.iloc[:0]
+
+    def similar_count(r):
+        return int(((r["size"] * 2 >= size) & (r["size"] <= size * 2)).sum())
+
+    use_reference = (product["channel"] == "B2C" and len(rows) >= 3 and len(reference) >= 3
+                     and (similar_count(reference) >= 3 or similar_count(rows) < 3))
+    p75 = _p75(reference if use_reference else rows, size)
+    return (len(rows), rows["price_per_unit"].min(), p75, rows["size"].min(), rows["size"].max())
 
 
 @given(
@@ -176,7 +190,9 @@ def test_margin_floor_and_market_band(product_list, vol_market, unit_market, tre
         if count >= 3:
             # Ceiling: the p75 x size at every size (the floor wins if it is higher).
             assert price <= max(p75 * size, floor) + tolerance, (product, row.to_dict())
-            # Lifted to the minimum, except above the size range.
+            # Lifted to the minimum, except above the size range. The reference rows are part of
+            # every row, so the minimum is never above a reference ceiling (F7b).
+            assert row["market_min_found"] <= row["market_p75_found"] + tolerance, (product, row.to_dict())
             if size <= size_max:
                 assert price >= low * size - tolerance, (product, row.to_dict())
         else:
@@ -309,3 +325,58 @@ def test_only_a_sibling_inside_the_market_range_can_cap():
     mid, big = report.iloc[0], report.iloc[1]
     assert mid["volume_outside_market"] and big["volume_outside_market"]
     assert not big["volume_capped"] and big["predicted_price"] == pytest.approx(160.0)  # 40/L x 4 L
+
+
+
+def _market(rows):
+    return pd.DataFrame(rows, columns=MARKET_COLUMNS)
+
+
+def test_b2c_ceiling_comes_from_saudi_reference_prices_when_there_are_three():
+    """F7b: 3 Saudi reference prices (Odoo retail / local origin) set the B2C ceiling; the cheap
+    imports cannot lift it, the floor still comes from every row, and B2B keeps the F7a band."""
+    market = _market([("T0", p, 1.0, ref) for p, ref in
+                      [(20.0, True), (22.0, True), (24.0, True), (90.0, False), (95.0, False), (5.0, False)]])
+    products = [_product("B2C", 1.0) | {"channel": "B2C"}, _product("B2B", 1.0) | {"channel": "B2B"}]
+    report = prediction.generate_predictions(
+        pd.DataFrame(products), FakeModel([80.0, 80.0], [1.0]), FakeModel([], [1.0]),
+        ["volume_liters"], ["total_quantity"], market, _market([]))
+    b2c, b2b = report.iloc[0], report.iloc[1]
+    assert b2c["ceiling_source"] == "reference" and b2c["predicted_price"] == pytest.approx(23.0)
+    assert b2c["market_median_found"] == pytest.approx(22.0) and b2c["market_match"] == "size"
+    assert b2c["market_min_found"] == 5.0  # the floor keeps every row
+    assert b2b["ceiling_source"] == "all"
+    assert b2b["predicted_price"] == pytest.approx(float(np.quantile([20, 22, 24, 90, 95, 5], 0.75)))
+
+
+def test_two_reference_prices_are_not_enough():
+    market = _market([("T0", p, 1.0, ref) for p, ref in [(20.0, True), (22.0, True), (90.0, False), (95.0, False)]])
+    report = prediction.generate_predictions(
+        pd.DataFrame([_product("B2C", 1.0) | {"channel": "B2C"}]), FakeModel([200.0], [1.0]), FakeModel([], [1.0]),
+        ["volume_liters"], ["total_quantity"], market, _market([]))
+    assert report.iloc[0]["ceiling_source"] == "all"
+    assert report.iloc[0]["predicted_price"] == pytest.approx(float(np.quantile([20, 22, 90, 95], 0.75)))
+
+
+
+def test_reference_prices_of_another_size_never_replace_a_similar_size_ceiling():
+    """Review finding: three 0.5 L shelf prices must not set the ceiling of a 4 L SKU when the
+    market has similar-size 4 L rows (it would lift the ceiling about 4.7 times)."""
+    market = _market([("T0", p, s, ref) for p, s, ref in
+                      [(7.5, 4.0, False), (8.0, 4.0, False), (8.5, 4.0, False), (8.5, 4.0, False), (9.0, 4.0, False),
+                       (40.0, 0.5, True), (40.0, 0.5, True), (40.0, 0.5, True)]])
+    report = prediction.generate_predictions(
+        pd.DataFrame([_product("BIG", 4.0) | {"channel": "B2C"}]), FakeModel([30.0], [1.0]), FakeModel([], [1.0]),
+        ["volume_liters"], ["total_quantity"], market, _market([]))
+    row = report.iloc[0]
+    assert row["ceiling_source"] == "all" and row["market_match"] == "size"
+    assert row["predicted_price"] == pytest.approx(34.0)  # 8.5/L x 4 L, the similar-size p75
+
+
+def test_no_ceiling_source_without_a_clamp():
+    """With 1-2 competitor rows there is no band, so no ceiling source."""
+    market = _market([("T0", 10.0, 1.0, True), ("T0", 12.0, 1.0, True)])
+    report = prediction.generate_predictions(
+        pd.DataFrame([_product("A", 1.0) | {"channel": "B2C"}]), FakeModel([30.0], [1.0]), FakeModel([], [1.0]),
+        ["volume_liters"], ["total_quantity"], market, _market([]))
+    assert report.iloc[0]["ceiling_source"] == "" and report.iloc[0]["predicted_price"] == pytest.approx(30.0)

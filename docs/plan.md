@@ -241,11 +241,14 @@ Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here ne
 - **Documented decision about the model** (the ticket asks for it): the other improvements (log target, GroupKFold) are left for a phase 2. They move the prices of all lines. The `approved_quote_price` leakage as a feature was already removed in e25e2c9 (`2_train_models.py:160`), together with the clipping to the market range with 3 or more competitors (`3_predicted_prices.py:126-132`).
 - Before/after comparison by subindustry: median of the new/old ratio and % of suggestions above the local p75.
 
-### F7b · Origin-based Pets selection (1 day)
+### F7b · Saudi reference ceiling for B2C (1 day) — **implemented on branch `feat/f7b-b2c-reference` (2026-11-24), PR to `server-improvement` pending Mafer's review**
 
-- Uses the F6 `seller` and `origin` columns (`local`, `imported`, `unknown`, only from the data; no hand-maintained brand lists).
-- **Only in Pets:** if there are at least N local rows per type, those rows are used; if not, the F7a robust market statistic.
-- Implementation note: `ml_model/1a_preprocess_data.py:23` must `reindex(..., fill_value='unknown')` before keeping `origin`, because the Odoo competitor CSV (`competitor_products_from_odoo.csv`) has no such column.
+Scope set by Mafer on 2026-11-24, replacing "only in Pets, N local rows": every **B2C** subindustry (Home, Automotive, Pets; baby products have no subindustry or type of their own in the F1 data, so they are covered wherever they are in B2C), because the complaints about high prices come from imported listings in Pets and baby products alike, and B2B prices are fine.
+
+- **Training is unchanged:** every competitor row (Odoo, Amazon, Noon, imported or not) still teaches the model; they are real offers in the Saudi market.
+- **Saudi reference prices:** an Odoo `competitor.product` price with channel `retail` (seen in a physical store in Saudi Arabia) or a scraped row with `origin` `local` (F6, only from the data). Odoo `ecommerce` and `b2b` prices are not. `odoo_api_competitor_products.py` now keeps the raw channel (`Source channel`), which it used to fold into B2C; 1a carries `origin` (`unknown` for Odoo rows and pre-F6 files) and `source_channel`.
+- **B2C ceiling:** with 3 or more reference prices of the SKU's type, the p75 ceiling (similar sizes first, as in F7a) comes from them only (`ceiling_source` `reference`); otherwise the F7a band with every row. Reference prices of another size never replace a similar-size ceiling from every row (review finding: three 0.5 L shelf prices would have lifted a 4 L ceiling about 4.7 times). The floor keeps every row, so it can never be above the reference ceiling. B2B SKUs are not affected.
+- **Before/after:** none on the frozen F1 data (its Odoo CSV predates `Source channel` and its scraper CSV predates `origin`): the outputs only gain the new columns. A what-if that counts every F1 Odoo B2C price as `retail` (an upper bound: some are e-commerce) changes 22 Home suggestions (16 of them by more than 0.5 %, all upwards, at most ×1.06; the other 6 by a cent or so) and nothing else (Pets, Automotive and B2B unchanged), because F1's B2C competitors are almost all Odoo rows: the reference ceiling only drops the few scraped rows. The real effect starts when the next run reads Odoo's channel and Amazon/Noon rows arrive: imported listings then stop setting B2C ceilings wherever a type has 3 shelf prices.
 
 ### F8 · Final run and Odoo KSA (1 day + review)
 

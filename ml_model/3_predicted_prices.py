@@ -15,6 +15,10 @@ MARGIN_FLOOR = 1.30            # the final price is never below cost x 1.30 (rou
 MIN_COMPETITORS_FOR_CLAMP = 3  # with 1-2 rows the range collapses to a point and forces absurd prices
 SIZE_MATCH_RATIO = 2.0         # "similar size": from size / 2 to size x 2
 MIN_SIZE_MATCHES = 3           # fewer similar-size rows -> the band uses every row of the type
+# F7b (Mafer, 2026-11-24): for a B2C SKU, the ceiling comes from the Saudi reference prices of its
+# type (Odoo retail, scraped 'local' origin) when there are at least this many; the floor and the
+# model keep using every competitor row. B2B SKUs are not affected.
+MIN_REFERENCE_ROWS = 3
 CEILING_QUANTILE = 0.75        # the ceiling is the p75 per liter / per piece x the SKU's size
 CAT_FEATURES = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
 
@@ -124,7 +128,12 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
 
     1. Model price per liter (or per piece).
     2. With MIN_COMPETITORS_FOR_CLAMP or more market rows of its type, clamped to [low, p75] of
-       its market band (`market_band`). A SKU larger than every market row of its type is never
+       its market band (`market_band`). For a B2C SKU whose type has MIN_REFERENCE_ROWS or more
+       Saudi reference rows (`is_reference`, F7b), the median and p75 come from those rows only
+       (`ceiling_source` 'reference'), unless that would replace a similar-size band with an
+       all-sizes one (fewer than MIN_SIZE_MATCHES similar-size reference rows while every row has
+       them); `ceiling_source` is 'all' for the F7a band and '' when no band applies; `low` always comes from every row (the reference rows
+       are among them, so `low` is never above that p75). A SKU larger than every market row of its type is never
        lifted to `low` (large sizes cost less per liter; `volume_outside_market`). The p75 ceiling
        applies at every size, also below the market's size range (the plan's "p75 x volume"
        ceiling; lifting it there raised small sizes up to x6 on the F1 data).
@@ -165,7 +174,19 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
         item['confidence'] = calculate_confidence(model, X_pred)
         item['pu'] = item['model_pu']
 
-        band = market_band(markets[kind].get(row.get('type_of_product')), item['size'])
+        rows = markets[kind].get(row.get('type_of_product'))
+        band = market_band(rows, item['size'])
+        if band is not None:
+            band['ceiling_source'] = 'all' if band['count'] >= MIN_COMPETITORS_FOR_CLAMP else ''
+            if band['ceiling_source'] and row.get('channel') == 'B2C' and 'is_reference' in rows:
+                reference = rows[rows['is_reference'].fillna(False).astype(bool)]
+                if len(reference) >= MIN_REFERENCE_ROWS:
+                    reference_band = market_band(reference, item['size'])
+                    # Never trade a similar-size ceiling for an all-sizes one: shelf bottles of
+                    # another size would set the wrong price per liter (small packs cost more).
+                    if reference_band['match'] == 'size' or band['match'] == 'all':
+                        band.update({key: reference_band[key] for key in ('median', 'p75', 'match')})
+                        band['ceiling_source'] = 'reference'
         item['band'] = band
         if band is None:
             continue
@@ -221,6 +242,7 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
             'market_match': band['match'] if band else '',
             'volume_capped': item['capped'],
             'has_size': item['kind'] is not None,
+            'ceiling_source': band['ceiling_source'] if band else '',
         })
 
     return pd.DataFrame(report_list)

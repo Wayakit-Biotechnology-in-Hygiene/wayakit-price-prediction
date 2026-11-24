@@ -144,6 +144,11 @@ def test_confidence_and_counts_in_range(report):
     assert report["volume_outside_market"].dtype == bool
     assert report["volume_capped"].dtype == bool and report["has_size"].dtype == bool
     assert not (report["volume_capped"] & ~report["volume_outside_market"]).any()
+    # F7b: no reference rows in F1, so every band uses all rows; without a band (fewer than 3
+    # competitor rows), no ceiling source.
+    has_band = report["competitors_count"] >= MIN_COMPETITORS_FOR_CLAMP
+    assert (report.loc[has_band, "ceiling_source"] == "all").all()
+    assert report.loc[~has_band, "ceiling_source"].fillna("").eq("").all()
 
 
 def test_products_without_a_size_get_only_the_floor(report):
@@ -172,6 +177,8 @@ def test_models_saved_and_loadable(run):
         assert len(stats) > 0 and not math.isnan(float(stats["market_min"].min()))
     for name in ("vol_market_rows.joblib", "unit_market_rows.joblib"):
         rows = joblib.load(model_dir / name)
-        assert rows.columns.tolist() == ["type_of_product", "price_per_unit", "size"]
+        assert rows.columns.tolist() == ["type_of_product", "price_per_unit", "size", "is_reference"]
+        # F1 predates F7b: no Odoo retail channel and no scraper origin, so no Saudi reference rows.
+        assert rows["is_reference"].dtype == bool and not rows["is_reference"].any()
         assert len(rows) > 0 and (rows["price_per_unit"] > 0).all() and (rows["size"] > 0).all()
     assert (joblib.load(model_dir / "vol_market_rows.joblib")["size"] > 0.005).all(), "5 mL or less is dropped"

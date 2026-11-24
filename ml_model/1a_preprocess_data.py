@@ -50,6 +50,14 @@ def flag_multipacks(titles, units, quantities):
     return flags
 
 
+def _text_column(df, column, default):
+    """`df[column]` lower-cased and stripped, `default` where it is missing or empty."""
+    if column not in df:
+        return pd.Series([default] * len(df), index=df.index, dtype=object)
+    values = df[column].astype('string').str.strip().str.lower()
+    return values.where(values.notna() & (values != ''), default).astype(object)
+
+
 def load_and_clean_raw_data():
     logger.info("--- 1. Loading and cleaning raw competitor data ---")
     df_test4 = pd.read_csv('scraper/competitors_complete.csv')
@@ -75,6 +83,13 @@ def load_and_clean_raw_data():
     df_test4_clean['is_multipack'] = flag_multipacks(titles, df_test4_clean['unit_of_measurement'].tolist(),
                                                      df_test4_clean['total_quantity'].tolist())
     df_prod_clean['is_multipack'] = False
+    # F7b: where each price comes from. `origin` (local / imported / unknown) only exists in the
+    # scraper CSV since F6 (pre-F6 files and Odoo rows: unknown); `source_channel` (retail /
+    # ecommerce / b2b) only in the Odoo CSV since F7b (scraper rows and older Odoo files: '').
+    df_test4_clean['origin'] = _text_column(df_test4, 'origin', 'unknown').values
+    df_test4_clean['source_channel'] = ''
+    df_prod_clean['origin'] = 'unknown'
+    df_prod_clean['source_channel'] = _text_column(df_prod, 'Source channel', '').values
 
     competitor_data = pd.concat([df_test4_clean, df_prod_clean], ignore_index=True)
     logger.info(f"✅ Raw data combined. Total: {len(competitor_data)} rows.")

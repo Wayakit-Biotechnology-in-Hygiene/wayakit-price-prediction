@@ -150,7 +150,18 @@ def _run_new(rel: str, records: list, out: Path, **kwargs) -> list:
     return models.calls
 
 
-def _compare(rel: str, out_rel: str, records: list, **new_kwargs) -> tuple[list, list]:
+def _without_last_column(data: bytes, column: str) -> bytes:
+    """Drops a trailing CSV column added on purpose. Only for columns whose values never contain
+    a comma, a quote or a newline (the F7b `Source channel` codes; the strategies generate none)."""
+    lines = data.decode("utf-8-sig").split("\n")
+    assert lines[0].rstrip("\r").endswith("," + column), lines[0]
+    out = [line if not line.strip() else line.rsplit(",", 1)[0] + ("\r" if line.endswith("\r") else "")
+           for line in lines]
+    return ("\ufeff" if data.startswith(b"\xef\xbb\xbf") else "").encode() + "\n".join(out).encode()
+
+
+def _compare(rel: str, out_rel: str, records: list, added_last_column: str | None = None,
+             **new_kwargs) -> tuple[list, list]:
     with tempfile.TemporaryDirectory(prefix="pi-odoo-eq-") as tmp:
         tmp = Path(tmp)
         base_out, base_calls = _run_base(rel, records, tmp / "base", out_rel, **new_kwargs)
@@ -158,6 +169,9 @@ def _compare(rel: str, out_rel: str, records: list, **new_kwargs) -> tuple[list,
         new_calls = _run_new(rel, records, new_out, **new_kwargs)
         base_bytes = base_out.read_bytes()
         new_bytes = new_out.read_bytes()
+        if added_last_column and not base_bytes.decode("utf-8-sig").split("\n")[0].rstrip("\r").endswith(
+                "," + added_last_column):
+            new_bytes = _without_last_column(new_bytes, added_last_column)
         assert new_bytes == base_bytes, (
             f"{rel}: CSV differs from base for the same records\n--- base ---\n"
             f"{base_bytes.decode('utf-8', 'replace')}\n--- new ---\n{new_bytes.decode('utf-8', 'replace')}")
@@ -217,8 +231,10 @@ def test_products_csv_is_identical_to_base(records):
            "generic_product_type": "Floor cleaner", "total_quantity": 1000.0, "uom": "ml",
            "price_unit_sar": 12.5, "company": "Fake brand"}])
 def test_competitor_products_csv_is_identical_to_base(records):
+    # F7b adds the raw channel as the last column; every earlier byte must stay the same.
     base_calls, new_calls = _compare("ml_model/odoo_api_competitor_products.py",
-                                     "ml_model/competitor_products_from_odoo.csv", records)
+                                     "ml_model/competitor_products_from_odoo.csv", records,
+                                     added_last_column="Source channel")
     assert new_calls == base_calls, "the competitor.product query changed"
 
 
