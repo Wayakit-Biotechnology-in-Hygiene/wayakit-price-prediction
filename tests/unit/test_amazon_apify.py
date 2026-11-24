@@ -6,8 +6,10 @@ The adapter gets a `FakeClient` (no Apify) and the real `RelevanceAgent` with `F
   `scrape()` with the configured actor, item cap and USD cap;
 - each drop rule (not SA, sponsored, no title, no / zero / negative price, non-SAR currency,
   Wayakit's own products: C09) with its reason; the price is `price.value`, never `listPrice`;
-- sizes: 2 of {title, Item Volume, Size, Unit Count} must agree on the pack total (C10), weights
-  never count, "3X concentrate" is not a pack; no size -> dropped before the AI;
+- sizes: 2 of {title, Item Volume, Size, Unit Count} agreeing on the pack total (C10), else the
+  title's size when no attribute contradicts it; a ml attribute repeating another source's fl oz
+  number is fl oz; plain oz and gallons are fl oz; weights never count, "3X concentrate" is not a
+  pack; no size -> dropped before the AI (cases from the 2026-11-23 smoke run);
 - relevance through the batch API with the post-drop titles; units mode (wipes batch, Number of
   Items); output keys are exactly the 8 contract keys; Company is the brand, never the seller;
 - origin from the data only; duplicate ASINs; errors propagate; the client is resolved lazily.
@@ -188,16 +190,242 @@ def test_size_needs_two_agreeing_sources(title, attributes, expected):
 
 @pytest.mark.parametrize("title, attributes", [
     ("good Cleaner 500ml", [{"key": "Item Volume", "value": "750 Milliliters"}]),   # disagree
-    ("good Cleaner 500ml", []),                                                     # one source only
+    ("good Cleaner", [{"key": "Item Volume", "value": "500 Milliliters"}]),         # one attribute only
     ("good Cleaner 907 g", [{"key": "Size", "value": "907 Grams"}]),                # weights never count
-    ("good Cleaner 12 oz", [{"key": "Size", "value": "12 Ounces"}]),                # plain oz is a weight
-    ("good Cleaner 500ml Pack of 3", [{"key": "Item Volume", "value": "500 Milliliters"}]),  # per-item vs pack
+    ("good Cleaner Net Wt 12 oz", [{"key": "Size", "value": "12 Ounces"}]),         # net weight in the title
+    ("good Cleaner 750ml, Pack of 3", [{"key": "Item Volume", "value": "500 Milliliters"}]),  # neither total nor unit
 ])
 def test_size_without_agreement_is_dropped_before_the_ai(title, attributes):
     relevance = agent()
     rows, _ = scrape([item(title=title, attributes=attributes)], relevance=relevance)
     assert rows == []
     assert relevance.stats()["evaluated"] == 0, "no_size is dropped before calling the AI"
+
+
+# --- title-only sizes and the fl-oz-as-ml label (Mafer, 2026-11-23; real smoke-run items) ----------
+@pytest.mark.parametrize("title, attrs, expected", [
+    # No attribute is a volume: the title alone is enough.
+    ("Clorox Pet Urine Remover for Stains and Odors, Spray Bottle, 24oz -709ml",
+     {"size": "1 count (Pack of 1)", "unit count": "1.0 Count"}, ("ml", 709.0)),    # the title's own ml
+    ("Pet Stain Remover and Odor Eliminator Spray, 100ml Plant-Based Surfactant Cleaner", {}, ("ml", 100.0)),
+    ("good Cleaner 500ml", {}, ("ml", 500.0)),
+    ("good Cleaner 500ml", {"unit count": "907.18 Grams"}, ("ml", 500.0)),     # a weight never contradicts
+    # A per-unit attribute of the title's pack is consistent with it.
+    ("good Cleaner 500ml Pack of 3", {"item volume": "500 Milliliters"}, ("ml", 1500.0)),
+    # Plain oz in the title agrees with an attribute.
+    ("Simple Solution Extreme Stain & Odor Remover, Stain Cleaner, 32oz (2 Pack)",
+     {"item volume": "64 Fluid Ounces", "size": "32 Fl Oz (Pack of 2)", "unit count": "64 Milliliters"},
+     ("fl oz", 64.0)),
+    ("good Cleaner 12 oz", {"item volume": "12 Fluid Ounces"}, ("fl oz", 12.0)),
+    ("good Cleaner 12 oz", {"size": "355 ml"}, ("fl oz", 12.0)),
+    # A gallon is 128 fl oz and settles 3840 / 3750 ml.
+    ("Simple Solution Pet Stain and Odor Remover | Enzymatic Cleaner | Floral Fresh, 1 Gallon",
+     {"item volume": "1 Gallons", "size": "3840 ml (Pack of 1)", "unit count": "3750 Milliliters"}, ("fl oz", 128.0)),
+    # Unit Count holds the fl oz number with a ml label; the explicit Item Volume confirms the title.
+    ("Rejuvenate Carpet Spot Remover 32oz", {"item volume": "32 Fluid Ounces", "unit count": "32 Milliliters"},
+     ("fl oz", 32.0)),
+])
+def test_smoke_run_sizes(title, attrs, expected):
+    unit, amount = amazon_apify.amazon_size(title, attrs)
+    assert unit == expected[0]
+    assert amount == pytest.approx(expected[1])
+
+
+@pytest.mark.parametrize("title, attrs", [
+    # An attribute volume contradicts the title.
+    ("Simple Solution Urine Destroyer Enzymatic Cleaner | 32 Ounces",
+     {"item volume": "5 Liters", "size": "890 ml (Pack of 1)", "unit count": "907.18 Grams"}),
+    ("good Cleaner 500ml", {"item volume": "750 Milliliters"}),
+    # No size in the title and no two attributes agree: one attribute alone is never enough.
+    ("Extreme Stain & Odor Eliminator Professional Strength Deodorizing Spray",
+     {"item volume": "499.73 Milliliters", "unit count": "1 Count"}),
+    ("Paw Inspired Pet Enzyme Cleaner Spray", {"unit count": "946.35 Milliliters"}),
+    ("Simple Solution Cat Litter Freshner Granules, 600 gm", {"unit count": "1 Count"}),
+    # Conservative mode (Mafer, 2026-11-23). 128 ml twice against 1 gallon (128 fl oz): one label is
+    # wrong and no title says which.
+    ("Stuart Pet Supply Co. Professional Strength Pet Odor Eliminator",
+     {"item volume": "1 Gallons", "size": "128 ml (Pack of 1)", "unit count": "128 Milliliters"}),
+    # A plain oz needs a confirmation that is not another plain oz or a relabeled ml: the oz may
+    # be a net weight (aerosols, pastes). Title-only needs ml, liters or fl oz.
+    ("good Cleaner 12 oz", {"size": "12 Ounces"}),
+    ("Nature’s Miracle Urine Destroyer Plus Cat, 32 Ounces, Enzymatic Formula", {}),
+    ("THORNELL Cat Odor-Off Concentrate Pet Smell Odor Eliminator – 16oz", {"unit count": "16 Milliliters"}),
+    ("Floral Fresh, 1 Gallon", {}),
+    # "32Oz, Blue, 32 Oz Spray" has the shape of a two-scent pack ("1L Blue, 1L Pink"): no title size,
+    # and the two attributes (890 ml, 945 ml) do not agree.
+    ("Simple Solution Stain And Odor Remover 2X Pro Bacteria And Enzyme Formula, Floral Fresh 32Oz, Blue, 32 Oz Spray",
+     {"size": "890 ml (Pack of 1)", "unit count": "945 Milliliters"}),
+    # Number of Items 2 with nothing in the title to agree with: one attribute pair or the title
+    # alone is not enough.
+    ("Goreem Powerful Pet Odor Eliminator Spray", {"item volume": "120 Milliliters", "unit count": "120 Milliliters",
+                                                   "number of items": "2"}),
+    ("good Cleaner 500ml", {"number of items": "2"}),
+])
+def test_smoke_run_items_without_a_usable_size(title, attrs):
+    assert amazon_apify.amazon_size(title, attrs) is None
+
+
+# Review of the 2026-11-23 fixes: a per-unit oz title with "N Count", a capacity, a fl oz pack.
+@pytest.mark.parametrize("title, attrs, expected", [
+    ("Lysol Spray 19 fl oz x 3", {"item volume": "19 Fluid Ounces", "size": "19 Fl Oz"}, ("fl oz", 57.0)),
+    ("Dettol Antiseptic Liquid/500ml", {"item volume": "500 Milliliters"}, ("ml", 500.0)),
+])
+def test_review_sizes(title, attrs, expected):
+    unit, amount = amazon_apify.amazon_size(title, attrs)
+    assert unit == expected[0]
+    assert amount == pytest.approx(expected[1])
+
+
+@pytest.mark.parametrize("title, attrs", [
+    # A title with a count of 2 or more is ambiguous: only the attributes decide, never the title alone.
+    ("Method All-Purpose Cleaner Spray, French Lavender, 28 oz, 4 Count", {"unit count": "4.0 Count"}),
+    ("Dish Soap 500ml, 24 Count Sponges", {"item volume": "500 Milliliters"}),
+    ("Finish 24 Count 500 ml rinse aid", {"size": "500 ml"}),
+    ("Tide PODS Laundry Detergent, 16 Count, 15.2 oz", {}),
+    # Fractions and case notation are not read.
+    ("Clorox Splash-Less Bleach, 1/2 Gallon", {"unit count": "1.0 Count"}),
+    ("Lysol Disinfectant Spray, 12/19 oz", {}),
+    # Conservative mode (Mafer, 2026-11-23): an ambiguous title leaves a single attribute, and an
+    # attribute multipack the title does not state is ambiguous.
+    ("Method All-Purpose Cleaner Spray, French Lavender, 28 oz, 4 Count",
+     {"item volume": "28 Fluid Ounces", "size": "28 Fl Oz (Pack of 4)", "unit count": "112 Fl Oz"}),
+    ("Tetra AquaSafe Water Conditioner, Treats up to 50 Gallons, 250 ml", {"item volume": "250 Milliliters"}),
+])
+def test_review_items_without_a_usable_size(title, attrs):
+    assert amazon_apify.amazon_size(title, attrs) is None
+
+
+def test_a_title_with_a_tank_capacity_is_not_used():
+    assert amazon_apify.amazon_size("Aquarium Water Conditioner for 55 Gallon Tanks, 8 oz",
+                                    {"item volume": "8 Fluid Ounces"}) is None
+    # Not even when two attributes agree: they may be per-unit sizes of a pack or a kit.
+    assert amazon_apify.amazon_size("Aquarium Water Conditioner for 55 Gallon Tanks, 8 oz",
+                                    {"item volume": "8 Fluid Ounces", "size": "8 Fl Oz"}) is None
+
+
+# Review of the conservative rules (2026-11-23) and Mafer's answers: solids and kits of different
+# products are not wanted; a multipack of the same product is kept with its total.
+@pytest.mark.parametrize("title, attrs", [
+    # an ambiguous title drops the row even when two per-unit attributes agree
+    ("Clorox Bleach, 121 oz, 3 Count", {"item volume": "121 Fluid Ounces", "size": "121 Fl Oz"}),
+    ("Simple Green All-Purpose Cleaner 1 Gallon, Case of 6", {"item volume": "1 Gallons", "size": "1 Gallon"}),
+    ("Leather Cleaner 16 oz and Leather Conditioner 16 oz Kit", {"item volume": "16 Fluid Ounces", "size": "16 Fl Oz"}),
+    ("Car Wash Shampoo 1L with Pack of 3 Microfiber Towels", {"size": "1 Liter"}),
+    # a title that states a pack but no size: the attributes are per unit
+    ("Lysol Disinfectant Spray, Crisp Linen, Pack of 2", {"item volume": "19 Fluid Ounces", "size": "19 Ounce"}),
+    ("Dettol Antiseptic Liquid, Pack of 3", {"item volume": "500 Milliliters", "size": "500 ml"}),
+    # the title's pack and an attribute's pack disagree
+    ("Hand Soap, Pack of 3", {"item volume": "36 Fluid Ounces", "size": "36 Fl Oz", "number of items": "6"}),
+    ("Clorox Cleaner 32 oz", {"item volume": "32 Fluid Ounces", "size": "32 oz (Pack of 2)", "unit count": "64 Fl Oz"}),
+    # solids and aerosols: their oz are a net weight
+    ("Meguiar's Clay Bar 3.5 oz", {"size": "3.5 Ounce"}),
+    ("Turtle Wax Paste Wax 14 oz", {"item volume": "14 Fluid Ounces"}),
+    ("Meguiar's Gold Class Wax 11 oz", {"item form": "Wax", "size": "11 Ounce", "item volume": "11 Fluid Ounces"}),
+    ("Lysol Disinfectant Spray, Crisp Linen, 19 oz", {"item form": "Aerosol", "size": "19 Ounce (Pack of 1)"}),
+    ("Lysol Disinfectant Spray, Crisp Linen, 19 oz", {"item form": "Aerosol", "item volume": "19 Fluid Ounces"}),
+    ("Febreze Air Freshener Aerosol 8.8 oz", {"item volume": "8.8 Fluid Ounces"}),
+    # a title pack with no attribute to confirm it
+    ("Dettol Antiseptic Liquid 500ml*2", {}),
+    ("Clorox Bleach 1.89L Twin Pack", {}),
+    ("Fairy Dishwashing Liquid Lemon 500ml x 2, Original Scent", {}),
+    ("Car Wash Bucket 5 Gallon", {"item volume": "5 Gallons", "size": "5 Gallon"}),
+    # final review (2026-11-23)
+    ("Car Wash Soap 64 oz with 3 Pack of Premium Microfiber Towels",
+     {"item volume": "64 Fluid Ounces", "unit count": "64.0 Fluid Ounces"}),
+    ("Armor All Interior Cleaner Spray 16 fl oz with 2 Pack Cleaning Wipes", {"item volume": "16 Fluid Ounces"}),
+    ("Multi-Surface Cleaner Concentrate 946 ml, Makes up to 8 Bottles", {"item volume": "946 Milliliters"}),
+    ("Purex Liquid Laundry Detergent 2X 150 oz", {"item volume": "150 Fluid Ounces", "size": "150 Fl Oz"}),
+    # two attributes agree with each other but not with the title's own size
+    ("Dettol Antiseptic Liquid 1L", {"item volume": "1 Milliliters", "unit count": "1.0 Milliliters"}),
+    ("Eco Strong Pet Stain and Odor Remover, for Cats Dogs I by 1: Gallon Value .9 Gallon, Size 9",
+     {"item volume": "128 Fluid Ounces", "size": "3.79 l (Pack of 1)", "unit count": "3785.41 Milliliters"}),
+])
+def test_conservative_items_without_a_size(title, attrs):
+    assert amazon_apify.amazon_size(title, attrs) is None
+
+
+def test_a_can_sized_in_oz_gets_no_size():
+    """Both 2026-11-23 smoke runs: a 17 oz can (Included Components "1 17 ounce can", case price
+    SAR 723) was stored as 17 fl oz. Its oz are a net weight, like an aerosol's."""
+    title = ("Simple Solution Urine Destroyer Enzymatic Cleaner | Pet Stain and Odor Remover with 2X "
+             "Pro-bacteria Cleaning Power | 17 Ounces")
+    attrs = {"item volume": "5 Liters", "size": "500 ml (Pack of 1)", "unit count": "17 Milliliters",
+             "number of items": "1", "item form": "other", "item weight": "17 Ounces",
+             "included components": "1 17 ounce can"}
+    assert amazon_apify.amazon_size(title, attrs) is None
+    assert amazon_apify.amazon_size("Carpet Foam Cleaner 22 oz Can", {"item volume": "22 Fluid Ounces"}) is None
+    # Without the can, the same sources still give the size; "can" as a verb is not a can.
+    assert amazon_apify.amazon_size(title, {**attrs, "included components": "1 bottle"}) == ("fl oz", 17.0)
+    assert amazon_apify.amazon_size(
+        "Odor Remover 32 Fl Oz, Can Be Used on Carpets",
+        {"item volume": "32 Fluid Ounces", "included components": "Can be used on carpets"}) == ("fl oz", 32.0)
+    # A can in ml is a volume.
+    assert amazon_apify.amazon_size(
+        "Carpet Foam Cleaner 650 ml", {"item volume": "650 Milliliters", "included components": "1 650 ml can"}
+    ) == ("ml", 650.0)
+
+
+def test_number_of_items_does_not_outvote_a_title_that_agrees_with_an_attribute():
+    """2026-11-23 smoke run: a single 4 L bottle (checked by Mafer on the page) had Number of Items 2."""
+    attrs = {"item volume": "148.13 Fluid Ounces", "size": "4 L", "unit count": "4000 Milliliters",
+             "number of items": "2"}
+    assert amazon_apify.amazon_size(
+        "Simple Solution Patio and Decking Pet Stain and Odour Remover, Silver, 4 Litres", attrs) == ("ml", 4000.0)
+    # A real 2-pack states it in the title, and Number of Items agrees.
+    assert amazon_apify.amazon_size(
+        "Simple Solution Extreme Stain & Odor Remover, Stain Cleaner, 32oz (2 Pack)",
+        {"item volume": "64 Fluid Ounces", "size": "32 Fl Oz (Pack of 2)", "number of items": "2"}) == ("fl oz", 64.0)
+
+
+@pytest.mark.parametrize("title, attrs, expected", [
+    ("Dettol Antiseptic Liquid 500ml*2", {"size": "500 ml"}, ("ml", 1000.0)),   # a pack needs an attribute
+    ("Dettol Antiseptic Liquid 500 ml * 3", {"item volume": "500 Milliliters"}, ("ml", 1500.0)),
+    ("Clorox Bleach 1 L, Pack of Two", {"item volume": "1 Liters", "size": "1 l (Pack of 2)"}, ("ml", 2000.0)),
+    ("Fairy Dish Soap 500 ml", {"item volume": "500 Milliliters", "size": "500 ml", "unit count": "500.0 Fl Oz"},
+     ("ml", 500.0)),                                                    # the title confirms the ml label
+    ("Dettol Disinfectant Spray Aerosol 450 ml", {"item form": "Aerosol", "item volume": "450 Milliliters"},
+     ("ml", 450.0)),                                                    # an aerosol in ml is a volume
+    ("Only Natural Pet Stain + Odor Remover 32 Fl Oz", {"item form": "Bar, Liquid", "item volume": "32 Fluid Ounces"},
+     ("fl oz", 32.0)),                                                  # any liquid form wins
+    # final review (2026-11-23): a title that shows its total is not multiplied again
+    ("Dettol Hand Wash 400ml Twin Pack 2x200ml", {"item volume": "400 Milliliters"}, ("ml", 400.0)),
+    ("Harpic Toilet Cleaner Liquid Original, 1.5L Twin Pack (2 x 750ml)", {"item volume": "1.5 Liters"}, ("ml", 1500.0)),
+    ("Dettol Antibacterial Power Floor Cleaner Lemon 1.8L Twin Pack (2 x 900ml)",
+     {"item volume": "1.8 Liters", "unit count": "1800.0 Milliliters", "number of items": "2"}, ("ml", 1800.0)),
+    ("Fabric Softener 1L for Towels", {"item volume": "1 Liters", "unit count": "1000.0 Milliliters"}, ("ml", 1000.0)),
+    ("Clorox Bleach 4L (1 Gallon)", {"item volume": "4 Liters"}, ("ml", 4000.0)),
+    ("Clorox Bleach 1.89L Twin Pack", {"item volume": "1.89 Liters", "size": "1.89 l (Pack of 2)"}, ("ml", 3780.0)),
+    ("Fairy 500ml x 2, Lemon", {"item volume": "1000 Milliliters", "size": "1 Litre"}, ("ml", 1000.0)),
+    ("Simple Green Cleaner 32 oz (946 ml) x 2", {"item volume": "946 Milliliters", "number of items": "2"},
+     ("ml", 1892.0)),                                                    # one unit of the pack confirms it
+])
+def test_conservative_items_with_a_size(title, attrs, expected):
+    unit, amount = amazon_apify.amazon_size(title, attrs)
+    assert unit == expected[0]
+    assert amount == pytest.approx(expected[1])
+
+
+@pytest.mark.parametrize("value", [32, 3.5, ["32 oz"], {"a": 1}, None])
+def test_non_text_attributes_never_raise(value):
+    attrs = {"size": value, "item volume": value, "unit count": value, "item form": value, "number of items": value}
+    result = amazon_apify.amazon_size("good Cleaner 500 ml", attrs)
+    assert result is None or result[1] > 0
+
+
+def test_a_powder_in_oz_with_grams_is_dropped():
+    assert amazon_apify.amazon_size("Bar Keepers Friend Cleanser Powder 21 oz (595 g)",
+                                    {"item weight": "595 Grams"}) is None
+
+
+def test_a_ml_attribute_is_only_relabeled_by_an_equal_fl_oz_number():
+    # 500 ml next to 16.9 fl oz is a real 500 ml (they agree as volumes), not 500 fl oz.
+    assert amazon_apify.amazon_size("good Cleaner", {"item volume": "16.9 Fluid Ounces", "size": "500 ml"}) == \
+        ("fl oz", 16.9)
+    # Two ml attributes with no fl oz source keep their ml label.
+    assert amazon_apify.amazon_size("good Cleaner", {"size": "128 ml", "unit count": "128 Milliliters"}) == \
+        ("ml", 128.0)
+    # The title is never relabeled.
+    assert amazon_apify.amazon_size("good Cleaner 32 ml", {"item volume": "32 Fluid Ounces"}) is None
 
 
 # Review round 1 (C10): two per-unit attributes never outvote a title that states the pack.
@@ -350,7 +578,7 @@ def attr(name, value):
 @pytest.mark.parametrize("extra, title, size_attr, expected", [
     (attr("Country of Origin", "Saudi Arabia"), "good Cleaner 500ml", "500 Milliliters", "local"),
     (attr("Country of Origin", "China"), "good Cleaner 500ml", "500 Milliliters", "imported"),
-    (None, "good Cleaner 16.9 fl oz", "16.9 Fluid Ounces", "imported"),
+    (None, "good Cleaner 16.9 fl oz", "16.9 Fluid Ounces", "unknown"),   # a fl oz size is not a signal
     (None, "good Cleaner 500ml", "500 Milliliters", "unknown"),
     (attr("Country/Region of origin", "KSA"), "good Cleaner 16.9 fl oz", "16.9 Fluid Ounces", "local"),
 ])
