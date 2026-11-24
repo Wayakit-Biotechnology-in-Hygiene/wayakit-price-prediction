@@ -474,7 +474,7 @@ python -m infra.check_pi --only schedule iam   # sections: bucket, instance, bed
 
 ## Deploy and rollback
 
-**Status (2026-11-22): F4 is code on branch `f4-cicd`; nothing of it is in GitHub, AWS or the instance yet.** Until the [F4 rollout](#f4-rollout-once) is done, deploy by hand as in [Before F4: manual pull](#before-f4-manual-pull). What exists after the rollout: [resources.md, Releases and deploys (F4)](resources.md#releases-and-deploys-f4); why: [decisions.md](decisions.md) (2026-11-22 rows).
+**Status (2026-11-24): F4 rollout steps 1–4 done (2026-11-22); step 5 (`main` receives `server-improvement`) is still pending, so nothing deploys automatically and there is no release pointer.** Until the [F4 rollout](#f4-rollout-once) is done, deploy by hand as in [Before F4: manual pull](#before-f4-manual-pull). What exists after the rollout: [resources.md, Releases and deploys (F4)](resources.md#releases-and-deploys-f4); why: [decisions.md](decisions.md) (2026-11-22 rows).
 
 ### How a push deploys (F4, pull-on-boot)
 
@@ -553,7 +553,7 @@ Every step needs Mafer's OK. **Never on the last Thursday of the month, nor whil
    aws iam get-role --role-name price-intelligence-deploy --query Role.Arn --output text --profile wayakit-vdc \
      | gh secret set PI_DEPLOY_ROLE_ARN --repo Wayakit-Biotechnology-in-Hygiene/wayakit-price-prediction
    ```
-4. **Done 2026-11-22** (instance at `server-improvement` @ 0221cfc; the checks below gave `enabled` twice, both files in `/opt/price-intelligence`, `pi_deploy.py --dry-run`: normal boot, no release pointer yet, ok; no crontab). Install `pi-deploy.service` on the instance (the last manual pull): start the instance, SSM session, then the [manual pull](#before-f4-manual-pull) of `server-improvement` and `sudo infra/instance/bootstrap.sh --dry-run --skip-chrome --skip-conda`, then without `--dry-run` (values not passed are kept from the env file; see [Bootstrap on the current instance](#bootstrap-on-the-current-instance)). It installs `/opt/price-intelligence/` and enables `pi-deploy.service`. Check:
+4. **Done 2026-11-22** (instance at `server-improvement` @ 0221cfc; the checks below gave `enabled` twice, both files in `/opt/price-intelligence`, `pi_deploy.py --dry-run`: normal boot, no release pointer yet, ok; no crontab). Later manual pull, 2026-11-24: `server-improvement` 0221cfc → 6d97e78 (F5 + F6 and the PR #12 smoke fixes), no bootstrap or conda change. Install `pi-deploy.service` on the instance (the last manual pull): start the instance, SSM session, then the [manual pull](#before-f4-manual-pull) of `server-improvement` and `sudo infra/instance/bootstrap.sh --dry-run --skip-chrome --skip-conda`, then without `--dry-run` (values not passed are kept from the env file; see [Bootstrap on the current instance](#bootstrap-on-the-current-instance)). It installs `/opt/price-intelligence/` and enables `pi-deploy.service`. Check:
    ```bash
    systemctl is-enabled pi-deploy.service pi-pipeline.service    # enabled, enabled
    ls -l /opt/price-intelligence                                  # pi_deploy.py, pi_boot_guard.py (root)
@@ -653,9 +653,9 @@ How to read it:
 
 ## Apify (Amazon and Noon, F6)
 
-Implemented on 2026-11-22 and merged into `server-improvement` (PR #10; smoke fixes in PR #12, merged 2026-11-24); **not on the instance**, which runs `server-improvement` at 0221cfc. Amazon KSA (`junglee~amazon-crawler`, site `amazon`) and Noon KSA (`saswave~noon-product-scraper`, site `noon`) are scraped through the Apify REST API in Home, Automotive and Pets; the Selenium Amazon scraper is deleted. Mumzworld, SACO and the B2B stores stay on Selenium. Code: `scraper/services/apify_client.py` (client, caps, budget), `scraper/scrapers/apify_common.py` (parsing, Wayakit exclusion, `origin`), `scraper/scrapers/amazon_apify.py`, `scraper/scrapers/noon_apify.py`. Decisions: [decisions.md](decisions.md), 2026-11-22 rows.
+Implemented on 2026-11-22 and merged into `server-improvement` (PR #10; smoke fixes in PR #12, merged 2026-11-24); **on the instance since 2026-11-24** (manual pull of `server-improvement` from 0221cfc to 6d97e78 (F2 + F3 + F4 + F5 + F6 and the PR #12 smoke fixes); the first monthly run with Apify is Thursday 2026-11-26). Amazon KSA (`junglee~amazon-crawler`, site `amazon`) and Noon KSA (`saswave~noon-product-scraper`, site `noon`) are scraped through the Apify REST API in Home, Automotive and Pets; the Selenium Amazon scraper is deleted. Mumzworld, SACO and the B2B stores stay on Selenium. Code: `scraper/services/apify_client.py` (client, caps, budget), `scraper/scrapers/apify_common.py` (parsing, Wayakit exclusion, `origin`), `scraper/scrapers/amazon_apify.py`, `scraper/scrapers/noon_apify.py`. Decisions: [decisions.md](decisions.md), 2026-11-22 rows.
 
-**Pulling F6 onto the instance is Mafer's decision, and never on the day of a monthly run.** `APIFY_API_TOKEN` exists in `prod/wayakit-app` (Mafer, 2026-11-23) and two paid smoke runs passed (2026-11-23). Without the key the scraper exits 1 at the Apify preflight, so the monthly run would stop at `3. Run scraping` with nothing uploaded.
+`APIFY_API_TOKEN` exists in `prod/wayakit-app` (Mafer, 2026-11-23), two paid smoke runs passed (2026-11-23), and on 2026-11-24 the Apify preflight passed on the instance with the instance role. `check_pi` after the pull: 74 OK, 0 WARN, 0 FAIL. Without the key the scraper exits 1 at the Apify preflight, so the monthly run would stop at `3. Run scraping` with nothing uploaded.
 
 ### Token
 
@@ -773,8 +773,8 @@ Errors that have already appeared or that are visible in the code, and what to d
 | GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
 | Chrome processes are left open | In SACO, `driver.get` and `_handle_overlays` are outside the `try` (`saco_scraper.py:122-123`) and errors other than Timeout do not close the browser | `pkill -f chrome` when running by hand. The instance shuts down at the end of the scheduled run |
 | Scraping does not start: `Could not install ChromeDriver` | `ChromeDriverManager().install()` resolves the driver on every run and downloads it if it is not cached (`main.py:263`), and depends on the network and the Chrome version | Retry. On the instance: Google Chrome 146.0.7680.177 and webdriver-manager 4.0.2 (F1) |
-| Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (in `server-improvement`, not on the instance): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
-| Wayakit products in the Amazon and Noon results (pre-F6 code) | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | **Fixed in F6** (in `server-improvement`, not on the instance): the Apify adapters drop Wayakit by brand, seller, manufacturer or title (drop reason `wayakit`) |
+| Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (on the instance since 2026-11-24): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
+| Wayakit products in the Amazon and Noon results (pre-F6 code) | Neither the Amazon scraper nor the actors exclude the Wayakit brand or seller (seen in the calibration) | **Fixed in F6** (on the instance since 2026-11-24): the Apify adapters drop Wayakit by brand, seller, manufacturer or title (drop reason `wayakit`) |
 
 ### ML and Odoo
 
