@@ -47,7 +47,7 @@ Details in [docs/runbook.md](docs/runbook.md) and [docs/decisions.md](docs/decis
 
 Except what is marked F2 or F3 (code and scripts only), none of this exists yet; no new resource has been created in AWS. Details in [docs/plan.md](docs/plan.md).
 
-- **F6 (merged into `server-improvement` through PR #10 and PR #12, not on the instance):** Amazon KSA and Noon KSA through Apify (`junglee/amazon-crawler` and `saswave/noon-product-scraper`), in VdC's Apify account, in Home, Automotive and Pets; the Selenium Amazon scraper is removed. USD 20 cap per run; new CSV columns `seller` and `origin` (`local` / `imported` / `unknown`, only from the data). Reads the key `APIFY_API_TOKEN` in `prod/wayakit-app` (added by Mafer on 2026-11-23); two paid smoke runs passed on 2026-11-23. Pulling it onto the instance is Mafer's decision, never on the day of a monthly run ([docs/runbook.md](docs/runbook.md), *Apify*). Mumzworld and SACO stay the same.
+- **F6 (merged into `server-improvement` through PR #10 and PR #12; on the instance since 2026-11-24):** Amazon KSA and Noon KSA through Apify (`junglee/amazon-crawler` and `saswave/noon-product-scraper`), in VdC's Apify account, in Home, Automotive and Pets; the Selenium Amazon scraper is removed. USD 20 cap per run; new CSV columns `seller` and `origin` (`local` / `imported` / `unknown`, only from the data). Reads the key `APIFY_API_TOKEN` in `prod/wayakit-app` (added by Mafer on 2026-11-23); two paid smoke runs passed on 2026-11-23. Pulled onto the instance on 2026-11-24 (`server-improvement` @ 6d97e78); the first monthly run with Apify is Thursday 2026-11-26 ([docs/runbook.md](docs/runbook.md), *Apify*). Mumzworld and SACO stay the same.
 - **F2 (in the code):** relevance with Bedrock instead of Gemini: DeepSeek V3.2 as primary and Claude Haiku 4.5 as fallback, in batches and with the same `RelevanceAgent` interface. Needs the F3 permission to run on the instance.
 - **F3 (applied 2026-11-22; first run 2026-11-26):** a single monthly full run on the last Thursday of each month at 21:50 Mexico City (`run_pipeline.sh` with no arguments: one run, no stages; the keyword review happens outside the run and never blocks it), started by the `price-intelligence-monthly` schedule and gated by a boot guard.
 - **F3 (applied 2026-11-22):** resources in `infra/` (boto3 scripts with `--dry-run`, tag `project=price-intelligence`), state bucket in S3 (`price-intelligence-<account>`; nothing writes to it yet) and SNS failure alerts by email.
@@ -80,8 +80,8 @@ Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `s
 
 | Site | Channel | Subindustries | Method today | Planned change |
 |---|---|---|---|---|
-| Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Selenium + Bedrock | Apify `junglee/amazon-crawler` (F6, in `server-improvement`, not on the instance; replaces Selenium) |
-| Noon (noon.com/saudi-en) | B2C | Home, Automotive, Pets (F6) | — (does not exist on the instance) | Apify `saswave/noon-product-scraper` (F6, in `server-improvement`, not on the instance) |
+| Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Apify `junglee/amazon-crawler` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (replaced Selenium) |
+| Noon (noon.com/saudi-en) | B2C | Home, Automotive, Pets (F6) | Apify `saswave/noon-product-scraper` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (new site) |
 | Mumzworld | B2C | Home | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
 | SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
 | Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
