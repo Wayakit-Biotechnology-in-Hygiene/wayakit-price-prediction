@@ -114,6 +114,7 @@ def test_unit_helpers():
     assert diagnosis.model_of_unit(" mL ") == "volumetric" and diagnosis.model_of_unit("units") == "units"
     assert diagnosis.size_in_ml("fl oz", 16) == pytest.approx(473.176)
     assert diagnosis.size_in_ml("L", 2) == 2000 and pd.isna(diagnosis.size_in_ml("g", 100))
+    assert diagnosis.size_in_ml("Litre", 2) == 2000 and diagnosis.size_in_ml("liters", 0.5) == 500  # as 1a (F7a)
     assert diagnosis.is_us_size_ml(473.0) and diagnosis.is_us_size_ml(946.0)
     assert not diagnosis.is_us_size_ml(500.0) and not diagnosis.is_us_size_ml(60.0)
     # Large US bottles with rounded labels (relative tolerance): half gallon and gallon.
@@ -132,14 +133,17 @@ def test_by_type_counts_reproduce_training_trimming(tmp_path, monkeypatch):
     assert code == 0
     by_type = pd.read_csv(out / "pets_by_type.csv").set_index(["model", "type_of_product"])
 
-    # Bug 6: two different prices -> p10-p90 bounds exclude both rows.
+    # Bug 6 (fixed in F7a): two different prices used to be excluded by the p10-p90 bounds; the
+    # diagnosis reuses the pipeline's trimming, so it now reports the type as kept whole.
     two = by_type.loc[("volumetric", "P1-Two prices")]
-    assert (two["n_before_trim"], two["n_after_trim"], bool(two["emptied_by_trim"])) == (2, 0, True)
+    assert (two["n_before_trim"], two["n_after_trim"], bool(two["emptied_by_trim"])) == (2, 2, False)
 
     spray = by_type.loc[("volumetric", "P2-Spray")]
     volume = pd.read_csv(data / "ml_model/competitor_volumetric_processed.csv")
-    expected_after = training.filter_outliers_with_percentiles(volume, "price_per_liter")
-    assert spray["n_raw"] == 13 and spray["n_before_trim"] == 13
+    # As 2_train_models main(): 5 mL or less is dropped before the trimming (F7a).
+    expected_after = training.filter_outliers_with_percentiles(training.drop_implausible_sizes(volume), "price_per_liter")
+    # 1a drops the price-0 row since F7a (C18), so 12 of the 13 raw rows reach training.
+    assert spray["n_raw"] == 13 and spray["n_before_trim"] == 12
     assert spray["n_after_trim"] == (expected_after["type_of_product"] == "P2-Spray").sum()
     assert spray["n_after_trim"] < spray["n_before_trim"] and not spray["emptied_by_trim"]
     assert spray["max_per_unit"] == pytest.approx(50000.0)
@@ -147,7 +151,7 @@ def test_by_type_counts_reproduce_training_trimming(tmp_path, monkeypatch):
     assert spray["pct_fl_oz"] == pytest.approx(round(100 / 13, 1))
     assert spray["pct_us_size_ml"] == pytest.approx(round(100 / 12, 1))
     assert (spray["n_price_zero"], spray["n_le_5ml"], spray["n_le_5ml_after_trim"]) == (1, 1, 0)
-    assert spray["n_brands"] == 13 and spray["n_wayakit_skus"] == 2
+    assert spray["n_brands"] == 12 and spray["n_wayakit_skus"] == 2  # the price-0 brand is dropped by 1a
 
     wipes = by_type.loc[("units", "P3-Wipes")]
     assert (wipes["n_raw"], wipes["n_with_title"], wipes["n_multipack"]) == (3, 2, 1)

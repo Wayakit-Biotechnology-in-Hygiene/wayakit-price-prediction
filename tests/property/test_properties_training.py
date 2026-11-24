@@ -6,7 +6,7 @@ production logger is replaced with one that writes no files (see ``tests/conftes
 import numpy as np
 import pandas as pd
 import pytest
-from hypothesis import Phase, example, given, settings
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from tests.conftest import load_module
@@ -66,6 +66,9 @@ def test_equals_filtering_by_quantiles_of_each_group(generated_rows, percentiles
     df = _df(generated_rows)
     kept = set(filter_outliers(df, METRIC, p_low, p_high)["row_id"])
     for _, group in df.groupby("type_of_product"):
+        if len(group) < training.MIN_ROWS_TO_TRIM:  # small types are kept whole (F7a, bug 6)
+            assert set(group["row_id"]) <= kept
+            continue
         low = _quantile(group[METRIC], p_low)
         high = _quantile(group[METRIC], p_high)
         for row_id, value in zip(group["row_id"], group[METRIC]):
@@ -100,45 +103,22 @@ def test_groups_with_a_single_distinct_value_are_kept_whole(generated_rows):
             assert (output["type_of_product"] == product_type).sum() == len(group)
 
 
-@st.composite
-def rows_without_pair_of_distinct_prices(draw):
-    """Like ``rows``, but no group has exactly 2 rows with different prices.
-
-    That is the only case in which a group disappears (with n >= 3 rows there is always an integer
-    index between the positions of p10 and p90, and its value stays within the limits). It is
-    excluded here so the general property keeps running; the bug has its own minimal test below.
-    """
-    group = st.one_of(
-        st.lists(prices, min_size=1, max_size=1),
-        prices.map(lambda p: [p, p]),
-        st.lists(prices, min_size=3, max_size=15),
-    )
-    by_type = draw(st.dictionaries(st.sampled_from(["A", "B", "C", "D"]), group, max_size=4))
-    result = [(product_type, value) for product_type, values in by_type.items() for value in values]
-    return draw(st.permutations(result))
-
-
-@given(rows_without_pair_of_distinct_prices())
+@given(rows)
+@example([("A", 1.0), ("A", 2.0)])  # bug 6 (fixed in F7a): limits 1.1 and 1.9 used to leave 0 rows
 def test_no_group_disappears(generated_rows):
     df = _df(generated_rows)
     output = filter_outliers(df, METRIC)
     assert set(output["type_of_product"]) == set(df["type_of_product"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a type_of_product with exactly 2 rows of different prices loses both "
-    "(p10 > minimum and p90 < maximum). Counterexample: group 'A' with [1.0, 2.0] -> limits 1.1 and "
-    "1.9 -> 0 rows. In the F1 data, 14 of 151 volumetric types and 1 of 15 unit types "
-    "end up without competitors (finding for pi-dev)",
-)
-@settings(phases=[Phase.explicit])
 @given(rows)
-@example([("A", 1.0), ("A", 2.0)])
-def test_bug_group_of_two_distinct_prices_disappears(generated_rows):
+def test_small_groups_are_kept_whole(generated_rows):
+    """F7a: a type with fewer than MIN_ROWS_TO_TRIM rows is not trimmed at all."""
     df = _df(generated_rows)
     output = filter_outliers(df, METRIC)
-    assert set(output["type_of_product"]) == set(df["type_of_product"])
+    for product_type, group in df.groupby("type_of_product"):
+        if len(group) < training.MIN_ROWS_TO_TRIM:
+            assert sorted(output.loc[output["type_of_product"] == product_type, "row_id"]) == sorted(group["row_id"])
 
 
 @given(rows, st.lists(st.sampled_from([np.nan]), min_size=1, max_size=5))

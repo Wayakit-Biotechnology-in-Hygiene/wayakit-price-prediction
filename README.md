@@ -18,7 +18,7 @@ flowchart TD
     SC <-->|relevance and wipes count| G["Gemini"]
     SC --> CSV["scraper/competitors_complete.csv"]
     OD[("Odoo: product.master,<br/>sale.order.line, competitor.product")] --> ML
-    CSV --> ML["ml_model/<br/>price per L or per piece, p10–p90 trimming, RandomForest"]
+    CSV --> ML["ml_model/<br/>price per L or per piece, p10–p90 trimming, RandomForest, market band (p75 ceiling)"]
     ML --> OUT[("Odoo: product.price.suggestion")]
 ```
 

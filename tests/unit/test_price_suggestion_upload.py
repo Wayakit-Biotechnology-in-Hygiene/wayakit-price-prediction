@@ -536,3 +536,33 @@ def test_cleanup_previous_in_a_later_process_finds_the_ids_file_in_pi_log_dir(mo
     assert not set(odoo.table) & set(old_ids) and len(odoo.table) == 4
     assert not (state / IDS_NAME).exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["state", "wayakit_prediction_report.csv"]
+
+
+# --- products without a size (F7a) --------------------------------------------------------------
+def test_without_size_reads_the_flag_and_the_volume():
+    df = pd.DataFrame([_row(0), _row(1, volume="0 units"), _row(2, volume="0.0 L"),
+                       _row(3, has_size=False), _row(4, volume="20 units", has_size=True)])
+    assert up.without_size(df).tolist() == [False, True, True, True, False]
+    # A report from before F7a has no has_size column: the volume alone decides.
+    assert up.without_size(df.drop(columns="has_size")).tolist() == [False, True, True, False, False]
+
+
+def test_products_without_a_size_are_never_uploaded(report, ids_file, tmp_path):
+    """Their price is only the cost x 1.30 floor: they are left out of the batch, and they do not
+    count as unparseable rows (40 % of the report here, far above the 5 % limit)."""
+    out = tmp_path / "dry.csv"
+    rows = [_row(0), _row(1, volume="0 units", has_size=False), _row(2, has_size=True),
+            _row(3, volume="0 units", has_size=False), _row(4, has_size=True)]
+    argv = ["--input", str(report(rows)), "--ids-file", str(ids_file), "--run_mode", "full",
+            "--dry-run", "--dry-run-output", str(out)]
+    assert up.main(argv, session=Untouchable()) == 0
+    assert pd.read_csv(out)["product_id_str"].tolist() == ["FP-000", "FP-002", "FP-004"]
+
+
+def test_skipped_row_numbers_stay_the_report_rows_after_no_size_rows_are_left_out(report):
+    """The warning names the report's own row even after main() leaves the no-size rows out."""
+    rows = [_row(0, volume="0 units", has_size=False)] + [_row(i) for i in range(1, 30)]
+    rows[5]["predicted_price"] = "not a number"  # report row 6
+    df = pd.read_csv(report(rows))
+    records, skipped = up.build_records(df[~up.without_size(df)])
+    assert [(n, pid) for n, pid, _ in skipped] == [(6, "FP-005")] and len(records) == 28

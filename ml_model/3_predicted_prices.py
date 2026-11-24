@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import numpy as np
 import joblib
@@ -8,21 +10,29 @@ from log_config import get_logger
 
 logger = get_logger()
 
+# Pricing rules (F7a; docs/plan.md and docs/decisions.md, 2026-11-24).
+MARGIN_FLOOR = 1.30            # the final price is never below cost x 1.30 (rounded up to the cent)
+MIN_COMPETITORS_FOR_CLAMP = 3  # with 1-2 rows the range collapses to a point and forces absurd prices
+SIZE_MATCH_RATIO = 2.0         # "similar size": from size / 2 to size x 2
+MIN_SIZE_MATCHES = 3           # fewer similar-size rows -> the band uses every row of the type
+CEILING_QUANTILE = 0.75        # the ceiling is the p75 per liter / per piece x the SKU's size
+CAT_FEATURES = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
+
 def load_artifacts():
-    """Loads trained models and column lists from disk."""
+    """Loads trained models, column lists and market rows from disk."""
     logger.info("--- 1. Loading trained models and columns ---")
     model_dir = 'ml_model/trained_models'
-    
+
     # A missing file raises FileNotFoundError (run 2_train_models.py first); it is not swallowed.
     model_vol = joblib.load(os.path.join(model_dir, 'volumetric_model.joblib'))
     model_unit = joblib.load(os.path.join(model_dir, 'unit_model.joblib'))
     vol_cols = joblib.load(os.path.join(model_dir, 'volumetric_model_columns.joblib'))
     unit_cols = joblib.load(os.path.join(model_dir, 'unit_model_columns.joblib'))
-    vol_stats = joblib.load(os.path.join(model_dir, 'vol_market_stats.joblib'))
-    unit_stats = joblib.load(os.path.join(model_dir, 'unit_market_stats.joblib'))
+    vol_market = joblib.load(os.path.join(model_dir, 'vol_market_rows.joblib'))
+    unit_market = joblib.load(os.path.join(model_dir, 'unit_market_rows.joblib'))
 
     logger.info("✅ Models and columns loaded successfully.")
-    return model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats
+    return model_vol, model_unit, vol_cols, unit_cols, vol_market, unit_market
 
 def prepare_prediction_data():
     """Loads Wayakit products, cleans them and enriches with past quotation data."""
@@ -66,87 +76,153 @@ def calculate_confidence(model, X):
     confidence = max(0, (1 - (cov * 2))) * 100
     return round(confidence, 2)
 
-def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats):
-    """Iterates over products and generates a price prediction for each one."""
+def market_band(rows, size):
+    """Market band of one SKU from the market rows of its type (price per unit and size columns).
+
+    - `count`: rows of the type; `low`: their minimum price per unit; `max`: their maximum;
+      `size_min` / `size_max`: their size range.
+    - `median` / `p75`: from the rows of similar size (size / 2 to size x 2) when there are at
+      least MIN_SIZE_MATCHES of them (`match` = 'size'), else from every row (`match` = 'all').
+      Small packs cost more per liter or per piece, so a p75 over all sizes would not bind.
+    Returns None when the type has no market rows.
+    """
+    if rows is None or len(rows) == 0:
+        return None
+    prices = rows['price_per_unit'].to_numpy(dtype=float)
+    sizes = rows['size'].to_numpy(dtype=float)
+    similar = (sizes >= size / SIZE_MATCH_RATIO) & (sizes <= size * SIZE_MATCH_RATIO)
+    match = 'size' if similar.sum() >= MIN_SIZE_MATCHES else 'all'
+    used = prices[similar] if match == 'size' else prices
+    return {
+        'count': len(prices), 'low': float(prices.min()), 'max': float(prices.max()),
+        'median': float(np.quantile(used, 0.5)), 'p75': float(np.quantile(used, CEILING_QUANTILE)),
+        'size_min': float(sizes.min()), 'size_max': float(sizes.max()), 'match': match,
+    }
+
+
+def apply_margin_floor(price, cost):
+    """max(price, cost x 1.30) rounded to the cent, never below the floor (rounded up if needed)."""
+    floor = cost * MARGIN_FLOOR
+    noise = 1e-9 * max(1.0, abs(floor))  # 3873 x 1.30 = 5034.900000000001 is 5034.90, not 5034.91
+    final = round(max(price, floor), 2)
+    if final < floor - noise:
+        final = math.ceil(round(floor * 100, 6)) / 100
+        if final < floor - noise:
+            final = math.ceil(floor * 100) / 100
+    return final
+
+
+def _size_of(value):
+    return float(value) if pd.notna(value) and value > 0 else 0.0
+
+
+def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols, vol_market, unit_market):
+    """One report row per product, in the input order.
+
+    `vol_market` / `unit_market` are the market rows saved by 2_train_models.py
+    (`type_of_product`, `price_per_unit`, `size`). Per product with a size:
+
+    1. Model price per liter (or per piece).
+    2. With MIN_COMPETITORS_FOR_CLAMP or more market rows of its type, clamped to [low, p75] of
+       its market band (`market_band`). A SKU larger than every market row of its type is never
+       lifted to `low` (large sizes cost less per liter; `volume_outside_market`). The p75 ceiling
+       applies at every size, also below the market's size range (the plan's "p75 x volume"
+       ceiling; lifting it there raised small sizes up to x6 on the F1 data).
+    3. A SKU larger than every market row of its type (`volume_outside_market`) costs at most,
+       per liter or per piece, what the smallest-priced smaller SKU of the same subindustry and
+       type costs (`volume_capped`).
+    4. x size, then the margin floor (`apply_margin_floor`), which always wins.
+
+    A product without a size (no-size parent templates) gets the floor and `has_size` False; the
+    upload skips it.
+    """
     logger.info("\n--- 3. Starting prediction generation ---")
-    report_list = []
+    markets = {
+        'volume': {t: g for t, g in vol_market.groupby('type_of_product')},
+        'units': {t: g for t, g in unit_market.groupby('type_of_product')},
+    }
+    items = []
 
     for _, row in df_wayakit.iterrows():
-        # Your prediction logic and business rule (intact)
-        is_volumetric = pd.notna(row['Volume_Liters']) and row['Volume_Liters'] > 0
-        is_unit = pd.notna(row['Pack_quantity_Units']) and row['Pack_quantity_Units'] > 0
-        confidence_score = 0.0
-        market_min = 0.0
-        market_max = 0.0
-        competitor_count = 0
-        volume_outside_market = False
-        
-        single_product_df = pd.DataFrame([row])
-        model_predicted_price = 0
-        predicted_price_per_unit = 0
+        volume = _size_of(row['Volume_Liters'])
+        pieces = _size_of(row.get('Pack_quantity_Units'))
+        kind = 'volume' if volume > 0 else 'units' if pieces > 0 else None
+        item = {'row': row, 'kind': kind, 'size': volume if kind == 'volume' else pieces,
+                'model_pu': 0.0, 'pu': 0.0, 'confidence': 0.0, 'band': None,
+                'clamped': False, 'outside': False, 'capped': False}
+        items.append(item)
+        if kind is None:
+            continue
 
-        if is_volumetric:
-            single_product_df = single_product_df.rename(columns={'Volume_Liters': 'volume_liters'})
-            cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
-            X_pred_encoded = pd.get_dummies(single_product_df[['volume_liters'] + cat_features], columns=cat_features)
-            X_pred_aligned = X_pred_encoded.reindex(columns=vol_cols, fill_value=0)
-            predicted_price_per_unit = model_vol.predict(X_pred_aligned)[0]
-            model_predicted_price = predicted_price_per_unit * row['Volume_Liters']
-            confidence_score = calculate_confidence(model_vol, X_pred_aligned)
+        size_column, model, columns = (('volume_liters', model_vol, vol_cols) if kind == 'volume'
+                                       else ('total_quantity', model_unit, unit_cols))
+        single = pd.DataFrame([row]).rename(
+            columns={'Volume_Liters' if kind == 'volume' else 'Pack_quantity_Units': size_column})
+        single[size_column] = item['size']
+        X_pred = pd.get_dummies(single[[size_column] + CAT_FEATURES], columns=CAT_FEATURES)
+        X_pred = X_pred.reindex(columns=columns, fill_value=0)
+        item['model_pu'] = float(model.predict(X_pred)[0])
+        item['confidence'] = calculate_confidence(model, X_pred)
+        item['pu'] = item['model_pu']
 
-            product_type = row.get('type_of_product')
-            stat_row = vol_stats[vol_stats['type_of_product'] == product_type]
-            if not stat_row.empty:
-                market_min = stat_row.iloc[0]['market_min'] * row['Volume_Liters']
-                market_max = stat_row.iloc[0]['market_max'] * row['Volume_Liters']
-                competitor_count = int(stat_row.iloc[0]['competitor_count'])
-                volume_outside_market = not (stat_row.iloc[0]['vol_min'] <= row['Volume_Liters'] <= stat_row.iloc[0]['vol_max'])
-        
-        elif is_unit:
-            single_product_df = single_product_df.rename(columns={'Pack_quantity_Units': 'total_quantity'})
-            cat_features = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
-            X_pred_encoded = pd.get_dummies(single_product_df[['total_quantity'] + cat_features], columns=cat_features)
-            X_pred_aligned = X_pred_encoded.reindex(columns=unit_cols, fill_value=0)
-            predicted_price_per_unit = model_unit.predict(X_pred_aligned)[0]
-            model_predicted_price = predicted_price_per_unit * row['Pack_quantity_Units']
-            confidence_score = calculate_confidence(model_unit, X_pred_aligned)
-            
-            product_type = row.get('type_of_product')
-            stat_row = unit_stats[unit_stats['type_of_product'] == product_type]
-            if not stat_row.empty:
-                market_min = stat_row.iloc[0]['market_min'] * row['Pack_quantity_Units']
-                market_max = stat_row.iloc[0]['market_max'] * row['Pack_quantity_Units']
-                competitor_count = int(stat_row.iloc[0]['competitor_count'])
-                volume_outside_market = not (stat_row.iloc[0]['vol_min'] <= row['Pack_quantity_Units'] <= stat_row.iloc[0]['vol_max'])
+        band = market_band(markets[kind].get(row.get('type_of_product')), item['size'])
+        item['band'] = band
+        if band is None:
+            continue
+        below, above = item['size'] < band['size_min'], item['size'] > band['size_max']
+        item['outside'] = below or above
+        if band['count'] >= MIN_COMPETITORS_FOR_CLAMP and item['pu'] > 0:
+            lower = 0.0 if above else band['low']
+            clamped = min(max(item['pu'], lower), band['p75'])
+            item['clamped'] = clamped != item['pu']
+            item['pu'] = clamped
 
-        # Clamp to the market range observed in competitors; the profitability floor always wins.
-        # >=3 competitors are required: with 1-2 rows the range collapses to a point and forces absurd prices.
-        clamped_to_market = False
-        if competitor_count >= 3 and model_predicted_price > 0:
-            clamped_price = min(max(model_predicted_price, market_min), market_max)
-            clamped_to_market = clamped_price != model_predicted_price
-            model_predicted_price = clamped_price
+    # Larger than the whole market: no more per liter (or per piece) than a smaller sibling SKU.
+    for item in items:
+        band = item['band']
+        if band is None or item['size'] <= band['size_max'] or item['pu'] <= 0:
+            continue
+        row = item['row']
+        sibling_prices = [
+            other['pu'] for other in items
+            if other is not item and other['kind'] == item['kind'] and other['pu'] > 0
+            and other['size'] < item['size'] and other['band'] is not None
+            and other['size'] <= other['band']['size_max']
+            and other['row'].get('subindustry') == row.get('subindustry')
+            and other['row'].get('type_of_product') == row.get('type_of_product')
+        ]
+        if sibling_prices and min(sibling_prices) < item['pu']:
+            item['pu'] = min(sibling_prices)
+            item['capped'] = True
 
+    report_list = []
+    for item in items:
+        row, band, size = item['row'], item['band'], item['size']
         cost = row['Unit_cost_SAR']
-        min_profitable_price = cost * 1.30
-        final_price = max(model_predicted_price, min_profitable_price)
+        final_price = apply_margin_floor(item['pu'] * size, cost)
         profit_margin = ((final_price - cost) / cost) * 100 if cost > 0 else 0
+        scale = (lambda key: round(band[key] * size, 2)) if band else (lambda key: 0.0)
 
         report_list.append({
             'Product_ID': row['Product_ID'], 'product_name': row['Product_Name'],
             'product_type': row.get('type_of_product', 'N/A'), 'generic_product_type': row.get('generic_product_type', 'N/A'),
             'subindustry': row.get('subindustry', 'N/A'), 'industry': row.get('industry', 'N/A'),
-            'volume': f"{row['Volume_Liters']} L" if is_volumetric else f"{int(row.get('Pack_quantity_Units', 0))} units",
-            'cost_per_unit': cost, 'predicted_price': round(final_price, 2),
-            'predicted_price_per_unit': round(predicted_price_per_unit, 2), 'porcentaje_de_ganancia': round(profit_margin, 2),
-            'model_confidence': confidence_score,
-            'market_min_found': round(market_min, 2),
-            'market_max_found': round(market_max, 2),
-            'competitors_count': competitor_count,
-            'clamped_to_market': clamped_to_market,
-            'volume_outside_market': volume_outside_market,
+            'volume': f"{row['Volume_Liters']} L" if item['kind'] == 'volume' else f"{int(size)} units",
+            'cost_per_unit': cost, 'predicted_price': final_price,
+            'predicted_price_per_unit': round(item['model_pu'], 2), 'porcentaje_de_ganancia': round(profit_margin, 2),
+            'model_confidence': item['confidence'],
+            'market_min_found': scale('low'),
+            'market_max_found': scale('max'),
+            'competitors_count': band['count'] if band else 0,
+            'clamped_to_market': item['clamped'],
+            'volume_outside_market': item['outside'],
+            'market_median_found': scale('median'),
+            'market_p75_found': scale('p75'),
+            'market_match': band['match'] if band else '',
+            'volume_capped': item['capped'],
+            'has_size': item['kind'] is not None,
         })
-        
+
     return pd.DataFrame(report_list)
 
 def main():
@@ -156,10 +232,10 @@ def main():
     logger.info("="*60)
     
     artifacts = load_artifacts()
-    model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats = artifacts
+    model_vol, model_unit, vol_cols, unit_cols, vol_market, unit_market = artifacts
     
     df_to_predict = prepare_prediction_data()
-    report_df = generate_predictions(df_to_predict, model_vol, model_unit, vol_cols, unit_cols, vol_stats, unit_stats)
+    report_df = generate_predictions(df_to_predict, model_vol, model_unit, vol_cols, unit_cols, vol_market, unit_market)
 
     # Save and analyze final report
     output_filename = 'ml_model/wayakit_prediction_report.csv'

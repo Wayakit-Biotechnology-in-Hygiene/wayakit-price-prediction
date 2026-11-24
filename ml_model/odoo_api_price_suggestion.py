@@ -2,6 +2,9 @@
 (`product.price.suggestion`). WRITES TO ODOO: only run for real with Mafer's OK.
 
 Modes:
+- Products without a size (no-size parent templates: `has_size` False or `volume` 0) are never
+  uploaded: their price is only the cost x 1.30 floor (F7a). In full mode their previous
+  suggestions are removed with the rest.
 - `--dry-run`: builds the records and writes them to a CSV (default
   ml_model/price_suggestion_dry_run.csv). Reads no secrets and connects to nothing.
 - `--run_mode partial` (default): creates the new records; deletes nothing.
@@ -136,15 +139,31 @@ def row_to_record(row) -> dict:
     return record
 
 
+def without_size(df: pd.DataFrame) -> pd.Series:
+    """True for report rows of products with no size (no-size parent templates). Pure.
+
+    Their price is only the cost x 1.30 floor, not a suggestion, so they are not uploaded (F7a);
+    the fix is their size in Odoo's product master data. A row is "no size" if the report says
+    `has_size` False (since F7a) or its `volume` starts with 0 or less ("0 units").
+    """
+    volume = pd.to_numeric(df['volume'].astype(str).str.split(' ').str[0], errors='coerce')
+    no_size = volume <= 0
+    if 'has_size' in df:
+        no_size |= df['has_size'].astype(str).str.strip().str.lower().isin(['false', '0'])
+    return no_size.fillna(False).astype(bool)
+
+
 def build_records(df: pd.DataFrame) -> tuple:
     """Report -> `(records, skipped)`. Pure apart from one warning log per skipped row.
 
     `records` keeps the order of `df`; `skipped` is a list of `(row_number, product_id, reason)`
     (1-based row number) for rows `row_to_record` rejected. `len(records) + len(skipped)
-    == len(df)` always.
+    == len(df)` always. With a default integer index (a report read from CSV, even after rows
+    were filtered out) the row number is the report's own (index + 1).
     """
     records, skipped = [], []
-    for position, (_, row) in enumerate(df.iterrows(), start=1):
+    numbers = (df.index + 1) if pd.api.types.is_integer_dtype(df.index) else range(1, len(df) + 1)
+    for position, (_, row) in zip(numbers, df.iterrows()):
         try:
             records.append(row_to_record(row))
         except (ValueError, TypeError, KeyError) as e:
@@ -392,6 +411,12 @@ def main(argv=None, session: 'OdooSession' = None) -> int:
 
         df_results = pd.read_csv(args.input)
         logger.info(f"Report '{args.input}' loaded: {len(df_results)} rows.")
+        no_size = without_size(df_results)
+        if no_size.any():
+            logger.warning(f"{int(no_size.sum())} products without a size are not uploaded (only the "
+                           "margin floor, not a suggestion; fix their size in Odoo): "
+                           f"{sorted(df_results.loc[no_size, 'Product_ID'].astype(str).unique())}")
+            df_results = df_results[~no_size]
         records, skipped = build_records(df_results)
         check_parse_quality(records, skipped)
         logger.info(f"{len(records)} records ready ({len(skipped)} rows skipped).")

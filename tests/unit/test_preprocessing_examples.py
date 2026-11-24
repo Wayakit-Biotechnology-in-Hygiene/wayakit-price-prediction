@@ -78,17 +78,58 @@ def test_main_splits_volume_and_pieces(tmp_path, monkeypatch):
     assert units["price_per_item"].tolist() == [pytest.approx(0.1)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: parse_volume_string returns unit='kg' (and 'litre', because of the other bug) and 1a only "
-    "recognizes ml/l/fl oz/g as volume; those rows fall into the per-piece model as if they were "
-    "pieces. Counterexample: 'Powder 2 kg', 30 SAR -> competitor_unit_processed.csv with "
-    "total_quantity=2 and price_per_item=15 (finding for pi-dev)",
-)
-@pytest.mark.parametrize("unit", ["kg", "litre"])
-def test_main_does_not_treat_mass_or_volume_as_pieces(tmp_path, monkeypatch, unit):
-    _, units = _run_main(tmp_path, monkeypatch, [_scraper_row("Powder 2 " + unit, 30.0, unit, 2.0)])
+@pytest.mark.parametrize("unit", ["kg", "KG", "g", "kilograms"])
+def test_main_drops_mass_units_and_never_treats_them_as_pieces(tmp_path, monkeypatch, unit):
+    """Bug 5 (fixed in F7a): 'Powder 2 kg' used to reach competitor_unit_processed.csv as 2 pieces."""
+    volume, units = _run_main(tmp_path, monkeypatch, [_scraper_row("Powder 2 " + unit, 30.0, unit, 2.0)])
     assert units.empty
+    assert volume["company"].tolist() == ["Callington"]  # only the Odoo mL row
+
+
+@pytest.mark.parametrize("unit", ["litre", "Litres", "liter", "liters"])
+def test_main_reads_litre_spellings_as_liters(tmp_path, monkeypatch, unit):
+    """Bug 5 (fixed in F7a): 'litre' fell into the per-piece model; now it is 1 L, written as 'l'."""
+    volume, units = _run_main(tmp_path, monkeypatch, [_scraper_row("Cleaner 2 " + unit, 30.0, unit, 2.0)])
+    assert units.empty
+    row = volume[volume["company"] == "Brand"].iloc[0]
+    assert row["unit_of_measurement"] == "l"
+    assert row["volume_liters"] == pytest.approx(2.0)
+    assert row["price_per_liter"] == pytest.approx(15.0)
+
+
+def test_main_drops_zero_and_negative_prices_c18(tmp_path, monkeypatch):
+    volume, units = _run_main(
+        tmp_path,
+        monkeypatch,
+        [
+            _scraper_row("Free 500 ml", 0.0, "ml", 500.0),
+            _scraper_row("Refund 500 ml", -5.0, "ml", 500.0),
+            _scraper_row("Free wipes 80", 0.0, "units", 80.0),
+            _scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0),
+        ],
+    )
+    assert sorted(volume["price_sar"].tolist()) == [10.0, 1000.50]
+    assert units.empty
+
+
+def test_main_flags_multipacks_from_the_title_only(tmp_path, monkeypatch):
+    """F7a: a scraper row whose title states a pack of the same product is flagged (it stays in
+    training, but not in the market range); Odoo rows have no title and are never flagged."""
+    volume, units = _run_main(
+        tmp_path,
+        monkeypatch,
+        [
+            _scraper_row("Cleaner 500 ml x 2", 20.0, "ml", 1000.0),
+            _scraper_row("Cleaner Twin Pack 1L", 30.0, "L", 2.0),
+            _scraper_row("Cleaner 750 ml", 10.0, "ml", 750.0),
+            _scraper_row("Wipes Pack of 6, 480 count", 60.0, "units", 480.0),
+            _scraper_row("Wipes 80", 8.0, "units", 80.0),
+            _scraper_row("Wet Wipes Pack of 72", 12.0, "units", 72.0),  # one pack of 72 pieces
+        ],
+    )
+    flags = dict(zip(volume["price_sar"], volume["is_multipack"]))
+    assert flags == {20.0: True, 30.0: True, 10.0: False, 1000.50: False}
+    assert dict(zip(units["price_sar"], units["is_multipack"])) == {60.0: True, 8.0: False, 12.0: False}
 
 
 def test_process_unit_data_drops_invalid_quantities(tmp_path, monkeypatch):
