@@ -241,7 +241,7 @@ Restructured by Mafer on 2026-11-22 (F7 split into F7a and F7b). Nothing here ne
 - **Documented decision about the model** (the ticket asks for it): the other improvements (log target, GroupKFold) are left for a phase 2. They move the prices of all lines. The `approved_quote_price` leakage as a feature was already removed in e25e2c9 (`2_train_models.py:160`), together with the clipping to the market range with 3 or more competitors (`3_predicted_prices.py:126-132`).
 - Before/after comparison by subindustry: median of the new/old ratio and % of suggestions above the local p75.
 
-### F7b · Saudi reference ceiling for B2C (1 day) — **implemented on branch `feat/f7b-b2c-reference` (2026-11-24), PR to `server-improvement` pending Mafer's review**
+### F7b · Saudi reference ceiling for B2C (1 day) — **merged into `server-improvement` (PR #17, 2026-11-24, CI green); not on the instance yet**
 
 Scope set by Mafer on 2026-11-24, replacing "only in Pets, N local rows": every **B2C** subindustry (Home, Automotive, Pets; baby products have no subindustry or type of their own in the F1 data, so they are covered wherever they are in B2C), because the complaints about high prices come from imported listings in Pets and baby products alike, and B2B prices are fine.
 

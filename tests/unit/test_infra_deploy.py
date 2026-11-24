@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import types
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,10 +149,27 @@ class FakeRunner:
 @pytest.fixture(autouse=True)
 def no_real_sleep(monkeypatch):
     """Retries must never really wait in a test: every call injects `sleep`; a forgotten one fails
-    here instead of waiting up to 105 s."""
+    here instead of waiting up to 105 s.
+
+    Only pi_deploy's own `time` is replaced, never the global `time.sleep`: `subprocess` polls
+    with `time.sleep` while it waits for a child run with a timeout (the real `bash -n` and
+    deployer `--help` checks of FakeRunner), so patching it globally made those tests fail at
+    random when the child was slow, as on the CI runners (2026-11-24)."""
     def refuse(seconds):
         raise AssertionError(f"real time.sleep({seconds}) called: inject sleep=")
-    monkeypatch.setattr(pd.time, "sleep", refuse)
+    own_time = types.SimpleNamespace(**{name: getattr(time, name) for name in dir(time)
+                                        if not name.startswith("__")})
+    own_time.sleep = refuse
+    monkeypatch.setattr(pd, "time", own_time)
+
+
+def test_no_real_sleep_refuses_pi_deploy_sleep_but_not_subprocess_waits():
+    """Regression: the guard must not break subprocess's own wait loop (it polls with time.sleep)."""
+    with pytest.raises(AssertionError, match="inject sleep="):
+        pd.time.sleep(1)
+    assert time.sleep is not pd.time.sleep
+    proc = subprocess.run([sys.executable, "-c", "import time; time.sleep(0.2)"], timeout=60)
+    assert proc.returncode == 0
 
 
 def make_paths(tmp_path):
