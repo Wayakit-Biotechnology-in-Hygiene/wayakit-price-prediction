@@ -229,6 +229,9 @@ COVERAGE_COLUMNS = [
 B2C_SUBINDUSTRIES = ['home', 'automotive', 'pets']  # compared in lowercase
 # B2B sites are only searched with a site-specific keyword or general modifiers.
 KEYWORD_REQUIRED_SITES = ['fine', 'gogreen', 'officesupply', 'aerosense']
+# ... except in B2C for these: GoGreen's own search ignores the query (the relevance AI picks from
+# its whole catalog), so B2C rows, which mostly have no modifiers, use the general keyword (2026-11-25).
+KEYWORD_OPTIONAL_IN_B2C = {'gogreen'}
 UNITS_MODE_KEYWORDS = ['wipes', 'rags', 'microfiber', 'brush']
 # Scrapers that do not use the relevance agent: everything they return counts as found and relevant.
 SITES_WITHOUT_AI = {'aerosense'}
@@ -516,6 +519,9 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, browser, co
             continue
 
         scrapers = scraper_factory(browser, ai_agent)
+        for group_scraper in scrapers.values():
+            if hasattr(group_scraper, 'set_channel'):  # GoGreen: B2C keeps sizes up to 4 L
+                group_scraper.set_channel(channel_for(sub_industry_group))
         all_found_products_for_group = []
 
         for index, row in df_industry_instructions.iterrows():
@@ -534,7 +540,9 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, browser, co
                 keywords_to_use = site_specific_keywords.get(site_name, [plan['search_keyword']])
 
                 for keyword_to_use in keywords_to_use:
-                    if site_name in KEYWORD_REQUIRED_SITES:
+                    keyword_optional = (site_name in KEYWORD_OPTIONAL_IN_B2C
+                                        and channel_for(sub_industry) == 'B2C')
+                    if site_name in KEYWORD_REQUIRED_SITES and not keyword_optional:
                         if site_name not in site_specific_keywords and not plan['general_modifiers']:
                             logger.warning(f"Skipping '{site_name}' for '{base_keyword}' because no specific keyword or general modifier was provided.")
                             continue

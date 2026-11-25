@@ -11,11 +11,18 @@ Sizes come from the Arabic title (``arabic_size``), conservatively: one liquid s
 مل / ملي / ملل = ml) and an optional count of the same product ("12 حبة (1لتر)" = 12 L); a title
 with two sizes ("3 لتر و مزيل بقع 1 لتر"), a set (مجموعة), a free gift or a "+" bundle, or a
 weight (جرام, كجم) gives no size and is dropped.
+
+In B2C (``set_channel('B2C')``, called by ``run_scraping`` for Home) only sizes up to
+``config.GOGREEN_B2C_MAX_LITERS`` (4 L) are kept, before the relevance AI: Wayakit's B2C sizes stop
+at 4 L and GoGreen's 5, 20 and 30 L jerrycans would pull the B2C price per liter down. B2B keeps
+every size.
 """
 import re
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+
+import config
 
 from utils import parse_volume_with_multiplier, parse_count_string
 from services.browser import (fetch_html, collect_products, HttpStatusError, SiteLayoutChanged)
@@ -40,6 +47,7 @@ _UNITS = re.compile(r"(\d+)\s*(مناديل|منديل|حبات|حبة|قطعة|
 # A set, a package of different products, a free gift, a special offer or a "+" bundle.
 _KIT = re.compile(r"مجموعة|بكج|باقة|مجان|هدية|عرض|\+")
 _WEIGHT = re.compile(r"\d\s*(جرام|غرام|جم|كجم|كغ|كيلو)(?![\w])")
+_LITERS = ("لترات", "لتر", "ليتر")
 
 
 def normalize_digits(text):
@@ -72,7 +80,7 @@ def arabic_size(title, search_mode):
     size, word = float(sizes[0][0]), sizes[0][1]
     if size <= 0 or multiplier <= 0:
         return None
-    liters = word in ("لترات", "لتر", "ليتر")
+    liters = word in _LITERS
     quantity = size * multiplier
     return {"quantity": quantity, "unit": "L" if liters else "ml",
             "normalized": quantity * 1000 if liters else quantity}
@@ -133,7 +141,26 @@ class GoGreenScraper:
         self.browser = browser
         self.relevance_agent = relevance_agent
         self.products_to_find_limit = 5
+        self.max_liters = None  # set_channel('B2C') sets config.GOGREEN_B2C_MAX_LITERS
         self._catalog = None
+
+    def set_channel(self, channel):
+        """B2C keeps sizes up to ``config.GOGREEN_B2C_MAX_LITERS``; B2B keeps every size."""
+        self.max_liters = config.GOGREEN_B2C_MAX_LITERS if channel == "B2C" else None
+
+    def _fits_channel(self, title, size):
+        """Volume sizes (``normalized`` in ml) up to ``max_liters``. A units-mode count has no
+        liter limit, but a pack of liquid bottles or jerrycans sized in liters ("12 حبة (1لتر)",
+        "4 حبات 20 لتر") is still dropped in B2C when its liquid volume is above the limit."""
+        if self.max_liters is None:
+            return True
+        limit = self.max_liters * 1000
+        if size["unit"] != "units":
+            return size["normalized"] <= limit
+        volume = title_size(title, "volume")
+        singles = [float(quantity) * (1000 if word in _LITERS else 1)
+                   for quantity, word in _SIZE.findall(normalize_digits(title))]
+        return (volume is None or volume["normalized"] <= limit) and all(v <= limit for v in singles)
 
     def _load_catalog(self, page):
         """Every ``(url, title)`` of the store, read once per scraper. The page after the last one
@@ -164,8 +191,9 @@ class GoGreenScraper:
         with self.browser.page() as page:
             catalog = self._load_catalog(page)
             sized = [(url, title, size) for url, title in catalog
-                     for size in [title_size(title, search_mode)] if size]
-            logger.info(f"    > {len(sized)} of {len(catalog)} catalog products have a size.")
+                     for size in [title_size(title, search_mode)] if size and self._fits_channel(title, size)]
+            limit = f" up to {self.max_liters} L" if self.max_liters else ""
+            logger.info(f"    > {len(sized)} of {len(catalog)} catalog products have a size{limit}.")
             if not sized:
                 return []
             answers = self.relevance_agent.filter_relevant([title for _, title, _ in sized], keyword)

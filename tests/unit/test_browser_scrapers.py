@@ -404,6 +404,43 @@ def test_gogreen_no_relevant_product_is_an_empty_search(monkeypatch):
     assert gg.GoGreenScraper(FakeBrowser(), ArabicAgent("زجاج")).scrape("glass cleaner", "volume") == []
 
 
+def test_gogreen_b2c_keeps_sizes_up_to_4_liters_and_b2b_keeps_every_size(monkeypatch):
+    titles = {"/products/a": "منظف زجاج 5 لتر", "/products/b": "منظف زجاج 4 لتر",
+              "/products/c": "منظف زجاج 650 مل", "/products/d": "مناديل زجاج 80 منديل"}
+    pages = {f"https://gogreen.com.sa{href}": _gg_product("10") for href in titles}
+    _site(monkeypatch, gg, {GG_PAGE.format(1): _gg_catalog(list(titles.items())), **pages})
+    assert gg.config.GOGREEN_B2C_MAX_LITERS == 4
+    agent = ArabicAgent("زجاج")
+    scraper = gg.GoGreenScraper(FakeBrowser(), agent)
+    scraper.set_channel("B2C")
+    rows = scraper.scrape("glass cleaner", "volume")
+    # the 5 L jerrycan never reaches the AI in B2C; exactly 4 L is kept
+    assert agent.calls[-1][0] == ["منظف زجاج 4 لتر", "منظف زجاج 650 مل"]
+    assert [r["Total quantity"] for r in rows] == [4.0, 650.0]
+    scraper.scrape("glass wipes", "units")
+    assert agent.calls[-1][0] == ["مناديل زجاج 80 منديل"]
+    scraper.set_channel("B2B")
+    scraper.scrape("glass cleaner", "volume")
+    assert agent.calls[-1][0] == ["منظف زجاج 5 لتر", "منظف زجاج 4 لتر", "منظف زجاج 650 مل"]
+    assert gg.GoGreenScraper(FakeBrowser(), agent).max_liters is None  # no channel set: every size
+
+
+def test_gogreen_b2c_units_mode_counts_have_no_limit_but_liquid_packs_do(monkeypatch):
+    titles = {"/products/a": "مناديل زجاج 5000 منديل",  # a count above 4000 is not liters
+              "/products/b": "زجاج كرتون 12 حبة (1لتر)",  # 12 x 1 L = 12 L: a liquid pack
+              "/products/c": "زجاج مطهر 4 حبات 20 لتر",  # jerrycans counted as pieces
+              "/products/d": "زجاج 6 حبات 500 مل"}  # 3 L in all: kept
+    _site(monkeypatch, gg, {GG_PAGE.format(1): _gg_catalog(list(titles.items()))})
+    agent = ArabicAgent("nothing")
+    scraper = gg.GoGreenScraper(FakeBrowser(), agent)
+    scraper.set_channel("B2C")
+    scraper.scrape("glass wipes", "units")
+    assert agent.calls[-1][0] == ["مناديل زجاج 5000 منديل", "زجاج 6 حبات 500 مل"]
+    scraper.set_channel("B2B")
+    scraper.scrape("glass wipes", "units")
+    assert agent.calls[-1][0] == list(titles.values())
+
+
 def test_gogreen_parsers():
     assert gg.parse_catalog_page(_gg_catalog([("/products/a", " x  1 لتر "), ("/products/a", "x")])) == [
         ("https://gogreen.com.sa/products/a", "x 1 لتر")]

@@ -8,7 +8,9 @@ CSV_COLUMNS = [
 ]
 
 TARGET_MAP = {
-    'Home': ['amazon', 'saco', 'noon'],  # Mumzworld removed 2026-11-25: HTTP 403 to every automated client
+    # Mumzworld removed 2026-11-25 (HTTP 403 to every automated client); GoGreen added the same day,
+    # sizes up to GOGREEN_B2C_MAX_LITERS only.
+    'Home': ['amazon', 'saco', 'noon', 'gogreen'],
     'Automotive': ['amazon', 'saco', 'noon'],
     'Pets': ['amazon', 'noon'],
     'Aviation': ['aerosense'],
@@ -23,6 +25,10 @@ TARGET_MAP = {
     'Healthcare': ['fine', 'saco'],
     'Industrial facilities': ['fine', 'gogreen', 'officesupply'],
 }
+
+# GoGreen in B2C (Home) keeps sizes up to 4 L, Wayakit's largest B2C size: its 5, 20 and 30 L
+# jerrycans would pull the B2C price per liter down. B2B keeps every size (Mafer, 2026-11-25).
+GOGREEN_B2C_MAX_LITERS = 4
 
 MUMZWORLD_EXCLUSIONS = [
     'oven and grill cleaner',

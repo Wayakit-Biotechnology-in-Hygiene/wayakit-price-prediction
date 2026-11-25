@@ -73,6 +73,13 @@ SITES = ("amazon", "mumzworld", "saco", "fine", "gogreen", "officesupply", "aero
 # Mumzworld, 2026-11-25 (Mafer: "quita Mumzworld", HTTP 403 to every automated client).
 REMOVED_SITES = {"Home": ("mumzworld",)}
 REMOVED_SOURCES = {"mumzworld"}
+# Sites added on purpose: GoGreen in Home, 2026-11-25 (Mafer: GoGreen is more B2C; Home keeps
+# sizes up to 4 L and searches it with the general keyword).
+ADDED_SITES = {"Home": ("gogreen",)}
+
+
+def _added(row):
+    return row["source"] in ADDED_SITES.get(row["subindustry"], ())
 NEW_SITES = SITES + ("noon",)
 APIFY_SITES = ("amazon", "noon")
 CLASSES = {"AmazonScraper": "amazon", "MumzworldScraper": "mumzworld", "SacoScraper": "saco",
@@ -236,7 +243,7 @@ def _read(path: Path) -> tuple[list[str], list[dict]]:
         return list(reader.fieldnames or []), rows
 
 
-def test_same_scraper_outputs_give_the_same_rows_except_the_removed_mumzworld(tmp_path):
+def test_same_scraper_outputs_give_the_same_rows_except_the_removed_and_added_sites(tmp_path):
     base_root = _materialize_base(tmp_path)
     base_out, new_out = tmp_path / "base.csv", tmp_path / "new.csv"
     base_is_f6 = _run_base(base_root, tmp_path, base_out)
@@ -249,11 +256,17 @@ def test_same_scraper_outputs_give_the_same_rows_except_the_removed_mumzworld(tm
     assert removed, "the test would prove nothing: the base wrote no Mumzworld rows"
     assert not [r for r in new_rows if r["source"] in REMOVED_SOURCES], "Mumzworld is still scraped"
     base_rows = [r for r in base_rows if r["source"] not in REMOVED_SOURCES]
+    # GoGreen in Home (2026-11-25): rows only the new version writes; every other row is unchanged.
+    added = [r for r in new_rows if _added(r)]
+    assert added, "the test would prove nothing: the new version wrote no GoGreen rows in Home"
+    assert all(r["channel"] == "B2C" for r in added)
+    assert not [r for r in base_rows if _added(r)], "the base already scraped GoGreen in Home"
+    new_rows = [r for r in new_rows if not _added(r)]
 
     if base_is_f6:
         # The base already has F6: same fakes, so every other row must not change at all.
         assert new_header == base_header
-        assert new_rows == base_rows, "the CSV changed against an F6 base (Mumzworld aside)"
+        assert new_rows == base_rows, "the CSV changed against an F6 base (Mumzworld and GoGreen in Home aside)"
     else:
         assert new_header == base_header + ["seller", "origin"]
         for source in [s for s in SITES if s not in REMOVED_SOURCES]:
@@ -275,7 +288,7 @@ def test_same_scraper_outputs_give_the_same_rows_except_the_removed_mumzworld(tm
         assert len(new_rows) == len(base_rows) + sum(r["source"] == "noon" for r in new_rows)
 
     _, cov = _read(tmp_path / "coverage.csv")
-    assert sum(int(r["rows_written"]) for r in cov) == len(new_rows)
+    assert sum(int(r["rows_written"]) for r in cov) == len(new_rows) + len(added)
     assert any(r["error"] == "TimeoutError" and r["site"] == "saco" for r in cov), "the failing keyword was exercised"
     assert {r["subindustry"] for r in cov if r["site"] == "noon"} <= {"Home", "Automotive", "Pets"}
 
@@ -301,6 +314,7 @@ def test_shared_parsers_ai_and_exclusions_are_unchanged(tmp_path):
     for key, base_sites in base_config.TARGET_MAP.items():
         new_sites = new_config.TARGET_MAP[key]
         base_sites = [s for s in base_sites if s not in REMOVED_SITES.get(key, ())]
+        new_sites = [s for s in new_sites if s not in ADDED_SITES.get(key, ())]
         if base_has_noon:  # the base already has F6: no site may change at all
             assert new_sites == base_sites, f"TARGET_MAP[{key!r}] changed"
         else:

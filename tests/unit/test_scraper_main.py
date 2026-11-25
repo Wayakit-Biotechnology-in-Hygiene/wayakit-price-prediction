@@ -175,7 +175,7 @@ def test_success_replaces_the_csv_and_leaves_no_temp(paths):
     assert _main(paths, sleeps=sleeps) == 0
     rows = _rows(paths["out"])
     assert list(rows[0]) == config.CSV_COLUMNS
-    assert {r["source"] for r in rows} == {"amazon", "noon", "saco", "aerosense"}
+    assert {r["source"] for r in rows} == {"amazon", "noon", "saco", "gogreen", "aerosense"}
     assert all(r["product"].startswith("good") for r in rows if r["source"] != "aerosense")
     assert not (paths["out"].parent / "competitors_complete.tmp.csv").exists()
     assert sleeps == [m.SECONDS_BETWEEN_SUBINDUSTRIES] * 3
@@ -224,7 +224,7 @@ FAILURES = {
     "preflight": dict(agent=FakeAgent(preflight_error=m.RelevanceAgentFatalError("fake: no access"))),
     "factory": dict(factory=_boom),
     "zero-rows": dict(factory=_factory({s: (lambda self, k, mode: []) for s in
-                                        ("amazon", "noon", "mumzworld", "saco", "aerosense")})),
+                                        ("amazon", "noon", "mumzworld", "saco", "gogreen", "aerosense")})),
     "failure-rate": dict(agent=FakeAgent(rate_error=True)),
 }
 
@@ -565,9 +565,35 @@ def test_overwrite_onto_a_pre_f6_file_replaces_it(paths):
     assert list(_rows(paths["out"])[0]) == config.CSV_COLUMNS
 
 
+def test_gogreen_in_b2c_needs_no_site_keyword_and_is_told_the_channel(paths):
+    # Mafer, 2026-11-25: GoGreen in Home, searched with the general keyword (its own search
+    # ignores the query); B2B still needs a site-specific keyword or general modifiers.
+    _write_instructions(paths, [
+        INSTRUCTIONS[0],  # Home, no modifiers
+        {"Type of product": "G1-Floor cleaner", "Sub industry": "Gyms", "Industry": "Sports",
+         "Generic product type": "Floor cleaner", "Search Modifiers": ""},
+    ])
+    created = []
+
+    def factory(browser, agent):
+        scrapers = _factory(created=created)(browser, agent)
+        scrapers["gogreen"].channels = []
+        scrapers["gogreen"].set_channel = scrapers["gogreen"].channels.append
+        return scrapers
+
+    assert _main(paths, factory=factory) == 0
+    gyms, home = created  # one set of scrapers per subindustry, in groupby order
+    assert (gyms["gogreen"].channels, gyms["gogreen"].calls) == (["B2B"], [])
+    assert (home["gogreen"].channels, home["gogreen"].calls) == (["B2C"], [("floor cleaner", "volume")])
+    gogreen = [r for r in _rows(paths["out"]) if r["source"] == "gogreen"]
+    assert gogreen and {(r["subindustry"], r["channel"]) for r in gogreen} == {("Home", "B2C")}
+    assert not [r for r in _rows(paths["out"]) if r["subindustry"] == "Gyms"]
+
+
 def test_target_map_noon_only_in_home_automotive_and_pets():
     assert {k for k, v in config.TARGET_MAP.items() if "noon" in v} == {"Home", "Automotive", "Pets"}
-    assert config.TARGET_MAP["Home"] == ["amazon", "saco", "noon"]  # Mumzworld removed 2026-11-25 (HTTP 403)
+    # Mumzworld removed 2026-11-25 (HTTP 403); GoGreen added the same day (B2C, up to 4 L)
+    assert config.TARGET_MAP["Home"] == ["amazon", "saco", "noon", "gogreen"]
     assert not any("mumzworld" in v for v in config.TARGET_MAP.values())
     assert config.TARGET_MAP["Automotive"] == ["amazon", "saco", "noon"]
     assert config.TARGET_MAP["Pets"] == ["amazon", "noon"]

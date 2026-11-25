@@ -76,7 +76,7 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 
 ## Sources
 
-Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `scraper/main.py:364-365`: B2C if the subindustry is Home, Automotive or Pets; B2B for all others.
+Comes from `TARGET_MAP` (`scraper/config.py`). The channel is decided by `channel_for()` (`scraper/main.py`): B2C if the subindustry is Home, Automotive or Pets; B2B for all others.
 
 | Site | Channel | Subindustries | Method today | Planned change |
 |---|---|---|---|---|
@@ -85,11 +85,11 @@ Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `s
 | Mumzworld | B2C | — (removed from `TARGET_MAP` on 2026-11-25) | Playwright (browser layer only, parsing unchanged) + Bedrock | Blocked by the site (HTTP 403 to every automated client); Mafer removed it on 2026-11-25. The scraper stays in the code, unused |
 | SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Playwright (browser layer only, parsing unchanged) + Bedrock | None |
 | Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Playwright + Bedrock | None |
-| GoGreen (gogreen.com.sa) | B2B | Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities | Playwright + Bedrock | Arabic-only store whose search ignores the query: the whole catalog (about 170 products) is read and the relevance AI picks by keyword; sizes from the Arabic titles (2026-11-25) |
+| GoGreen (gogreen.com.sa) | B2C / B2B | Home (B2C, sizes up to 4 L, since 2026-11-25); Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities (B2B, every size) | Playwright + Bedrock | Arabic-only store whose search ignores the query: the whole catalog (about 170 products) is read and the relevance AI picks by keyword; sizes from the Arabic titles (2026-11-25) |
 | OfficeSupply (officesupply.sa) | B2B | Facilities management, Faith, Gyms, Spas and salons, Hotels, Industrial facilities | Playwright + Bedrock | None |
 | AeroSense (aero-sense.com) | B2B | Aviation | Playwright, no AI filter (product looked up on the shop index since 2026-11-25) | None |
 
-Note: `Land Transportation` (`config.py:19`) does not match `Land transportation` in the CSV, so today that subindustry is never scraped.
+Note: `Land Transportation` (in `TARGET_MAP`, `scraper/config.py`) does not match `Land transportation` in the CSV, so today that subindustry is never scraped.
 
 ## How to run it locally
 
