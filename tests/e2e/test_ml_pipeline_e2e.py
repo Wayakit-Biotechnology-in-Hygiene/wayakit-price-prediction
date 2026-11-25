@@ -122,8 +122,9 @@ def test_clamp_to_market_range(report):
 
     # With >= 3 competitors and a model price > 0, the price stays within the SKU's band
     # [min, p75 x size] (F7a), unless the margin floor lifts it above the ceiling (the floor always
-    # wins). The ceiling applies at every size; a size above the market's size range is never
-    # lifted to the minimum (the report does not say which side, so outside rows skip that check).
+    # wins). The ceiling applies at every size; a volumetric size above the market's size range is
+    # never lifted to the minimum, a pack of pieces is (the report does not say which side, so
+    # outside rows skip that check).
     assert (report["market_p75_found"] <= report["market_max_found"] + ROUND_TOL).all()
     clamped_rows = ~few & (report["predicted_price_per_unit"] > 0)
     assert clamped_rows.any(), "no product went through the clamp; the check would prove nothing"

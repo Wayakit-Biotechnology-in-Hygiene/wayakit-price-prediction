@@ -13,47 +13,35 @@
   "changes": [
     {
       "file": "ml_model/wayakit_prediction_report.csv",
-      "type": "column_added",
-      "column": "ceiling_source",
+      "type": "value_changed",
+      "column": "predicted_price",
+      "key": "FP-AUT-01800#0",
+      "subindustry": "Automotive",
       "expected_cells": 1,
-      "reason": "F7b: where each B2C ceiling came from ('reference': Saudi reference prices; 'all'; '' without a band). Not uploaded to Odoo.",
-      "date": "2026-11-24",
+      "reason": "2026-11-25: a pack of pieces above the market's size range is lifted to the type's minimum (volumetric sizes keep the F7a exemption). On the F1 data only the 20-unit microfiber pack changes: 35.90 -> 65.13.",
+      "date": "2026-11-25",
       "approved_by": "Mafer"
     },
     {
-      "file": "ml_model/competitor_volumetric_processed.csv",
-      "type": "column_added",
-      "column": "origin",
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "porcentaje_de_ganancia",
+      "key": "FP-AUT-01800#0",
+      "subindustry": "Automotive",
       "expected_cells": 1,
-      "reason": "F7b: scraper origin (local / imported / unknown) carried by 1a; 'unknown' for Odoo rows and pre-F6 files.",
-      "date": "2026-11-24",
+      "reason": "2026-11-25: a pack of pieces above the market's size range is lifted to the type's minimum (volumetric sizes keep the F7a exemption). On the F1 data only the 20-unit microfiber pack changes: 35.90 -> 65.13.",
+      "date": "2026-11-25",
       "approved_by": "Mafer"
     },
     {
-      "file": "ml_model/competitor_volumetric_processed.csv",
-      "type": "column_added",
-      "column": "source_channel",
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "clamped_to_market",
+      "key": "FP-AUT-01800#0",
+      "subindustry": "Automotive",
       "expected_cells": 1,
-      "reason": "F7b: raw Odoo channel (retail / ecommerce / b2b) carried by 1a; empty for scraper rows and pre-F7b Odoo files.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/competitor_unit_processed.csv",
-      "type": "column_added",
-      "column": "origin",
-      "expected_cells": 1,
-      "reason": "F7b: scraper origin (local / imported / unknown) carried by 1a; 'unknown' for Odoo rows and pre-F6 files.",
-      "date": "2026-11-24",
-      "approved_by": "Mafer"
-    },
-    {
-      "file": "ml_model/competitor_unit_processed.csv",
-      "type": "column_added",
-      "column": "source_channel",
-      "expected_cells": 1,
-      "reason": "F7b: raw Odoo channel (retail / ecommerce / b2b) carried by 1a; empty for scraper rows and pre-F7b Odoo files.",
-      "date": "2026-11-24",
+      "reason": "2026-11-25: a pack of pieces above the market's size range is lifted to the type's minimum (volumetric sizes keep the F7a exemption). On the F1 data only the 20-unit microfiber pack changes: 35.90 -> 65.13.",
+      "date": "2026-11-25",
       "approved_by": "Mafer"
     }
   ]
