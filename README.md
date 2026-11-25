@@ -14,7 +14,7 @@ flowchart TD
     EC2 -->|"ec2-user crontab<br/>Fri and Sat 04:00 UTC"| E1["run_pipeline.sh, stage 1<br/>Odoo products → analysis-odoo.csv"]
     E1 --> R["Manual review<br/>editing analysis-odoo.csv through git"]
     R --> E2["run_pipeline.sh --stage 2<br/>git pull"]
-    E2 --> SC["scraper/main.py<br/>Amazon, Mumzworld, SACO, B2B sites"]
+    E2 --> SC["scraper/main.py<br/>Amazon, Noon, SACO, B2B sites"]
     SC <-->|relevance and wipes count| G["Gemini"]
     SC --> CSV["scraper/competitors_complete.csv"]
     OD[("Odoo: product.master,<br/>sale.order.line, competitor.product")] --> ML
@@ -59,8 +59,8 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 | Path | What it contains |
 |---|---|
 | `scraper/` | `main.py` (orchestrates the scraping), `config.py` (`TARGET_MAP`, CSV columns, exclusions), `odoo_api_connection_products.py` (generates `analysis-odoo.csv`), `modifiers_mapping.csv` (keywords per product type) |
-| `scraper/scrapers/` | One scraper per site with the signature `scrape(keyword, search_mode) -> list[dict]`: Selenium + BeautifulSoup for Mumzworld, SACO and the B2B stores (AeroSense uses `scrape(search_term, mode='volume')`, same argument order); since F6 `amazon_apify.py` and `noon_apify.py` on Apify, with their own parsing in `apify_common.py` |
-| `scraper/services/` | `ai_service.py`: `RelevanceAgent` (Bedrock since F2); `apify_client.py` (F6): Apify REST client with per-run caps and the USD 20 run budget |
+| `scraper/scrapers/` | One scraper per site with the signature `scrape(keyword, search_mode) -> list[dict]`: Playwright + BeautifulSoup for Mumzworld, SACO and the B2B stores since 2026-11-25 (Selenium before; AeroSense uses `scrape(search_term, mode='volume')`, same argument order); since F6 `amazon_apify.py` and `noon_apify.py` on Apify, with their own parsing in `apify_common.py` |
+| `scraper/services/` | `ai_service.py`: `RelevanceAgent` (Bedrock since F2); `apify_client.py` (F6): Apify REST client with per-run caps and the USD 20 run budget; `browser.py` (2026-11-25): the shared Playwright browser and its page errors |
 | `ml_model/` | Odoo reads, preprocessing (`1a`, `1b`), training (`2`), prediction (`3`) and upload (`odoo_api_price_suggestion.py`) |
 | `docs/` | Plan, runbook, AWS inventory, decisions and reliability checklist |
 | `run_pipeline.sh` | Pipeline that runs on the instance. Since F3: one run, no arguments (the pre-F2 code on the instance still has stage 1 and `--stage 2`) |
@@ -76,24 +76,24 @@ Except what is marked F2 or F3 (code and scripts only), none of this exists yet;
 
 ## Sources
 
-Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `scraper/main.py:364-365`: B2C if the subindustry is Home, Automotive or Pets; B2B for all others.
+Comes from `TARGET_MAP` (`scraper/config.py`). The channel is decided by `channel_for()` (`scraper/main.py`): B2C if the subindustry is Home, Automotive or Pets; B2B for all others.
 
 | Site | Channel | Subindustries | Method today | Planned change |
 |---|---|---|---|---|
 | Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Apify `junglee/amazon-crawler` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (replaced Selenium) |
 | Noon (noon.com/saudi-en) | B2C | Home, Automotive, Pets (F6) | Apify `saswave/noon-product-scraper` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (new site) |
-| Mumzworld | B2C | Home | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
-| SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Selenium + Gemini | Same; only the AI changes to Bedrock (F2) |
-| Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
-| GoGreen (gogreen.com.sa) | B2B | Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
-| OfficeSupply (officesupply.sa) | B2B | Facilities management, Faith, Gyms, Spas and salons, Hotels, Industrial facilities | Selenium + Gemini | AI to Bedrock (F2) |
-| AeroSense (aero-sense.com) | B2B | Aviation | Selenium, no AI filter | None |
+| Mumzworld | B2C | — (removed from `TARGET_MAP` on 2026-11-25) | Playwright (browser layer only, parsing unchanged) + Bedrock | Blocked by the site (HTTP 403 to every automated client); Mafer removed it on 2026-11-25. The scraper stays in the code, unused |
+| SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Playwright (browser layer only, parsing unchanged) + Bedrock | None |
+| Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Playwright + Bedrock | None |
+| GoGreen (gogreen.com.sa) | B2C / B2B | Home (B2C, sizes up to 4 L, since 2026-11-25); Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities (B2B, every size) | Playwright + Bedrock | Arabic-only store whose search ignores the query: the whole catalog (about 170 products) is read and the relevance AI picks by keyword; sizes from the Arabic titles (2026-11-25) |
+| OfficeSupply (officesupply.sa) | B2B | Facilities management, Faith, Gyms, Spas and salons, Hotels, Industrial facilities | Playwright + Bedrock | None |
+| AeroSense (aero-sense.com) | B2B | Aviation | Playwright, no AI filter (product looked up on the shop index since 2026-11-25) | None |
 
-Note: `Land Transportation` (`config.py:19`) does not match `Land transportation` in the CSV, so today that subindustry is never scraped.
+Note: `Land Transportation` (in `TARGET_MAP`, `scraper/config.py`) does not match `Land transportation` in the CSV, so today that subindustry is never scraped.
 
 ## How to run it locally
 
-Requirements: Python with `requirements.txt` and Chrome installed (`webdriver-manager` downloads the driver). [environment.yml](environment.yml) pins the instance versions (Python 3.10.20):
+Requirements: Python with `requirements.txt` and Google Chrome installed (Playwright drives it; without Chrome, `python -m playwright install chromium`). [environment.yml](environment.yml) pins the instance versions (Python 3.10.20):
 
 - **Local:** `conda env create -f environment.yml` creates the `wayakit-price-prediction` environment. For the tests, also `pip install -r requirements-dev.txt` and, once per clone, `scripts/install_githooks.sh`.
 - **Instance:** the environment is called `wayakit_env` (`run_pipeline.sh:6`; the F3 bootstrap keeps that name). If it has to be recreated there: `conda env create -f environment.yml -n wayakit_env`; without `-n` it creates `wayakit-price-prediction` and the pipeline does not find it. The Odoo scripts read the `prod/wayakit-app` secret (eu-north-1) through `pi_secrets.py` with the default boto3 session, so you need an SSO profile with read permission on that secret. Since F2, `scraper/main.py` calls Bedrock with the same session (`bedrock:InvokeModel`).

@@ -24,9 +24,19 @@ Since F6 was merged into `server-improvement` (2026-11-23) the base itself can h
 same F6 fakes and the CSVs must be identical byte for byte; the per-source projection above only
 applies to a pre-F6 base.
 
-A second test proves the Selenium side of ticket A did not move: `mumzworld_scraper.py`,
-`saco_scraper.py` and `utils.py` are identical to the base, and so are the Mumzworld / SACO
-exclusion lists and every TARGET_MAP entry except the 'noon' additions.
+A second test proves the shared side of ticket A did not move: `utils.py` and `ai_service.py` are
+identical to the base, and so are the Mumzworld / SACO exclusion lists and every TARGET_MAP entry
+except the 'noon' additions.
+
+Since the Playwright migration (Mafer, 2026-11-25, option A: "solo navegador") the Mumzworld and
+SACO scrapers are no longer byte-identical to a Selenium base: only their browser layer changed.
+Instead of the file check, the saved-HTML tests run the BASE scrapers (Selenium, through
+`_fake_selenium`, no browser) and the NEW ones (Playwright, through a fake browser) on the same
+saved search and product pages and require the same rows and the same relevance-AI calls, plus a
+Hypothesis property over product titles for the product-page parsers. When the base is already a
+Playwright version (after this change is merged) the same tests still compare base and new.
+
+Selenium is not installed any more: the base `scraper/main.py` and scrapers import the fake one.
 
 If the base ref does not exist locally the tests FAIL (`git fetch origin`).
 """
@@ -49,6 +59,9 @@ from unittest import mock
 import pytest
 
 from tests.conftest import REPO_ROOT, load_module
+from hypothesis import given, strategies as st
+
+from tests.differential import _fake_selenium
 from tests.differential import _harness as dh
 from tests.e2e import _helpers as h
 
@@ -56,6 +69,17 @@ pytestmark = pytest.mark.differential
 
 ANALYSIS = REPO_ROOT / "scraper" / "analysis-odoo.csv"
 SITES = ("amazon", "mumzworld", "saco", "fine", "gogreen", "officesupply", "aerosense")
+# Sites removed from TARGET_MAP on purpose, with the decision (docs/decisions.md):
+# Mumzworld, 2026-11-25 (Mafer: "quita Mumzworld", HTTP 403 to every automated client).
+REMOVED_SITES = {"Home": ("mumzworld",)}
+REMOVED_SOURCES = {"mumzworld"}
+# Sites added on purpose: GoGreen in Home, 2026-11-25 (Mafer: GoGreen is more B2C; Home keeps
+# sizes up to 4 L and searches it with the general keyword).
+ADDED_SITES = {"Home": ("gogreen",)}
+
+
+def _added(row):
+    return row["source"] in ADDED_SITES.get(row["subindustry"], ())
 NEW_SITES = SITES + ("noon",)
 APIFY_SITES = ("amazon", "noon")
 CLASSES = {"AmazonScraper": "amazon", "MumzworldScraper": "mumzworld", "SacoScraper": "saco",
@@ -65,8 +89,8 @@ FAKE_TIME = types.SimpleNamespace(strftime=lambda fmt, *a: "2026-11-14", sleep=l
 ISOLATED_PREFIXES = ("config", "utils", "scrapers", "services")
 # Everything Mumzworld and SACO depend on besides config.py (checked value by value below):
 # their scrapers, the shared parsers and the relevance agent they call.
-UNCHANGED_FILES = ("scraper/scrapers/mumzworld_scraper.py", "scraper/scrapers/saco_scraper.py", "scraper/utils.py",
-                   "scraper/services/ai_service.py")
+UNCHANGED_FILES = ("scraper/utils.py", "scraper/services/ai_service.py")
+FAKE_SELENIUM_PREFIXES = ("selenium", "webdriver_manager")
 
 
 class FakeScraper:
@@ -133,6 +157,24 @@ def isolated_scraper_tree(root: Path):
         sys.path[:] = saved_path
 
 
+@contextlib.contextmanager
+def fake_selenium_installed(site=None):
+    """While inside, `selenium` and `webdriver_manager` are the fakes of `_fake_selenium` serving
+    ``site`` (URL -> HTML); the previous modules (real or absent) are restored on exit."""
+    def ours(name):
+        return any(name == p or name.startswith(p + ".") for p in FAKE_SELENIUM_PREFIXES)
+    saved = {name: mod for name, mod in sys.modules.items() if ours(name)}
+    for name in saved:
+        del sys.modules[name]
+    _fake_selenium.install(site or {})
+    try:
+        yield
+    finally:
+        for name in [n for n in sys.modules if ours(n)]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
 def _materialize_base(tmp: Path) -> Path:
     ref = dh.base_ref()
     try:
@@ -145,7 +187,7 @@ def _run_base(base_root: Path, tmp: Path, out: Path) -> bool:
     """Runs the base scraper into ``out``. Returns True when the base already has the F6 shape."""
     script = base_root / "scraper" / "main.py"
     source = script.read_text(encoding="utf-8")
-    with isolated_scraper_tree(base_root):
+    with isolated_scraper_tree(base_root), fake_selenium_installed():
         if re.search(r"^def main\(argv", source, re.MULTILINE):
             # F2 shape and later: importing has no side effects and `main(argv, ...)` takes the fakes.
             spec = importlib.util.spec_from_file_location("pi_base_scraper_main", script)
@@ -190,7 +232,7 @@ def _run_new(out: Path, cov: Path) -> int:
                         agent_factory=FakeAgent,
                         scraper_factory=lambda d, a: {s: FakeScraper(s, with_new_keys=s in APIFY_SITES)
                                                       for s in NEW_SITES},
-                        driver_installer=lambda: "/fake/chromedriver", sleep=lambda s: None,
+                        browser_factory=lambda: "/fake/browser", sleep=lambda s: None,
                         apify_preflight=lambda: None)
 
 
@@ -201,24 +243,37 @@ def _read(path: Path) -> tuple[list[str], list[dict]]:
         return list(reader.fieldnames or []), rows
 
 
-def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp_path):
+def test_same_scraper_outputs_give_the_same_rows_except_the_removed_and_added_sites(tmp_path):
     base_root = _materialize_base(tmp_path)
     base_out, new_out = tmp_path / "base.csv", tmp_path / "new.csv"
     base_is_f6 = _run_base(base_root, tmp_path, base_out)
     assert _run_new(new_out, tmp_path / "coverage.csv") == 0
     base_header, base_rows = _read(base_out)
     new_header, new_rows = _read(new_out)
+    # Mafer, 2026-11-25: Mumzworld leaves TARGET_MAP (HTTP 403 to every automated client). The
+    # base still writes its rows; the new version writes none and every other row is unchanged.
+    removed = [r for r in base_rows if r["source"] in REMOVED_SOURCES]
+    assert removed, "the test would prove nothing: the base wrote no Mumzworld rows"
+    assert not [r for r in new_rows if r["source"] in REMOVED_SOURCES], "Mumzworld is still scraped"
+    base_rows = [r for r in base_rows if r["source"] not in REMOVED_SOURCES]
+    # GoGreen in Home (2026-11-25): rows only the new version writes; every other row is unchanged.
+    added = [r for r in new_rows if _added(r)]
+    assert added, "the test would prove nothing: the new version wrote no GoGreen rows in Home"
+    assert all(r["channel"] == "B2C" for r in added)
+    assert not [r for r in base_rows if _added(r)], "the base already scraped GoGreen in Home"
+    new_rows = [r for r in new_rows if not _added(r)]
 
     if base_is_f6:
-        # The base already has F6: same fakes, so the CSV must not change at all.
-        assert new_out.read_bytes() == base_out.read_bytes(), "the CSV changed against an F6 base"
+        # The base already has F6: same fakes, so every other row must not change at all.
+        assert new_header == base_header
+        assert new_rows == base_rows, "the CSV changed against an F6 base (Mumzworld and GoGreen in Home aside)"
     else:
         assert new_header == base_header + ["seller", "origin"]
-        for source in SITES:
+        for source in [s for s in SITES if s not in REMOVED_SOURCES]:
             b = [r for r in base_rows if r["source"] == source]
             n = [{k: r[k] for k in base_header} for r in new_rows if r["source"] == source]
             assert n == b, f"{source} rows changed on the base columns ({len(b)} base, {len(n)} new)"
-    for source in ("mumzworld", "saco"):
+    for source in ("saco",):
         n = [r for r in new_rows if r["source"] == source]
         assert n, f"the test would prove nothing: no {source} rows"
         assert all((r["seller"], r["origin"]) == ("", "unknown") for r in n), f"{source} got a seller or origin"
@@ -228,17 +283,17 @@ def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp
     assert amazon and all(r["seller"].startswith("Seller") for r in amazon), "Apify Seller reaches the CSV"
     assert [r for r in new_rows if r["source"] == "noon"], "the new version writes noon rows"
     if not base_is_f6:
-        assert {r["source"] for r in base_rows} <= set(SITES)
+        assert {r["source"] for r in base_rows} <= set(SITES) - REMOVED_SOURCES
         assert not [r for r in base_rows if r["source"] == "noon"], "noon rows exist only in the new version"
         assert len(new_rows) == len(base_rows) + sum(r["source"] == "noon" for r in new_rows)
 
     _, cov = _read(tmp_path / "coverage.csv")
-    assert sum(int(r["rows_written"]) for r in cov) == len(new_rows)
+    assert sum(int(r["rows_written"]) for r in cov) == len(new_rows) + len(added)
     assert any(r["error"] == "TimeoutError" and r["site"] == "saco" for r in cov), "the failing keyword was exercised"
     assert {r["subindustry"] for r in cov if r["site"] == "noon"} <= {"Home", "Automotive", "Pets"}
 
 
-def test_selenium_scrapers_parsers_and_exclusions_are_unchanged(tmp_path):
+def test_shared_parsers_ai_and_exclusions_are_unchanged(tmp_path):
     ref = dh.base_ref()
     if h.resolve_ref(ref) is None:
         pytest.fail(f"the ref '{ref}' does not exist locally (git fetch origin?)", pytrace=False)
@@ -253,13 +308,233 @@ def test_selenium_scrapers_parsers_and_exclusions_are_unchanged(tmp_path):
     new_config = load_module("scraper/main.py").config
     assert new_config.MUMZWORLD_EXCLUSIONS == base_config.MUMZWORLD_EXCLUSIONS
     assert new_config.SACO_EXCLUSIONS == base_config.SACO_EXCLUSIONS
-    assert new_config.USER_AGENT == base_config.USER_AGENT  # used by both Selenium scrapers
+    assert new_config.USER_AGENT == base_config.USER_AGENT  # the base Selenium scrapers sent it
     assert set(new_config.TARGET_MAP) == set(base_config.TARGET_MAP)
     base_has_noon = any("noon" in sites for sites in base_config.TARGET_MAP.values())
     for key, base_sites in base_config.TARGET_MAP.items():
         new_sites = new_config.TARGET_MAP[key]
+        base_sites = [s for s in base_sites if s not in REMOVED_SITES.get(key, ())]
+        new_sites = [s for s in new_sites if s not in ADDED_SITES.get(key, ())]
         if base_has_noon:  # the base already has F6: no site may change at all
             assert new_sites == base_sites, f"TARGET_MAP[{key!r}] changed"
         else:
             assert [s for s in new_sites if s != "noon"] == base_sites, f"TARGET_MAP[{key!r}] changed"
     assert new_config.CSV_COLUMNS[:len(base_config.CSV_COLUMNS)] == base_config.CSV_COLUMNS
+
+
+# --- C15 after the Playwright migration: same saved HTML, same Mumzworld and SACO rows ---------------
+MUMZ = "https://www.mumzworld.com/sa-en/"
+SACO = "https://www.saco.sa/en/"
+
+
+def _mumz_search(products):
+    cards = "".join(f'<div class="ProductCard_productCard__x1Ab"><a class="ProductCard_productName__q9" '
+                    f'href="{href}">{href}</a></div>' for href in products)
+    return f"<html><body><div>{cards}</div></body></html>"
+
+
+def _mumz_product(name, price="1,234"):
+    title = f'<h1 class="ProductDetails_productName__lcVK_">{name}</h1>' if name is not None else "<h2>gone</h2>"
+    price_html = f'<span class="Price_integer__z1">{price}</span>' if price is not None else ""
+    return f"<html><body>{title}<div>{price_html}<span class='Price_decimal__z'>.50</span></div></body></html>"
+
+
+MUMZ_TITLES = [
+    "Pigeon - Baby Bottle Cleaner 500ml", "Johnson's Baby Shampoo 300 ml Pack of 3", "Dettol Kids Wash 250ml x 2",
+    "Mustela Cleansing Water 1L", "Some Toy Car", "Chicco - Bottle Wash 1 Liter", "Huggies - Baby Wipes 56 wipes Pack of 3",
+    "Pampers Sensitive 52 count", "WaterWipes 60s", "Mothercare Laundry Liquid 2 L of 2", "Sebamed Baby Lotion 200 ml",
+    "Toy Brush Set", "Philips Avent Bottle Cleaner 3 x 250 ml",
+] + [f"Brand{n} - Bottle Wash {n * 100} ml" for n in range(1, 7)] + [f"Brand{n} Baby Wipes {n * 10} wipes" for n in range(1, 9)]
+MUMZ_SITE = {f"{MUMZ}search?q={k}": _mumz_search([f"/sa-en/p{i}" for i in range(len(MUMZ_TITLES))] + ["/sa-en/p0"])
+             for k in ("bottle%20cleaner", "baby%20wipes")}
+MUMZ_SITE.update({f"{MUMZ}p{i}": _mumz_product(t, price=None if i == 3 else f"{i},0{i}") for i, t in enumerate(MUMZ_TITLES)})
+MUMZ_SITE[f"{MUMZ}p5"] = _mumz_product(None)  # a product page whose title never appears: skipped by both
+MUMZ_SEARCHES = [("bottle cleaner", "volume"), ("baby wipes", "units")]
+
+
+def _saco_search(hrefs):
+    cards = "".join(f'<div><a href="{h}"><img/></a><a href="{h}">title</a></div>' for h in hrefs)
+    return f"<html><body>{cards}<a href='/en/category/x'>cat</a></body></html>"
+
+
+def _saco_jsonld(name, price=None, brand=None, offers_as_list=False, extra_invalid=False):
+    data = {"@type": "Product", "name": name}
+    if price is not None:
+        offer = {"price": price}
+        data["offers"] = [offer] if offers_as_list else offer
+    if brand is not None:
+        data["brand"] = {"name": brand}
+    invalid = '<script type="application/ld+json">{not json</script>' if extra_invalid else ""
+    other = '<script type="application/ld+json">{"@type": "BreadcrumbList"}</script>'
+    import json as _json
+    return (f"<html><head>{invalid}{other}<script type=\"application/ld+json\">{_json.dumps(data)}</script></head>"
+            f"<body><h1>{name} (h1)</h1></body></html>")
+
+
+SACO_PRODUCTS = [
+    _saco_jsonld("DAC Floor Cleaner 4.5 Liter", 24.95, "DAC"),
+    _saco_jsonld("Bona Hardwood Floor Cleaner 946ml", "79", "Bona", offers_as_list=True),
+    _saco_jsonld("Dettol Floor Cleaner 1.8 L", 0, None, extra_invalid=True),
+    "<html><body><h1>Clorox Bleach 3.78 L</h1></body></html>",  # no JSON-LD: the h1 is the title
+    _saco_jsonld("Mop Bucket", 59, "Vileda"),
+    _saco_jsonld("Fine Tissue 200 Sheets x 5", 15.5, "Fine"),
+    _saco_jsonld("Zewa Kitchen Towels 4 Rolls", 22, "Zewa"),
+    _saco_jsonld("Harpic Toilet Cleaner 750 ml", 12.75, "Harpic"),
+    _saco_jsonld("Pril Dish Liquid 1 L", 9.5, "Pril"),
+]
+SACO_SITE = {f"{SACO}products-search?q={k}": _saco_search(
+    [f"/en/product/p{i}" for i in range(len(SACO_PRODUCTS))] + [f"{SACO}product/p0"])
+    for k in ("floor%20cleaner", "tissue")}
+SACO_SITE.update({f"{SACO}product/p{i}": html for i, html in enumerate(SACO_PRODUCTS)})
+SACO_SEARCHES = [("floor cleaner", "volume"), ("tissue", "units")]
+
+
+class RecordingAgent:
+    """Relevance AI stand-in: relevant unless the title says toy or bucket; records every call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def is_relevant(self, title, keyword):
+        self.calls.append((title, keyword))
+        return not any(word in title.lower() for word in ("toy", "bucket"))
+
+
+class SavedPage:
+    def __init__(self):
+        self.url, self.html = "about:blank", ""
+
+    def content(self):
+        return self.html
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+class SavedBrowser:
+    @contextlib.contextmanager
+    def page(self):
+        yield SavedPage()
+
+
+def _saved_fetch(site, browser_module):
+    """The new scrapers' ``fetch_html`` over saved pages: 404 for an unknown URL and
+    ``ElementNotFound`` when no part of ``wait_for`` is in the page (``:has-text`` by its text)."""
+    from bs4 import BeautifulSoup
+
+    def fetch(page, url, wait_for=None, timeout_ms=None):
+        if url not in site:
+            raise browser_module.HttpStatusError(404, url)
+        page.url, page.html = url, site[url]
+        if wait_for:
+            soup = BeautifulSoup(page.html, "html.parser")
+            found = False
+            for part in (p.strip() for p in wait_for.split(", ")):
+                if ":has-text(" in part:
+                    found |= part.split(":has-text(", 1)[1].strip("')\"") in soup.get_text(" ")
+                else:
+                    found |= soup.select_one(part) is not None
+            if not found:
+                raise browser_module.ElementNotFound(f"{wait_for} at {url}")
+        return page.html
+    return fetch
+
+
+def _base_scraper_modules(base_root: Path):
+    """The base Mumzworld and SACO modules, imported from the base tree with fake Selenium. The
+    module objects keep working after the context exits (their names were bound at import)."""
+    with isolated_scraper_tree(base_root), fake_selenium_installed(MUMZ_SITE | SACO_SITE):
+        mumz = importlib.import_module("scrapers.mumzworld_scraper")
+        saco = importlib.import_module("scrapers.saco_scraper")
+    for module in (mumz, saco):
+        if hasattr(module, "time"):
+            module.time = FAKE_TIME  # SACO slept 2-3 s around the cookie banner and the results
+    return mumz, saco
+
+
+def _run_scraper(scraper_cls, browser_arg, searches):
+    agent = RecordingAgent()
+    scraper = scraper_cls(browser_arg, relevance_agent=agent)
+    rows = {f"{k}|{mode}": scraper.scrape(k, mode) for k, mode in searches}
+    return rows, agent.calls
+
+
+def _run_new_scrapers(monkeypatch):
+    load_module("scraper/main.py")
+    from scrapers import mumzworld_scraper, saco_scraper
+    from services import browser as browser_module
+    for module in (mumzworld_scraper, saco_scraper):
+        monkeypatch.setattr(module, "fetch_html", _saved_fetch(MUMZ_SITE | SACO_SITE, browser_module))
+    return mumzworld_scraper, saco_scraper
+
+
+@pytest.fixture(scope="module")
+def base_modules(tmp_path_factory):
+    return _base_scraper_modules(_materialize_base(tmp_path_factory.mktemp("c15")))
+
+
+@pytest.mark.parametrize("site", ["mumzworld", "saco"])
+def test_mumzworld_and_saco_give_the_same_rows_from_the_same_saved_html(base_modules, monkeypatch, site):
+    base_mumz, base_saco = base_modules
+    new_mumz, new_saco = _run_new_scrapers(monkeypatch)
+    if site == "mumzworld":
+        base_cls, new_cls, searches = base_mumz.MumzworldScraper, new_mumz.MumzworldScraper, MUMZ_SEARCHES
+    else:
+        base_cls, new_cls, searches = base_saco.SacoScraper, new_saco.SacoScraper, SACO_SEARCHES
+    # A Selenium base takes a driver path; a Playwright base (after the merge) takes the browser.
+    base_arg = SavedBrowser() if "browser" in inspect.signature(base_cls.__init__).parameters else "/fake/chromedriver"
+    if base_arg != "/fake/chromedriver":
+        for module in base_modules:
+            monkeypatch.setattr(module, "fetch_html", _saved_fetch(MUMZ_SITE | SACO_SITE, sys.modules[
+                new_mumz.collect_products.__module__]), raising=False)
+    base_rows, base_calls = _run_scraper(base_cls, base_arg, searches)
+    new_rows, new_calls = _run_scraper(new_cls, SavedBrowser(), searches)
+    assert new_rows == base_rows
+    assert new_calls == base_calls, "the relevance AI sees the same titles in the same order"
+    assert all(rows for rows in base_rows.values()), "the test would prove nothing: a search gave no rows"
+    limit = 10 if site == "mumzworld" else 6
+    assert any(len(rows) == limit for rows in base_rows.values()), "the product limit was exercised"
+
+
+def test_saco_no_results_page_is_an_empty_search_and_mumzworld_without_cards_raises(monkeypatch):
+    new_mumz, new_saco = _run_new_scrapers(monkeypatch)
+    from services import browser as browser_module
+    site = {f"{SACO}products-search?q=zzq": '<html><body><h2 class="text-lg">No results found!</h2></body></html>',
+            f"{MUMZ}search?q=zzq": "<html><body>blocked</body></html>"}
+    monkeypatch.setattr(new_saco, "fetch_html", _saved_fetch(site, browser_module))
+    monkeypatch.setattr(new_mumz, "fetch_html", _saved_fetch(site, browser_module))
+    assert new_saco.SacoScraper(SavedBrowser(), RecordingAgent()).scrape("zzq", "volume") == []
+    with pytest.raises(browser_module.ElementNotFound):
+        new_mumz.MumzworldScraper(SavedBrowser(), RecordingAgent()).scrape("zzq", "volume")
+
+
+TITLE_WORDS = st.sampled_from(["Baby", "Bottle", "Cleaner", "-", "Wash", "Pack", "of", "x", "X", "Liquid", "Gel",
+                               "Pigeon", "Johnson's", "Toy", "Sensitive", "(", ")", "+", "&", "Fragrance"])
+TITLE_SIZES = st.builds(lambda n, unit, sep: f"{n}{sep}{unit}",
+                        st.sampled_from(["1", "2", "3", "12", "56", "250", "500", "1.5", "0.75", "1,000"]),
+                        st.sampled_from(["ml", "ML", "L", "l", "Liter", "litre", "Ltr", "wipes", "count", "sheets",
+                                         "pcs", "pieces", "s", "pack", "Pack", "oz", "fl oz", "g", "kg"]),
+                        st.sampled_from(["", " "]))
+TITLES = st.lists(st.one_of(TITLE_WORDS, TITLE_SIZES, st.builds(lambda n: f"Pack of {n}", st.integers(1, 24)),
+                            st.builds(lambda n: f"x {n}", st.integers(1, 24))), min_size=1, max_size=8).map(" ".join)
+
+
+@given(title=TITLES, mode=st.sampled_from(["volume", "units"]),
+       price=st.sampled_from(["12", "1,234", "0", "99.50"]))
+def test_product_page_parsers_match_the_base_for_any_title(base_modules, title, mode, price):
+    base_mumz, base_saco = base_modules
+    new_mumz = sys.modules["scrapers.mumzworld_scraper"]
+    new_saco = sys.modules["scrapers.saco_scraper"]
+    url = "https://example.invalid/p"
+    mumz_html = _mumz_product(title, price)
+    saco_html = _saco_jsonld(title, price, "Brand")
+    if hasattr(base_mumz.MumzworldScraper, "_extract_product_details"):  # Selenium base
+        driver = _fake_selenium.FakeDriver({url: mumz_html})
+        base_m = base_mumz.MumzworldScraper("/fake", None)._extract_product_details(driver, url, mode)
+        driver = _fake_selenium.FakeDriver({url: saco_html})
+        base_s = base_saco.SacoScraper("/fake", None)._extract_product_details(driver, url, mode)
+    else:  # Playwright base
+        base_m = base_mumz.parse_product_page(mumz_html, url, mode)
+        base_s = base_saco.parse_product_page(saco_html, url, mode)
+    assert new_mumz.parse_product_page(mumz_html, url, mode) == base_m
+    assert new_saco.parse_product_page(saco_html, url, mode) == base_s

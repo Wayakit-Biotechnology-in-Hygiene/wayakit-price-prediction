@@ -1,347 +1,223 @@
-import time
 import re
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, ElementClickInterceptedException
+from urllib.parse import urldefrag, urljoin, quote
+
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
+
 from utils import parse_volume_string, parse_count_string
-import config
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from webdriver_manager.chrome import ChromeDriverManager
+from services.browser import fetch_html, collect_products, keep_if_relevant, PageLoadError, SiteLayoutChanged
 from log_config import get_logger
 
 logger = get_logger()
 
+BASE_URL = "https://ksa.finestore.com/en"
+LINK_SELECTOR = "div.listing-page a.display-flex"
+NO_RESULTS_TEXT = "No results found"
+NO_RESULTS_SELECTOR = f"div.listing-page-item-container :text('{NO_RESULTS_TEXT}')"
+NAME_SELECTOR = "div.ecomz-product-name-style"
+# The product page is rendered by Angular after load: wait until the price shows its currency.
+PRICE_READY_SELECTOR = "div.ecomz-product-price-style:has-text('SAR')"
+MAX_SEARCH_PAGES = 5
+
+
+def _safe_get_text(element):
+    return element.get_text(strip=True) if element else None
+
+
+def search_url(keyword):
+    return f"{BASE_URL}/products?keyword={quote(keyword)}"
+
+
+def parse_search_results(html, page_url):
+    """``(product URLs, next page URL or None)`` of a search page; ([], None) for 'No results'.
+
+    A page with neither product links nor the no-results notice raises ``SiteLayoutChanged``.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    urls = []
+    for link in soup.select(LINK_SELECTOR):
+        href = link.get('href')
+        if href:
+            url = urljoin(page_url, href)
+            if url not in urls:
+                urls.append(url)
+    if not urls:
+        if NO_RESULTS_TEXT in soup.get_text(' ', strip=True):
+            return [], None
+        raise SiteLayoutChanged("Fine search page without product links or no-results notice")
+    return urls, next_page_url(soup, page_url)
+
+
+def next_page_url(soup, page_url):
+    """URL of the "Next" pagination link, or None.
+
+    Only an <a> whose own text is "Next" counts (a product titled "NextGen ..." does not), with a
+    real href that leads to another page (not '#', 'javascript:' or the current page). The live
+    site showed no such link on 2026-11-25 (one results page), so this usually returns None, like
+    the Selenium version when it found no "Next" element.
+    """
+    current = urldefrag(page_url)[0]
+    for link in soup.find_all('a', href=True):
+        own_text = ''.join(link.find_all(string=True, recursive=False)).strip()
+        href = link['href'].strip()
+        if own_text != 'Next' or not href or href.startswith(('#', 'javascript')):
+            continue
+        target = urldefrag(urljoin(page_url, href))[0]
+        if target != current:
+            return target
+    return None
+
+
+def extract_price(soup):
+    price_element = soup.select_one("div.ecomz-product-price-style")
+    if price_element:
+        text = price_element.get_text(separator=' ', strip=True)
+        sar_match = re.search(r'SAR\s*([\d.,]+)', text, re.I)
+        if sar_match:
+            return sar_match.group(1).replace(',', '')
+    return '0.00'
+
+
+def extract_product_specs(soup):
+    """``(base volume parsed from the spec table or None, pack multiplier)``."""
+    base_volume_data = None
+    multiplier = 1
+    for row in soup.select("div.product-tr"):
+        cells = row.select("div.product-cell")
+        if len(cells) != 2:
+            continue
+        label = (_safe_get_text(cells[0]) or '').lower()
+        value = (_safe_get_text(cells[1]) or '').strip()
+        if not label or not value:
+            continue
+        if ("ml" in label or "ml of" in label) and not base_volume_data:
+            base_volume_data = parse_volume_string(value)
+        elif ("l" in label or "liters" in label or "ltr" in label) and not base_volume_data:
+            base_volume_data = parse_volume_string(value)
+        if not any(term in label for term in ['number of sheets', 'number of wipes', 'number of pieces',
+                                              'volume', 'capacity', 'content', 'size']):
+            if not re.search(r'(\d+)\s*(ml|l|ltr|liter|liters|gallons?|fl\s?oz)\b', value, re.I):
+                m_pack = re.search(r'\b(\d+)\b', value)
+                if m_pack and 2 <= int(m_pack.group(1)) <= 50:
+                    multiplier = int(m_pack.group(1))
+    return base_volume_data, multiplier
+
+
+def extract_units_data(soup, product_title):
+    for row in soup.select("div.product-tr"):
+        cells = row.select("div.product-cell")
+        if len(cells) != 2:
+            continue
+        label = (_safe_get_text(cells[0]) or '').lower()
+        value = (_safe_get_text(cells[1]) or '').strip()
+        if any(term in label for term in ['number of sheets', 'number of wipes', 'number of pieces', 'count', 'pcs']):
+            match = re.search(r'(\d+)', value)
+            if match:
+                sheets_count = int(match.group(1))
+                return {'quantity': sheets_count, 'unit': 'units', 'normalized': sheets_count}
+    return parse_count_string(product_title)
+
+
+def extract_title_multiplier(title):
+    match = re.search(r'[x×]\s*(\d+)\b', title, re.I)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\(carton of \d+x(\d+)\)', title, re.I)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'(\d+)\s+(bottles?|pieces?|units?|pcs?|pack)', title, re.I)
+    if match:
+        return int(match.group(1))
+    return 1
+
+
+def parse_product_page(html, product_url, search_mode):
+    details = {
+        'Product': 'Not found', 'Price_SAR': '0.00', 'Company': 'Fine',
+        'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
+    }
+    soup = BeautifulSoup(html, 'html.parser')
+    details['Product'] = (
+        _safe_get_text(soup.select_one("span.mg-l-0.f-xs-18")) or
+        _safe_get_text(soup.select_one(NAME_SELECTOR)) or
+        _safe_get_text(soup.select_one("h1")) or
+        details['Product']
+    )
+    details['Price_SAR'] = extract_price(soup)
+
+    if search_mode == 'units':
+        final_data = extract_units_data(soup, details['Product'])
+        _, spec_multiplier = extract_product_specs(soup)
+        multiplier = max(spec_multiplier, extract_title_multiplier(details['Product']))
+    else:
+        base_volume_data, multiplier = extract_product_specs(soup)
+        multiplier = max(multiplier, extract_title_multiplier(details['Product']))
+        final_data = (base_volume_data or
+                      parse_volume_string(details['Product']) or
+                      parse_count_string(details['Product']))
+
+    if final_data:
+        details['Unit of measurement'] = final_data['unit']
+        details['Total quantity'] = final_data['quantity'] * multiplier
+    return details
+
+
+def is_valid_product(details):
+    """``(valid, reason)``: a positive price and quantity and a product name."""
+    try:
+        if float(str(details.get('Price_SAR', '0')).replace(',', '')) <= 0:
+            return False, "Invalid price"
+    except ValueError:
+        return False, "Invalid price format"
+    if details.get('Total quantity', 0) <= 0:
+        return False, "Invalid quantity"
+    if details.get('Product', '') == 'Not found':
+        return False, "Product name not found"
+    return True, "Valid"
+
 
 class FineScraper:
-    def __init__(self, driver_path, relevance_agent):
-        self.driver_path = driver_path
+    def __init__(self, browser, relevance_agent):
+        self.browser = browser
         self.relevance_agent = relevance_agent
-        self.base_url = "https://ksa.finestore.com/en"
         self.products_to_find_limit = 6
 
-    def _log(self, msg):
-        logger.info(msg)
-
-    def _safe_get_text(self, element):
-        return element.get_text(strip=True) if element else None
-
-    def _close_modal(self):
-        try:
-            js_script = 'document.querySelectorAll(".newsletter, .subscribe, .popup, .ecomz-popup, .modal, .overlay").forEach(function(e){e.style.display="none"});'
-            self.driver.execute_script(js_script)
-            time.sleep(0.3)
-            return True
-        except Exception:
-            return False
-
-    def _extract_price(self, soup):
-        try:
-            price_element = soup.select_one("div.ecomz-product-price-style")
-            if price_element:
-                text = price_element.get_text(separator=' ', strip=True)
-                sar_match = re.search(r'SAR\s*([\d.,]+)', text, re.I)
-                if sar_match:
-                    return sar_match.group(1).replace(',', '')
-        except Exception:
-            pass
-        return '0.00'
-
-    def _extract_product_specs(self, soup):
-        base_volume_data = None
-        multiplier = 1
-        
-        description_rows = soup.select("div.product-tr")
-        for row in description_rows:
-            try:
-                cells = row.select("div.product-cell")
-                if len(cells) != 2:
-                    continue
-                    
-                label = (self._safe_get_text(cells[0]) or '').lower()
-                value = (self._safe_get_text(cells[1]) or '').strip()
-                
-                if not label or not value:
-                    continue
-
-                if ("ml" in label or "ml of" in label) and not base_volume_data:
-                    base_volume_data = parse_volume_string(value)
-                elif ("l" in label or "liters" in label or "ltr" in label) and not base_volume_data:
-                    base_volume_data = parse_volume_string(value)
-
-                if not any(term in label for term in ['number of sheets', 'number of wipes', 'number of pieces', 'volume', 'capacity', 'content', 'size']):
-                    if not re.search(r'(\d+)\s*(ml|l|ltr|liter|liters|gallons?|fl\s?oz)\b', value, re.I):
-                        m_pack = re.search(r'\b(\d+)\b', value)
-                        if m_pack:
-                            potential_multiplier = int(m_pack.group(1))
-                            if 2 <= potential_multiplier <= 50:
-                                multiplier = potential_multiplier
-                            
-            except Exception:
-                continue
-                
-        return base_volume_data, multiplier
-
-    def _extract_units_data(self, soup, product_title):
-        description_rows = soup.select("div.product-tr")
-        
-        for row in description_rows:
-            try:
-                cells = row.select("div.product-cell")
-                if len(cells) != 2:
-                    continue
-                    
-                label = (self._safe_get_text(cells[0]) or '').lower()
-                value = (self._safe_get_text(cells[1]) or '').strip()
-                
-                if any(term in label for term in ['number of sheets', 'number of wipes', 'number of pieces', 'count', 'pcs']):
-                    match = re.search(r'(\d+)', value)
-                    if match:
-                        sheets_count = int(match.group(1))
-                        return {'quantity': sheets_count, 'unit': 'units', 'normalized': sheets_count}
-            except Exception:
-                continue
-        
-        return parse_count_string(product_title)
-
-    def _extract_title_multiplier(self, title):
-        try:
-            match = re.search(r'[x×]\s*(\d+)\b', title, re.I)
-            if match:
-                return int(match.group(1))
-            
-            match = re.search(r'\(carton of \d+x(\d+)\)', title, re.I)
-            if match:
-                return int(match.group(1))
-            
-            match = re.search(r'(\d+)\s+(bottles?|pieces?|units?|pcs?|pack)', title, re.I)
-            if match:
-                return int(match.group(1))
-                
-        except Exception:
-            pass
-        return 1
-
-    def _extract_product_details(self, driver, product_url, search_mode):
-        details = {
-            'Product': 'Not found', 'Price_SAR': '0.00', 'Company': 'Fine',
-            'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
-        }
-        
-        try:
-            for _ in range(2):
-                try:
-                    WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.ecomz-product-name-style"))
-                    )
-                    break
-                except TimeoutException:
-                    self._close_modal()
-                    time.sleep(0.5)
-
-            try:
-                WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.ecomz-product-price-style"))
-                )
-            except TimeoutException:
-                pass
-
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-            details['Product'] = (
-                self._safe_get_text(soup.select_one("span.mg-l-0.f-xs-18")) or
-                self._safe_get_text(soup.select_one("div.ecomz-product-name-style")) or
-                self._safe_get_text(soup.select_one("h1")) or
-                details['Product']
-            )
-
-            details['Price_SAR'] = self._extract_price(soup)
-
-            if search_mode == 'units':
-                final_data = self._extract_units_data(soup, details['Product'])
-                _, spec_multiplier = self._extract_product_specs(soup)
-                title_multiplier = self._extract_title_multiplier(details['Product'])
-                multiplier = max(spec_multiplier, title_multiplier)
-            else:
-                base_volume_data, multiplier = self._extract_product_specs(soup)
-                title_multiplier = self._extract_title_multiplier(details['Product'])
-                multiplier = max(multiplier, title_multiplier)
-                
-                final_data = (base_volume_data or 
-                             parse_volume_string(details['Product']) or 
-                             parse_count_string(details['Product']))
-
-            if final_data:
-                details['Unit of measurement'] = final_data['unit']
-                details['Total quantity'] = final_data['quantity'] * multiplier
-
-        except Exception as e:
-            logger.error(f"      ! Error extracting details from {product_url}", exc_info=True)
-
-        return details
-
-    def _is_valid_product(self, product_details):
-        try:
-            price_val = float(product_details.get('Price_SAR', '0').replace(',', ''))
-            if price_val <= 0:
-                return False, "Invalid price"
-        except (ValueError, AttributeError):
-            return False, "Invalid price format"
-        
-        if product_details.get('Total quantity', 0) <= 0:
-            return False, "Invalid quantity"
-            
-        if product_details.get('Product', '') == 'Not found':
-            return False, "Product name not found"
-            
-        return True, "Valid"
-
-    def _navigate_to_product(self, driver, link_element, href):
-        for attempt in range(2):
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link_element)
-                time.sleep(0.4)
-                
-                try:
-                    link_element.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", link_element)
-                
-                WebDriverWait(driver, 12).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.ecomz-product-name-style"))
-                )
-                return True
-                
-            except Exception:
-                if attempt == 0:
-                    self._close_modal()
-                    if href:
-                        try:
-                            absolute_url = urljoin(self.base_url, href)
-                            driver.get(absolute_url)
-                            WebDriverWait(driver, 12).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "div.ecomz-product-name-style"))
-                            )
-                            return True
-                        except Exception:
-                            continue
-                
-        return False
-
     def scrape(self, keyword, search_mode):
-        self._log(f"  [Fine Scraper] Searching for: '{keyword}' (Mode: {search_mode})")
-        
-        search_url = f"{self.base_url}/products?keyword={quote(keyword)}"
-        all_found_products = []
-        page_num = 1
+        logger.info(f"  [Fine Scraper] Searching for: '{keyword}' (Mode: {search_mode})")
+        relevant = keep_if_relevant(self.relevance_agent, keyword)
 
-        service = ChromeService(executable_path=self.driver_path)
-        options = webdriver.ChromeOptions()
-        options.add_experimental_option('excludeSwitches', ['enable-automation'])
-        options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument('--disable-notifications')
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-webgl')
-        options.add_argument('--disable-3d-apis')
-        options.add_argument(f"user-agent={config.USER_AGENT}")
-        options.add_argument('--log-level=3')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-extensions ')
-        options.add_argument('--disable-browser-side-navigation')
-        options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        
-        self.driver = webdriver.Chrome(service=service, options=options)
+        def keep(details):
+            valid, reason = is_valid_product(details)
+            if not valid:
+                logger.info(f"      -> Validation failed: {reason}")
+                return False
+            return relevant(details)
 
-        try:
-            self.driver.get(search_url)
-        except Exception as e:
-            logger.error(f"    ! Error loading search URL", exc_info=True)
-            return []
+        found, visited_pages, seen_products = [], set(), set()
+        with self.browser.page() as page:
 
-        while len(all_found_products) < self.products_to_find_limit:
-            try:
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.listing-page a.display-flex"))
-                )
-                
-                search_page_url = self.driver.current_url
-                time.sleep(1.5)
+            def details(url):
+                return parse_product_page(fetch_html(page, url, wait_for=PRICE_READY_SELECTOR, timeout_ms=12_000),
+                                          url, search_mode)
 
-                link_elements = self.driver.find_elements(By.CSS_SELECTOR, "div.listing-page a.display-flex")
-                num_products = len(link_elements)
-                
-                logger.debug(f"      -> Found {num_products} products on search page")
-                
-                if num_products == 0:
+            next_url = search_url(keyword)
+            for page_number in range(1, MAX_SEARCH_PAGES + 1):
+                if next_url is None or next_url in visited_pages or len(found) >= self.products_to_find_limit:
                     break
-
-                for i in range(num_products):
-                    if len(all_found_products) >= self.products_to_find_limit:
-                        break
-                        
-                    logger.debug(f"      -> Processing product {i+1}/{num_products}")
-                        
-                    try:
-                        fresh_links = self.driver.find_elements(By.CSS_SELECTOR, "div.listing-page a.display-flex")
-                        if i >= len(fresh_links):
-                            break
-                            
-                        link_element = fresh_links[i]
-                        href = link_element.get_attribute('href')
-
-                        if not self._navigate_to_product(self.driver, link_element, href):
-                            logger.warning(f"      -> Could not navigate to product")
-                            continue
-
-                        self._close_modal()
-                        product_url = self.driver.current_url
-                        product_details = self._extract_product_details(self.driver, product_url, search_mode)
-                        
-                        logger.debug(f"      -> Extracted: {product_details['Product'][:50]}... | Price: {product_details['Price_SAR']} | Qty: {product_details['Total quantity']}")
-
-                        is_valid, validation_msg = self._is_valid_product(product_details)
-                        if not is_valid:
-                            logger.info(f"      -> Validation failed: {validation_msg}")
-                            continue
-
-                        logger.debug(f"      -> Checking AI relevance...")
-                        if self.relevance_agent.is_relevant(product_details.get('Product'), keyword):
-                            all_found_products.append(product_details)
-                            logger.info(f"      -> Product found: {product_details['Product'][:60]}...")
-                        else:
-                            logger.info(f"      -> AI rejected product")
-
-                    except (StaleElementReferenceException, ElementClickInterceptedException, TimeoutException):
-                        continue
-                    finally:
-                        try:
-                            self.driver.get(search_page_url)
-                            WebDriverWait(self.driver, 8).until(
-                                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.listing-page a.display-flex"))
-                            )
-                            time.sleep(0.5)
-                        except Exception:
-                            pass
-
+                visited_pages.add(next_url)
                 try:
-                    next_page_button = self.driver.find_element(By.XPATH, "//a[contains(text(), 'Next')]")
-                    self.driver.execute_script("arguments[0].click();", next_page_button)
-                    page_num += 1
-                except NoSuchElementException:
+                    html = fetch_html(page, next_url, wait_for=f"{LINK_SELECTOR}, {NO_RESULTS_SELECTOR}")
+                    product_urls, next_url = parse_search_results(html, next_url)
+                    product_urls = [url for url in product_urls if url not in seen_products]
+                    seen_products.update(product_urls)
+                    logger.info(f"    > {len(product_urls)} new products on results page {page_number}.")
+                    found += collect_products(product_urls, details, keep,
+                                              self.products_to_find_limit - len(found), 'Fine')
+                except PageLoadError as error:
+                    # The first page, or a later one with nothing found yet, fails the search; a
+                    # later page keeps what the earlier ones gave (the Selenium version did too).
+                    if page_number == 1 or not found:
+                        raise
+                    logger.warning(f"    ! Fine: results page {page_number} failed ({type(error).__name__}): "
+                                   f"{error}. Keeping the {len(found)} products found before it.")
                     break
-
-            except TimeoutException:
-                break
-            except Exception as e:
-                logger.error(f"    ! Unexpected error", exc_info=True)
-                break
-        
-        if self.driver:
-            self.driver.quit()
-
-        return all_found_products
+        return found
