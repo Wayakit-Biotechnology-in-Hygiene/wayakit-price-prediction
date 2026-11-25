@@ -206,9 +206,6 @@ if SCRAPER_DIR not in sys.path:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 import config
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from services.ai_service import RelevanceAgent, RelevanceAgentError, RelevanceAgentFatalError
 from scrapers.amazon_apify import AmazonApifyScraper
 from scrapers.noon_apify import NoonApifyScraper
@@ -219,6 +216,7 @@ from scrapers.gogreen_scraper import GoGreenScraper
 from scrapers.officesupply_scraper import OfficeSupplyScraper
 from scrapers.aerosense_scraper import AeroSenseScraper
 from services.apify_client import ApifyError, ApifyFatalError, preflight as apify_preflight_default
+from services.browser import BrowserSession
 from log_config import get_logger
 
 logger = get_logger()
@@ -435,25 +433,57 @@ def write_coverage_report(report, path):
         writer.writerows(report)
 
 
-def install_chromedriver():
-    return ChromeDriverManager().install()
+def start_browser():
+    """The run's shared Playwright browser (installed Chrome, else Playwright's Chromium), with the
+    browser's own user agent: ``config.USER_AGENT`` (Chrome 128) contradicts the real Chrome's
+    version headers and AeroSense answers it with HTTP 429. Raises ``BrowserUnavailable`` if
+    neither browser can be launched."""
+    return BrowserSession().start()
 
 
-def make_scrapers(driver_path, ai_agent):
+def make_scrapers(browser, ai_agent):
     return {
         # Apify adapters: construction reads no secret; the shared client is built on first scrape().
-        'amazon': AmazonApifyScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'noon': NoonApifyScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'mumzworld': MumzworldScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'saco': SacoScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'fine': FineScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'gogreen': GoGreenScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'officesupply': OfficeSupplyScraper(driver_path=driver_path, relevance_agent=ai_agent),
-        'aerosense': AeroSenseScraper(driver_path=driver_path),  # does not use the relevance agent
+        'amazon': AmazonApifyScraper(driver_path=None, relevance_agent=ai_agent),
+        'noon': NoonApifyScraper(driver_path=None, relevance_agent=ai_agent),
+        # Browser scrapers (Playwright): one context per scrape() call on the shared browser.
+        'mumzworld': MumzworldScraper(browser, relevance_agent=ai_agent),
+        'saco': SacoScraper(browser, relevance_agent=ai_agent),
+        'fine': FineScraper(browser, relevance_agent=ai_agent),
+        'gogreen': GoGreenScraper(browser, relevance_agent=ai_agent),
+        'officesupply': OfficeSupplyScraper(browser, relevance_agent=ai_agent),
+        'aerosense': AeroSenseScraper(browser),  # does not use the relevance agent
     }
 
 
-def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path, coverage_entries,
+def sites_failing_every_search(coverage_entries):
+    """``{site: searches}`` for each site whose every attempted search ended with an error
+    (for example a site that blocks the browser: 403 on every page)."""
+    attempted, failed = {}, {}
+    for entry in coverage_entries:
+        attempted[entry['site']] = attempted.get(entry['site'], 0) + 1
+        if entry['error']:
+            failed[entry['site']] = failed.get(entry['site'], 0) + 1
+    return {site: n for site, n in attempted.items() if failed.get(site, 0) == n}
+
+
+def log_site_failures(coverage_entries):
+    """Per-site error summary at the end of the run: a site that failed every search is an
+    ERROR (it returned no rows because of the failures, not because nothing matched)."""
+    for site, searches in sites_failing_every_search(coverage_entries).items():
+        errors = sorted({e['error'] for e in coverage_entries if e['site'] == site and e['error']})
+        logger.error(f"Site '{site}' failed every search ({searches} of {searches}): {', '.join(errors)}. "
+                     f"See the 'error' column of the coverage report.")
+    totals = {}
+    for entry in coverage_entries:
+        total, failed = totals.get(entry['site'], (0, 0))
+        totals[entry['site']] = (total + 1, failed + (1 if entry['error'] else 0))
+    for site, (total, failed) in totals.items():
+        if 0 < failed < total:
+            logger.warning(f"Site '{site}': {failed} of {total} searches failed.")
+
+
+def run_scraping(df_instructions, writer, ai_agent, scraper_factory, browser, coverage_entries,
                  sleep=time.sleep, file_handle=None):
     """Scrapes every instruction and writes the rows; returns how many rows were written.
 
@@ -471,7 +501,7 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
             logger.warning(f"There are no instructions for '{sub_industry_group}'.")
             continue
 
-        scrapers = scraper_factory(driver_path, ai_agent)
+        scrapers = scraper_factory(browser, ai_agent)
         all_found_products_for_group = []
 
         for index, row in df_industry_instructions.iterrows():
@@ -509,9 +539,10 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
                         error = type(scrape_error).__name__
                         found_products = []  # Continue with the next site/keyword
                     uses_ai = site_name not in SITES_WITHOUT_AI
-                    # The Selenium scrapers catch every exception internally, so a fatal AI error
-                    # is detected through the agent, not only through the call above. The Apify
-                    # adapters let every error propagate (ApifyFatalError is caught above).
+                    # The browser scrapers call is_relevant(), which records a fatal AI error in the
+                    # agent and returns False instead of raising, so a fatal AI error is detected
+                    # through the agent, not only through the call above. Every scraper lets the
+                    # other errors propagate (page and parsing errors are caught above).
                     fatal = ai_agent.fatal_error or raised_fatal
                     if fatal is not None:
                         coverage_entries.append(coverage_entry(
@@ -556,7 +587,7 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, driver_path
     return rows_total
 
 
-def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep,
+def _run(args, coverage_entries, agent_factory, scraper_factory, browser_factory, sleep,
          apify_preflight=apify_preflight_default):
     """The scraping run; returns the exit code. The final CSV is only replaced on success."""
     try:
@@ -570,14 +601,27 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
         logger.error(f"Error reading '{args.analysis_file}'.", exc_info=True)
         return 1
 
-    logger.info("Downloading and configuring ChromeDriver...")
+    logger.info("Starting the browser (Playwright)...")
     try:
-        driver_path = driver_installer()
-        logger.info(f"ChromeDriver ready at: {driver_path}")
+        browser = browser_factory()
     except Exception:
-        logger.critical("Could not install ChromeDriver.", exc_info=True)
+        logger.critical("Could not start the browser (installed Chrome or Playwright's Chromium).", exc_info=True)
         return 1
+    try:
+        return _scrape(args, df_instructions, coverage_entries, agent_factory, scraper_factory, browser,
+                       sleep, apify_preflight)
+    finally:
+        close = getattr(browser, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Could not close the browser cleanly.", exc_info=True)
 
+
+def _scrape(args, df_instructions, coverage_entries, agent_factory, scraper_factory, browser, sleep,
+            apify_preflight):
+    """Preflights, scraping and the final checks, with the browser already started."""
     try:
         ai_agent = agent_factory()
         ai_agent.preflight()
@@ -616,7 +660,7 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
             if write_header:
                 writer.writeheader()
             rows_written = run_scraping(df_instructions, writer, ai_agent, scraper_factory,
-                                        driver_path, coverage_entries, sleep=sleep, file_handle=f)
+                                        browser, coverage_entries, sleep=sleep, file_handle=f)
     except ScrapingAborted as aborted:
         logger.critical(f"Scraping aborted by a fatal error (relevance AI or Apify): {aborted}. "
                         f"'{output_file}' was not modified.")
@@ -660,12 +704,13 @@ def _run(args, coverage_entries, agent_factory, scraper_factory, driver_installe
 
 
 def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrapers,
-         driver_installer=install_chromedriver, sleep=time.sleep,
+         browser_factory=start_browser, sleep=time.sleep,
          apify_preflight=apify_preflight_default):
     """Entry point; returns the exit code (0 only if the output CSV was replaced).
 
-    Tests inject ``agent_factory`` (no Bedrock), ``scraper_factory(driver_path, agent)``,
-    ``driver_installer`` (no Chrome), ``sleep`` and ``apify_preflight`` (no secret, no network).
+    Tests inject ``agent_factory`` (no Bedrock), ``scraper_factory(browser, agent)``,
+    ``browser_factory`` (no browser; its result is closed at the end if it has ``close()``),
+    ``sleep`` and ``apify_preflight`` (no secret, no network).
     """
     args = parse_args(argv)
     logger.info(f"Starting scraping. Output mode: {args.output_mode}")
@@ -675,7 +720,7 @@ def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrape
     coverage_entries = []
     exit_code = 1
     try:
-        exit_code = _run(args, coverage_entries, agent_factory, scraper_factory, driver_installer, sleep,
+        exit_code = _run(args, coverage_entries, agent_factory, scraper_factory, browser_factory, sleep,
                          apify_preflight=apify_preflight)
     finally:
         # Best effort, also after an error or SIGTERM from "timeout": the report says how far it got.
@@ -684,6 +729,7 @@ def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrape
             write_coverage_report(report, args.coverage_file)
             empty = zero_relevant_pairs(report)
             logger.info(f"Coverage report: {len(report)} product x site x keyword rows in '{args.coverage_file}'.")
+            log_site_failures(coverage_entries)
             if empty:
                 logger.warning(f"{len(empty)} product x site x keyword pairs with 0 relevant results:")
                 for row in empty:
@@ -697,7 +743,7 @@ def main(argv=None, *, agent_factory=RelevanceAgent, scraper_factory=make_scrape
 
 
 def _exit_on_sigterm(signum, frame):
-    # "timeout 30h" sends SIGTERM: turn it into SystemExit so the scrapers close Chrome and the
+    # "timeout 30h" sends SIGTERM: turn it into SystemExit so the browser is closed and the
     # coverage report is still written. The previous CSV is untouched.
     raise SystemExit(128 + signum)
 

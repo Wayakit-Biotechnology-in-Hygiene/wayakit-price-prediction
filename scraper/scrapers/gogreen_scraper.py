@@ -1,160 +1,108 @@
-import time
 import re
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote
+
+from bs4 import BeautifulSoup
+
 from utils import parse_volume_with_multiplier, parse_count_string
-import config
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from webdriver_manager.chrome import ChromeDriverManager
+from services.browser import fetch_html, collect_products, keep_if_relevant, SiteLayoutChanged
 from log_config import get_logger
 
 logger = get_logger()
 
+BASE_URL = "https://gogreen.com.sa/"
+RESULT_SELECTOR = "div.product-box"
+NAME_SELECTOR = "h1.title-product"
+# The site runs on the Zid platform: its language dialog only sets this cookie.
+LOCALE_COOKIE = {'name': 'locale', 'value': 'en-sa', 'url': BASE_URL}
+
+
+class LanguageUnavailable(SiteLayoutChanged):
+    """The store does not serve English (since November 2026 it is Arabic-only)."""
+
+
+def page_language(html):
+    tag = BeautifulSoup(html, 'html.parser').find('html')
+    return (tag.get('lang') or '').lower() if tag else ''
+
+
+def parse_search_results(html):
+    """Product URLs of a search results page.
+
+    The store has no "no results" page: a search that matches nothing lists 24 other products
+    (checked 2026-11-25), which the relevance AI then discards. So a page without any product box
+    is not an empty search but a changed or blocked page (``scrape()`` waits for the boxes and
+    raises ``ElementNotFound``), and boxes without the product link raise ``SiteLayoutChanged``.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    urls = []
+    containers = soup.select(RESULT_SELECTOR)
+    for container in containers:
+        link_tag = container.select_one("a.tp-image-product")
+        if link_tag and link_tag.has_attr('href'):
+            url = urljoin(BASE_URL, link_tag['href'])
+            if url not in urls:
+                urls.append(url)
+    if containers and not urls:
+        raise SiteLayoutChanged("GoGreen product boxes without 'a.tp-image-product' links")
+    return urls
+
+
+def parse_product_page(html, product_url, search_mode):
+    details = {
+        'Product': 'Not found', 'Price_SAR': '0.00', 'Company': 'GoGreen',
+        'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
+    }
+    soup = BeautifulSoup(html, 'html.parser')
+    name_tag = soup.select_one(NAME_SELECTOR)
+    product_name = name_tag.get_text(strip=True) if name_tag else None
+    if not product_name:
+        raise SiteLayoutChanged(f"no product name at {product_url}")
+    details['Product'] = product_name
+
+    price_tag = soup.select_one("p.product-formatted-price")
+    if price_tag:
+        # the theme shows the price without decimals (e.g. '182')
+        price_text = re.search(r'([\d,]+(?:\.\d{1,2})?)', price_tag.get_text())
+        if price_text:
+            details['Price_SAR'] = price_text.group(1).replace(',', '')
+
+    parse = parse_count_string if search_mode == 'units' else parse_volume_with_multiplier
+    parsed_data = parse(product_name)
+    if parsed_data:
+        details['Total quantity'] = parsed_data['quantity']
+        details['Unit of measurement'] = parsed_data['unit']
+    return details
+
+
 class GoGreenScraper:
-    def __init__(self, driver_path, relevance_agent):
-        self.driver_path = driver_path
+    def __init__(self, browser, relevance_agent):
+        self.browser = browser
         self.relevance_agent = relevance_agent
-        self.base_url = "https://gogreen.com.sa/"
         self.products_to_find_limit = 5
 
-    def _log(self, msg):
-        logger.info(msg)
+    def _ensure_english(self, page):
+        """Sets the English locale cookie and checks that the store answers in English.
 
-    def _safe_get_text(self, soup_element):
-        return soup_element.get_text(strip=True) if soup_element else None
-
-    def _set_language_to_english(self, driver):
-        # The site now runs on the Zid platform: saving the language in its
-        # dialog only sets the 'locale' cookie, so we set it directly and
-        # reload instead of interacting with the UI.
-        try:
-            html_tag = driver.find_element(By.TAG_NAME, "html")
-            if html_tag.get_attribute("lang") == "en":
-                return True
-            logger.info("    -> Changing language to English (cookie locale=en-sa)...")
-            driver.add_cookie({'name': 'locale', 'value': 'en-sa'})
-            driver.get(self.base_url)
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, "//html[@lang='en']"))
-            )
-            logger.info("    -> SUCCESS! Language verified correctly.")
-            return True
-        except Exception as e:
-            logger.error(f"    -> ERROR: Could not set language to English.", exc_info=True)
-            return False
-
-    def _extract_product_details(self, driver, product_url, search_mode):
-        details = {
-            'Product': 'Not found', 'Price_SAR': '0.00', 'Company': 'GoGreen',
-            'URL': product_url, 'Unit of measurement': 'units', 'Total quantity': 0
-        }
-        try:
-            driver.get(product_url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.title-product")))
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-
-            name_tag = soup.select_one("h1.title-product")
-            product_name = self._safe_get_text(name_tag)
-            details['Product'] = product_name
-
-            price_tag = soup.select_one("p.product-formatted-price")
-            if price_tag:
-                # the new theme shows the price without decimals (e.g. '182')
-                price_text = re.search(r'([\d,]+(?:\.\d{1,2})?)', price_tag.get_text())
-                if price_text:
-                    details['Price_SAR'] = price_text.group(1).replace(',', '')
-
-            if product_name:
-                parsed_data = None
-                if search_mode == 'units':
-                    parsed_data = parse_count_string(product_name)
-                else: 
-                    parsed_data = parse_volume_with_multiplier(product_name)
-
-                if parsed_data:
-                    details['Total quantity'] = parsed_data['quantity']
-                    details['Unit of measurement'] = parsed_data['unit']
-                    logger.debug(f"        -> Quantity extracted: {details['Total quantity']} {details['Unit of measurement']}")
-
-        except Exception as e:
-            logger.error(f"      ! Error extracting details from {product_url}", exc_info=True)
-        
-        return details
+        Titles are parsed for English units and the keywords are English, so an Arabic page
+        raises ``LanguageUnavailable`` instead of returning no rows.
+        """
+        page.context.add_cookies([LOCALE_COOKIE])
+        html = fetch_html(page, BASE_URL, wait_for='html')
+        language = page_language(html)
+        if not language.startswith('en'):
+            raise LanguageUnavailable(f"GoGreen serves lang='{language}' with the English locale cookie")
 
     def scrape(self, keyword, search_mode):
-        self._log(f"  [GoGreen Scraper] Searching: '{keyword}' (Mode: {search_mode})")
-        all_found_products = []
+        logger.info(f"  [GoGreen Scraper] Searching: '{keyword}' (Mode: {search_mode})")
+        with self.browser.page() as page:
+            self._ensure_english(page)
+            search_url = urljoin(BASE_URL, f"products?search={quote(keyword)}")
+            html = fetch_html(page, search_url, wait_for=RESULT_SELECTOR)
+            product_urls = parse_search_results(html)
+            logger.info(f"    > {len(product_urls)} products on the results page.")
 
-        service = ChromeService(executable_path=self.driver_path)
-        options = webdriver.ChromeOptions()
-        options.add_experimental_option('excludeSwitches', ['enable-automation'])
-        options.add_experimental_option('useAutomationExtension', False)
-        options.add_argument('--disable-notifications')
-        options.add_argument('--headless=new')
-        options.add_argument('--window-size=1920,1080')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-webgl')
-        options.add_argument('--disable-3d-apis')
-        options.add_argument(f"user-agent={config.USER_AGENT}")
-        options.add_argument('--log-level=3')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-extensions ')
-        options.add_argument('--disable-browser-side-navigation')
-        options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        # options.add_argument('--start-maximized')
-        
-        driver = webdriver.Chrome(service=service, options=options)
+            def details(url):
+                return parse_product_page(fetch_html(page, url, wait_for=NAME_SELECTOR), url, search_mode)
 
-        try:
-            driver.get(self.base_url)
-            if not self._set_language_to_english(driver):
-                if driver:
-                    driver.quit()
-                return []
-            
-            search_url = urljoin(self.base_url, f"products?search={quote(keyword)}")
-            driver.get(search_url)
-
-            WebDriverWait(driver, 15).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.product-box")))
-
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            product_containers = soup.select("div.product-box")
-            logger.debug(f"    -> Found {len(product_containers)} products on results page.")
-
-            for container in product_containers:
-                if len(all_found_products) >= self.products_to_find_limit:
-                    break
-
-                link_tag = container.select_one("a.tp-image-product")
-                if not link_tag or not link_tag.has_attr('href'):
-                    continue
-                
-                product_url = urljoin(self.base_url, link_tag['href'])
-                logger.debug(f"      -> Processing: {product_url[:80]}...")
-                
-                product_details = self._extract_product_details(driver, product_url, search_mode)
-                
-                if product_details.get('Total quantity', 0) > 0:
-                    if self.relevance_agent.is_relevant(product_details.get('Product'), keyword):
-                        all_found_products.append(product_details)
-                        logger.info(f"      -> VALID PRODUCT SAVED: {product_details['Product'][:60]}...")
-                    else:
-                        logger.info(f"      -> DISCARDED (Not relevant by AI): {product_details['Product'][:60]}...")
-                else:
-                    logger.info(f"      -> DISCARDED (No valid quantity): {product_details['Product'][:60]}...")
-            
-        except TimeoutException:
-            logger.warning("    -> No products found or page took too long to load.")
-        except Exception as e:
-            logger.error(f"    ! Unexpected error occurred in GoGreen scraper", exc_info=True)
-        finally:
-            if driver:
-                driver.quit()
-
-        return all_found_products
+            return collect_products(product_urls, details, keep_if_relevant(self.relevance_agent, keyword),
+                                    self.products_to_find_limit, 'GoGreen')

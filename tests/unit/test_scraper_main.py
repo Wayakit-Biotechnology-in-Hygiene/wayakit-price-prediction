@@ -1,12 +1,12 @@
 """Unit tests of `scraper/main.py` after F2: temp file + rename (C02), fail loudly, coverage report.
 
 `main()` runs in-process with everything injected: a fake relevance agent (or the real
-`RelevanceAgent` with a fake Bedrock client), fake scrapers (no Selenium, no Chrome), a fake
-ChromeDriver installer and a no-op sleep. All files live in `tmp_path`.
+`RelevanceAgent` with a fake Bedrock client), fake scrapers (no browser), a fake browser factory
+(`FAKE_BROWSER`) and a no-op sleep. All files live in `tmp_path`.
 
 What it proves:
 - success: the output CSV is replaced, no temp file is left, header + rows with `CSV_COLUMNS`;
-- any failure (instructions missing, driver, preflight, fatal AI error even when a scraper
+- any failure (instructions missing, browser start, preflight, fatal AI error even when a scraper
   swallows it, unexpected exception, 0 rows, AI failure rate above 5 %) → exit 1 and the previous
   CSV is byte-for-byte untouched; the coverage report is still written;
 - append mode copies the previous rows and adds no second header;
@@ -116,8 +116,8 @@ def _product(site, keyword, tag):
 def _factory(behaviors=None, created=None):
     behaviors = behaviors or {}
 
-    def factory(driver_path, agent):
-        assert driver_path == "/fake/chromedriver"
+    def factory(browser, agent):
+        assert browser is FAKE_BROWSER
         scrapers = {s: FakeScraper(s, None if s in m.SITES_WITHOUT_AI else agent, behaviors.get(s))
                     for s in SITES}
         if created is not None:
@@ -133,13 +133,24 @@ def paths(tmp_path):
     return {"instr": instr, "out": tmp_path / "competitors_complete.csv", "cov": tmp_path / "cov" / "coverage.csv"}
 
 
+class FakeBrowser:
+    """Stands in for `services.browser.BrowserSession`; main closes it at the end of the run."""
+    closed = 0
+
+    def close(self):
+        FakeBrowser.closed += 1
+
+
+FAKE_BROWSER = FakeBrowser()
+
+
 def _main(paths, mode="overwrite", agent=None, factory=None, installer=None, sleeps=None,
           apify_preflight=lambda: None):
     agent = agent or FakeAgent()
     argv = ["--analysis_file", str(paths["instr"]), "--output_mode", mode, "--output_file", str(paths["out"]),
             "--coverage_file", str(paths["cov"])]
     return m.main(argv, agent_factory=lambda: agent, scraper_factory=factory or _factory(),
-                  driver_installer=installer or (lambda: "/fake/chromedriver"),
+                  browser_factory=installer or (lambda: FAKE_BROWSER),
                   sleep=(sleeps.append if sleeps is not None else (lambda s: None)),
                   apify_preflight=apify_preflight)
 
@@ -205,7 +216,7 @@ def _boom(*a, **k):
 
 
 FAILURES = {
-    "driver": dict(installer=_boom),
+    "browser": dict(installer=_boom),
     "preflight": dict(agent=FakeAgent(preflight_error=m.RelevanceAgentFatalError("fake: no access"))),
     "factory": dict(factory=_boom),
     "zero-rows": dict(factory=_factory({s: (lambda self, k, mode: []) for s in
@@ -231,7 +242,8 @@ def test_missing_instructions_exit_1_and_keep_the_previous_csv(paths):
 
 
 def test_fatal_ai_error_swallowed_by_a_scraper_still_aborts(paths):
-    """The Selenium scrapers catch every exception; main must look at agent.fatal_error."""
+    """`is_relevant()` records a fatal AI error and returns False, so a scraper ends normally;
+    main must look at agent.fatal_error."""
     paths["out"].write_text(OLD_CSV, encoding="utf-8")
     agent = FakeAgent()
 
@@ -258,7 +270,7 @@ def test_fatal_ai_error_raised_by_a_scraper_aborts(paths):
 
 def test_one_site_error_is_logged_counted_and_does_not_abort(paths):
     def flaky(self, keyword, mode):
-        raise TimeoutError("fake selenium timeout")
+        raise TimeoutError("fake page timeout")
 
     assert _main(paths, factory=_factory({"saco": flaky})) == 0
     rows = _rows(paths["out"])
@@ -439,9 +451,9 @@ def test_apify_failures_over_the_rate_exit_1(paths, monkeypatch):
     assert not paths["out"].exists()
 
 
-def test_a_selenium_site_error_is_not_counted_as_an_apify_failure(paths):
+def test_a_browser_site_error_is_not_counted_as_an_apify_failure(paths):
     assert config.APIFY_MAX_FAILED_KEYWORD_RATE == 0.05
-    assert _main(paths, factory=_factory({"saco": _raise(TimeoutError("fake selenium timeout"))})) == 0
+    assert _main(paths, factory=_factory({"saco": _raise(TimeoutError("fake page timeout"))})) == 0
     cov = _coverage(paths)
     assert any(r["site"] == "saco" and r["error"] == "TimeoutError" for r in cov)
     assert m.apify_failed_keywords(cov) == []
@@ -457,7 +469,7 @@ def test_a_selenium_site_error_is_not_counted_as_an_apify_failure(paths):
 def test_apify_failures_exceeded_uses_a_strict_rate(ok, bad, exceeded):
     entries = ([m.coverage_entry("S", "T", "amazon", f"ok{i}", {}, 1) for i in range(ok)]
                + [m.coverage_entry("S", "T", "noon", f"bad{i}", {}, 0, "ApifyRunFailed") for i in range(bad)]
-               + [m.coverage_entry("S", "T", "saco", "x", {}, 0, "TimeoutError")] * 7)  # Selenium: ignored
+               + [m.coverage_entry("S", "T", "saco", "x", {}, 0, "TimeoutError")] * 7)  # browser site: ignored
     failed, attempted, result = m.apify_failures_exceeded(entries, 0.05)
     assert (len(failed), attempted, result) == (bad, ok + bad, exceeded)
 
@@ -513,7 +525,7 @@ def test_row_data_copies_seller_and_origin_or_uses_the_defaults():
         {k: v for k, v in without.items() if k in PRE_F6_COLUMNS}
 
 
-def test_selenium_rows_get_the_default_seller_and_origin(paths):
+def test_browser_site_rows_get_the_default_seller_and_origin(paths):
     assert _main(paths) == 0
     for r in _rows(paths["out"]):
         if r["source"] in m.APIFY_SITES:
@@ -578,3 +590,42 @@ def test_the_selenium_amazon_scraper_is_gone():
     from pathlib import Path
     assert not Path(m.SCRAPER_DIR, "scrapers", "amazon_scraper.py").exists()
     assert not hasattr(m, "AmazonScraper")
+
+
+# --- Playwright browser (2026-11 migration from Selenium) -----------------------------------------
+@pytest.mark.parametrize("factory", [None, _boom], ids=["success", "unexpected-error"])
+def test_the_browser_is_closed_at_the_end_of_every_run(paths, factory):
+    before = FakeBrowser.closed
+    _main(paths, factory=factory)
+    assert FakeBrowser.closed == before + 1
+
+
+def test_a_browser_that_cannot_start_exits_1_before_any_scraper_is_built(paths):
+    built = []
+    assert _main(paths, installer=_boom, factory=_factory(created=built)) == 1
+    assert built == []
+
+
+def test_a_site_that_fails_every_search_is_reported(paths, monkeypatch):
+    errors, warnings = [], []
+    monkeypatch.setattr(m.logger, "error", lambda msg, *a, **k: errors.append(msg))
+    monkeypatch.setattr(m.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    from services.browser import HttpStatusError
+    blocked = HttpStatusError(403, "https://example.invalid/")
+    assert _main(paths, factory=_factory({"mumzworld": _raise(blocked)})) == 0
+    rows = _rows(paths["cov"])
+    mumz = [r for r in rows if r["site"] == "mumzworld"]
+    assert mumz and all(r["error"] == type(blocked).__name__ and r["rows_written"] == "0" for r in mumz)
+    assert any("Site 'mumzworld' failed every search" in e for e in errors)
+    assert not any("Site 'saco' failed" in e for e in errors)
+
+
+def test_sites_failing_every_search():
+    entry = m.coverage_entry
+    entries = [entry("S", "T", "gogreen", "a", {}, 0, "LanguageUnavailable"),
+               entry("S", "T", "gogreen", "b", {}, 0, "LanguageUnavailable"),
+               entry("S", "T", "fine", "a", {}, 0, "HttpStatusError"),
+               entry("S", "T", "fine", "b", {}, 2),
+               entry("S", "T", "saco", "a", {}, 0)]
+    assert m.sites_failing_every_search(entries) == {"gogreen": 2}
+    assert m.sites_failing_every_search([]) == {}

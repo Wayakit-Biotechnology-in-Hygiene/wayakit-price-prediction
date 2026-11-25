@@ -13,9 +13,10 @@ dependencies:
       - scikit-learn==1.7.2
       - scipy==1.15.3
       - joblib==1.5.3
-      - selenium==4.41.0
-      - webdriver-manager==4.0.2
       - beautifulsoup4==4.14.3
+      # Browser scrapers (2026-11-25, replaces selenium 4.41.0 and webdriver-manager 4.0.2): drives the installed
+      # Google Chrome (channel 'chrome'); Playwright's own Chromium only as a fallback (`python -m playwright install chromium`).
+      - playwright==1.64.1
       - boto3==1.42.83
       - botocore==1.42.83
       - requests==2.33.1
