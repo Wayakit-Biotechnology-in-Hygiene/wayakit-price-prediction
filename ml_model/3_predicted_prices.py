@@ -133,8 +133,10 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
        (`ceiling_source` 'reference'), unless that would replace a similar-size band with an
        all-sizes one (fewer than MIN_SIZE_MATCHES similar-size reference rows while every row has
        them); `ceiling_source` is 'all' for the F7a band and '' when no band applies; `low` always comes from every row (the reference rows
-       are among them, so `low` is never above that p75). A SKU larger than every market row of its type is never
-       lifted to `low` (large sizes cost less per liter; `volume_outside_market`). The p75 ceiling
+       are among them, so `low` is never above that p75). A volumetric SKU larger than every market row of its
+       type is never lifted to `low` (large sizes cost less per liter; `volume_outside_market`); a pack of
+       pieces is, at every size (a 20-pack of cloths is still cloths: without it, wipes packs in the units
+       model priced 20 microfiber cloths at a tenth of the cheapest cloth, 2026-11-24 run). The p75 ceiling
        applies at every size, also below the market's size range (the plan's "p75 x volume"
        ceiling; lifting it there raised small sizes up to x6 on the F1 data).
     3. A SKU larger than every market row of its type (`volume_outside_market`) costs at most,
@@ -193,7 +195,8 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
         below, above = item['size'] < band['size_min'], item['size'] > band['size_max']
         item['outside'] = below or above
         if band['count'] >= MIN_COMPETITORS_FOR_CLAMP and item['pu'] > 0:
-            lower = 0.0 if above else band['low']
+            # Volume: a size above the market is cheaper per liter, so no minimum. Pieces: always.
+            lower = 0.0 if above and item['kind'] == 'volume' else band['low']
             clamped = min(max(item['pu'], lower), band['p75'])
             item['clamped'] = clamped != item['pu']
             item['pu'] = clamped
