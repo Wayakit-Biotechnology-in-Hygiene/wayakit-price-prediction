@@ -175,7 +175,7 @@ def test_success_replaces_the_csv_and_leaves_no_temp(paths):
     assert _main(paths, sleeps=sleeps) == 0
     rows = _rows(paths["out"])
     assert list(rows[0]) == config.CSV_COLUMNS
-    assert {r["source"] for r in rows} == {"amazon", "noon", "mumzworld", "saco", "aerosense"}
+    assert {r["source"] for r in rows} == {"amazon", "noon", "saco", "aerosense"}
     assert all(r["product"].startswith("good") for r in rows if r["source"] != "aerosense")
     assert not (paths["out"].parent / "competitors_complete.tmp.csv").exists()
     assert sleeps == [m.SECONDS_BETWEEN_SUBINDUSTRIES] * 3
@@ -256,12 +256,12 @@ def test_fatal_ai_error_swallowed_by_a_scraper_still_aborts(paths):
         return []  # what a scraper returns after catching the exception
 
     created = []
-    assert _main(paths, agent=agent, factory=_factory({"mumzworld": swallow}, created)) == 1
+    assert _main(paths, agent=agent, factory=_factory({"saco": swallow}, created)) == 1
     assert paths["out"].read_text(encoding="utf-8") == OLD_CSV
     cov = _coverage(paths)
-    assert cov[-1]["site"] == "mumzworld" and cov[-1]["error"] == "RelevanceAgentFatalError"
+    assert cov[-1]["site"] == "saco" and cov[-1]["error"] == "RelevanceAgentFatalError"
     assert cov[-1]["rows_written"] == "0"
-    assert created[0]["saco"].calls == [], "nothing is scraped after the fatal error"
+    assert created[-1]["noon"].calls == [], "nothing is scraped after the fatal error"
 
 
 def test_fatal_ai_error_raised_by_a_scraper_aborts(paths):
@@ -423,7 +423,7 @@ def test_apify_fatal_error_aborts_and_keeps_the_previous_csv(paths, error, mode)
     assert (cov[-1]["site"], cov[-1]["error"], cov[-1]["rows_written"]) == ("amazon", type(error).__name__, "0")
     # Subindustries run in groupby order (Aviation, Home, Pets): amazon is the first Home site.
     assert len(created) == 2, "Pets is never reached"
-    assert all(scrapers[s].calls == [] for scrapers in created for s in ("mumzworld", "saco", "noon")), \
+    assert all(scrapers[s].calls == [] for scrapers in created for s in ("saco", "noon")), \
         "nothing is scraped after the fatal error"
 
 
@@ -436,7 +436,7 @@ def test_apify_run_failed_is_per_keyword_but_fails_the_run(paths):
     temp = paths["out"].parent / TEMP_NAME
     assert temp.is_file(), "the partial rows stay in the temp file"
     sources = {r["source"] for r in _rows(temp)}
-    assert {"amazon", "mumzworld", "saco", "aerosense"} <= sources, "scraping went on after the failure"
+    assert {"amazon", "saco", "aerosense"} <= sources, "scraping went on after the failure"
     noon_calls = [c for scrapers in created for c in scrapers["noon"].calls]
     assert [k for k, _ in noon_calls] == ["floor cleaner", "pet wipes"], "noon kept being used after the failure"
     cov = _coverage(paths)
@@ -567,7 +567,8 @@ def test_overwrite_onto_a_pre_f6_file_replaces_it(paths):
 
 def test_target_map_noon_only_in_home_automotive_and_pets():
     assert {k for k, v in config.TARGET_MAP.items() if "noon" in v} == {"Home", "Automotive", "Pets"}
-    assert config.TARGET_MAP["Home"] == ["amazon", "mumzworld", "saco", "noon"]
+    assert config.TARGET_MAP["Home"] == ["amazon", "saco", "noon"]  # Mumzworld removed 2026-11-25 (HTTP 403)
+    assert not any("mumzworld" in v for v in config.TARGET_MAP.values())
     assert config.TARGET_MAP["Automotive"] == ["amazon", "saco", "noon"]
     assert config.TARGET_MAP["Pets"] == ["amazon", "noon"]
     assert {k for k, v in config.TARGET_MAP.items() if "amazon" in v} == {"Home", "Automotive", "Pets"}
@@ -628,13 +629,13 @@ def test_a_site_that_fails_every_search_exits_1_and_keeps_the_previous_csv(paths
     paths["out"].write_text(OLD_CSV, encoding="utf-8")
     from services.browser import HttpStatusError
     blocked = HttpStatusError(403, "https://example.invalid/")
-    assert _main(paths, factory=_factory({"mumzworld": _raise(blocked)})) == 1
+    assert _main(paths, factory=_factory({"saco": _raise(blocked)})) == 1
     assert paths["out"].read_text(encoding="utf-8") == OLD_CSV
-    mumz = [r for r in _rows(paths["cov"]) if r["site"] == "mumzworld"]
-    assert mumz and all(r["error"] == type(blocked).__name__ and r["rows_written"] == "0" for r in mumz)
-    assert any("Sites that failed every search: 'mumzworld'" in e for e in errors)
-    assert any("Site 'mumzworld' failed every search" in e for e in errors)
-    assert not any("'saco'" in e for e in errors)
+    saco = [r for r in _rows(paths["cov"]) if r["site"] == "saco"]
+    assert saco and all(r["error"] == type(blocked).__name__ and r["rows_written"] == "0" for r in saco)
+    assert any("Sites that failed every search: 'saco'" in e for e in errors)
+    assert any("Site 'saco' failed every search" in e for e in errors)
+    assert not any("'amazon'" in e for e in errors)
 
 
 def test_a_site_failing_its_first_searches_stops_the_run_at_once(paths):
@@ -643,10 +644,10 @@ def test_a_site_failing_its_first_searches_stops_the_run_at_once(paths):
     _write_instructions(paths, rows)
     from services.browser import HttpStatusError
     created = []
-    assert _main(paths, factory=_factory({"mumzworld": _raise(HttpStatusError(403, "u"))}, created)) == 1
+    assert _main(paths, factory=_factory({"saco": _raise(HttpStatusError(403, "u"))}, created)) == 1
     assert not paths["out"].exists()
-    mumz = [r for r in _coverage(paths) if r["site"] == "mumzworld"]
-    assert len(mumz) == m.FAILED_SEARCHES_TO_ABORT == 3, "nothing is searched after the third failure"
+    saco = [r for r in _coverage(paths) if r["site"] == "saco"]
+    assert len(saco) == m.FAILED_SEARCHES_TO_ABORT == 3, "nothing is searched after the third failure"
 
 
 def test_site_failing_from_the_start():

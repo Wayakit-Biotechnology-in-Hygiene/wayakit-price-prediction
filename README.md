@@ -14,7 +14,7 @@ flowchart TD
     EC2 -->|"ec2-user crontab<br/>Fri and Sat 04:00 UTC"| E1["run_pipeline.sh, stage 1<br/>Odoo products → analysis-odoo.csv"]
     E1 --> R["Manual review<br/>editing analysis-odoo.csv through git"]
     R --> E2["run_pipeline.sh --stage 2<br/>git pull"]
-    E2 --> SC["scraper/main.py<br/>Amazon, Mumzworld, SACO, B2B sites"]
+    E2 --> SC["scraper/main.py<br/>Amazon, Noon, SACO, B2B sites"]
     SC <-->|relevance and wipes count| G["Gemini"]
     SC --> CSV["scraper/competitors_complete.csv"]
     OD[("Odoo: product.master,<br/>sale.order.line, competitor.product")] --> ML
@@ -82,7 +82,7 @@ Comes from `TARGET_MAP` (`scraper/config.py:9-24`). The channel is decided by `s
 |---|---|---|---|---|
 | Amazon (amazon.sa) | B2C | Home, Automotive, Pets | Apify `junglee/amazon-crawler` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (replaced Selenium) |
 | Noon (noon.com/saudi-en) | B2C | Home, Automotive, Pets (F6) | Apify `saswave/noon-product-scraper` + Bedrock (F6, on the instance since 2026-11-24) | Done in F6 (new site) |
-| Mumzworld | B2C | Home | Playwright (browser layer only, parsing unchanged) + Bedrock | Blocked by the site (HTTP 403 to every automated client, 2026-11-25): open |
+| Mumzworld | B2C | — (removed from `TARGET_MAP` on 2026-11-25) | Playwright (browser layer only, parsing unchanged) + Bedrock | Blocked by the site (HTTP 403 to every automated client); Mafer removed it on 2026-11-25. The scraper stays in the code, unused |
 | SACO (saco.sa) | B2C / B2B | Home, Automotive (B2C); Healthcare (B2B) | Playwright (browser layer only, parsing unchanged) + Bedrock | None |
 | Fine (ksa.finestore.com) | B2B | Airports, Restaurants, Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Healthcare, Industrial facilities | Playwright + Bedrock | None |
 | GoGreen (gogreen.com.sa) | B2B | Facilities management, Faith, Gyms, Land Transportation, Spas and salons, Hotels, Industrial facilities | Playwright + Bedrock | Arabic-only store whose search ignores the query: the whole catalog (about 170 products) is read and the relevance AI picks by keyword; sizes from the Arabic titles (2026-11-25) |

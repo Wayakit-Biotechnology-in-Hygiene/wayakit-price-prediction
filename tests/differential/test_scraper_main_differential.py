@@ -69,6 +69,10 @@ pytestmark = pytest.mark.differential
 
 ANALYSIS = REPO_ROOT / "scraper" / "analysis-odoo.csv"
 SITES = ("amazon", "mumzworld", "saco", "fine", "gogreen", "officesupply", "aerosense")
+# Sites removed from TARGET_MAP on purpose, with the decision (docs/decisions.md):
+# Mumzworld, 2026-11-25 (Mafer: "quita Mumzworld", HTTP 403 to every automated client).
+REMOVED_SITES = {"Home": ("mumzworld",)}
+REMOVED_SOURCES = {"mumzworld"}
 NEW_SITES = SITES + ("noon",)
 APIFY_SITES = ("amazon", "noon")
 CLASSES = {"AmazonScraper": "amazon", "MumzworldScraper": "mumzworld", "SacoScraper": "saco",
@@ -232,24 +236,31 @@ def _read(path: Path) -> tuple[list[str], list[dict]]:
         return list(reader.fieldnames or []), rows
 
 
-def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp_path):
+def test_same_scraper_outputs_give_the_same_rows_except_the_removed_mumzworld(tmp_path):
     base_root = _materialize_base(tmp_path)
     base_out, new_out = tmp_path / "base.csv", tmp_path / "new.csv"
     base_is_f6 = _run_base(base_root, tmp_path, base_out)
     assert _run_new(new_out, tmp_path / "coverage.csv") == 0
     base_header, base_rows = _read(base_out)
     new_header, new_rows = _read(new_out)
+    # Mafer, 2026-11-25: Mumzworld leaves TARGET_MAP (HTTP 403 to every automated client). The
+    # base still writes its rows; the new version writes none and every other row is unchanged.
+    removed = [r for r in base_rows if r["source"] in REMOVED_SOURCES]
+    assert removed, "the test would prove nothing: the base wrote no Mumzworld rows"
+    assert not [r for r in new_rows if r["source"] in REMOVED_SOURCES], "Mumzworld is still scraped"
+    base_rows = [r for r in base_rows if r["source"] not in REMOVED_SOURCES]
 
     if base_is_f6:
-        # The base already has F6: same fakes, so the CSV must not change at all.
-        assert new_out.read_bytes() == base_out.read_bytes(), "the CSV changed against an F6 base"
+        # The base already has F6: same fakes, so every other row must not change at all.
+        assert new_header == base_header
+        assert new_rows == base_rows, "the CSV changed against an F6 base (Mumzworld aside)"
     else:
         assert new_header == base_header + ["seller", "origin"]
-        for source in SITES:
+        for source in [s for s in SITES if s not in REMOVED_SOURCES]:
             b = [r for r in base_rows if r["source"] == source]
             n = [{k: r[k] for k in base_header} for r in new_rows if r["source"] == source]
             assert n == b, f"{source} rows changed on the base columns ({len(b)} base, {len(n)} new)"
-    for source in ("mumzworld", "saco"):
+    for source in ("saco",):
         n = [r for r in new_rows if r["source"] == source]
         assert n, f"the test would prove nothing: no {source} rows"
         assert all((r["seller"], r["origin"]) == ("", "unknown") for r in n), f"{source} got a seller or origin"
@@ -259,7 +270,7 @@ def test_same_scraper_outputs_give_the_same_rows_mumzworld_and_saco_included(tmp
     assert amazon and all(r["seller"].startswith("Seller") for r in amazon), "Apify Seller reaches the CSV"
     assert [r for r in new_rows if r["source"] == "noon"], "the new version writes noon rows"
     if not base_is_f6:
-        assert {r["source"] for r in base_rows} <= set(SITES)
+        assert {r["source"] for r in base_rows} <= set(SITES) - REMOVED_SOURCES
         assert not [r for r in base_rows if r["source"] == "noon"], "noon rows exist only in the new version"
         assert len(new_rows) == len(base_rows) + sum(r["source"] == "noon" for r in new_rows)
 
@@ -289,6 +300,7 @@ def test_shared_parsers_ai_and_exclusions_are_unchanged(tmp_path):
     base_has_noon = any("noon" in sites for sites in base_config.TARGET_MAP.values())
     for key, base_sites in base_config.TARGET_MAP.items():
         new_sites = new_config.TARGET_MAP[key]
+        base_sites = [s for s in base_sites if s not in REMOVED_SITES.get(key, ())]
         if base_has_noon:  # the base already has F6: no site may change at all
             assert new_sites == base_sites, f"TARGET_MAP[{key!r}] changed"
         else:

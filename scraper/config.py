@@ -8,7 +8,7 @@ CSV_COLUMNS = [
 ]
 
 TARGET_MAP = {
-    'Home': ['amazon', 'mumzworld', 'saco', 'noon'],
+    'Home': ['amazon', 'saco', 'noon'],  # Mumzworld removed 2026-11-25: HTTP 403 to every automated client
     'Automotive': ['amazon', 'saco', 'noon'],
     'Pets': ['amazon', 'noon'],
     'Aviation': ['aerosense'],
