@@ -425,6 +425,16 @@ set -a; . /etc/price-intelligence.env; set +a
 bash run_pipeline.sh                 # no arguments: the whole run
 ```
 
+To run the monthly run by hand **without writing to Odoo** (done on 2026-11-24; decision in `docs/decisions.md`): disable the schedule if the next scheduled run must not upload (`python -m infra.schedule --disable`, dry-run first), copy `run_pipeline.sh` outside the code folder (e.g. `/home/ec2-user/pi-manual-run/`), change only step 10 to `odoo_api_price_suggestion.py --run_mode full --dry-run` (and fix `PROJECT_DIR` to the repo path), and start it so that it survives the SSM session:
+
+```bash
+sudo systemd-run --unit=pi-manual-run-<date> --uid=ec2-user --gid=ec2-user \
+  -p WorkingDirectory=/home/ec2-user/wayakit-price-prediction -p EnvironmentFile=/etc/price-intelligence.env -p KillMode=control-group \
+  /bin/bash /home/ec2-user/pi-manual-run/run_pipeline_dryrun.sh
+```
+
+It shuts the instance down when it ends, like a scheduled run. The suggestions are in `ml_model/price_suggestion_dry_run.csv`; after the review, upload with `odoo_api_price_suggestion.py --run_mode full` (Mafer's OK, KSA company confirmed) and re-enable the schedule.
+
 `run_pipeline.sh` accepts **no arguments** (since F3): any argument, including the old `--stage 2` or `--monthly`, logs `ERROR: run_pipeline.sh takes no arguments (got '…')` and exits 1 without running any step (the trap still alerts and shuts down). Before F3, a typo silently ran stage 1.
 
 ### Bootstrap on the current instance
@@ -774,7 +784,8 @@ Errors that have already appeared or that are visible in the code, and what to d
 | Products are silently discarded (pre-F2 code) | On a 429, Gemini waits 60 s; on the third attempt it returns `False` (`ai_service.py:151-154`) | Search for "RATE LIMIT HIT" in `wayakit_app.log`. **F2**: Bedrock with backoff and fallback; failures are counted (`ai_failures` in the coverage report) |
 | Land transportation has no competitor data | `config.py:19` says `'Land Transportation'` and `analysis-odoo.csv` says `Land transportation` (31 rows). The comparison is case-sensitive (`main.py:333`) and gives no warning | Pending: fix the key in `scraper/config.py:19` (code change, with Mafer's OK) |
 | 4 SACO exclusions are not applied | Missing commas in `SACO_EXCLUSIONS` (`config.py:65,70`): Python concatenates the strings | Pending: add the commas |
-| GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
+| GoGreen: "Could not set language to English" many times | Seen in the Nov 13–15, 2026 run (`gogreen_scraper.py:48`); switching the site's language fails. In the 2026-11-24 run it failed in all 64 searches (0 rows) | Pending: review the GoGreen scraper (code change, with Mafer's OK) |
+| Mumzworld, GoGreen or AeroSense write 0 rows and the coverage report shows no `error` | Seen in the 2026-11-24 run: every search failed (Mumzworld: `TimeoutException` waiting for `ProductCard_productCard__`, 22 of 22; GoGreen: the language switch, 64 of 64; AeroSense: an error on every product page, 20 of 20). These Selenium scrapers catch their own exceptions and return an empty list, so `scraper/main.py` sees "0 found", not a failed search, and the run exits 0 | Search the log for `Unexpected error occurred in Mumzworld scraper`, `Could not set language to English` and `An error occurred while scraping`. Pending (code change, with Mafer's OK; Mumzworld and SACO are not changed under ticket A): fix the scrapers and report their failures as errors |
 | Chrome processes are left open | In SACO, `driver.get` and `_handle_overlays` are outside the `try` (`saco_scraper.py:122-123`) and errors other than Timeout do not close the browser | `pkill -f chrome` when running by hand. The instance shuts down at the end of the scheduled run |
 | Scraping does not start: `Could not install ChromeDriver` | `ChromeDriverManager().install()` resolves the driver on every run and downloads it if it is not cached (`main.py:263`), and depends on the network and the Chrome version | Retry. On the instance: Google Chrome 146.0.7680.177 and webdriver-manager 4.0.2 (F1) |
 | Inflated price per liter on Amazon (pre-F6 code) | No pack multiplier: a "Pack of 3, 500 ml" is stored as 500 ml with the price of 3 (the Selenium `amazon_scraper.py:80-109`). In Mumzworld, the pack regex takes the volume as the multiplier (`mumzworld_scraper.py:58`) | Amazon: **fixed in F6** (on the instance since 2026-11-24): the Apify adapters apply the pack multiplier (`apify_common.pack_count`). Mumzworld: still open (its scraper does not change, ticket A); robust statistics in Pets in F7a |
