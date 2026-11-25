@@ -308,43 +308,107 @@ def test_fine_blocked_search_page_raises(monkeypatch):
 
 
 # --- GoGreen --------------------------------------------------------------------------------------
-GG_HOME_EN = '<html lang="en" dir="ltr"><body>home</body></html>'
-GG_HOME_AR = '<html class="no-js" lang="ar" dir="rtl"><body>home</body></html>'
+GG_PAGE = "https://gogreen.com.sa/products?page={}"
 
 
-def _gg_results(paths):
-    cards = "".join(f'<div class="product-box"><a class="tp-image-product" href="{p}">x</a></div>' for p in paths)
-    return f'<html lang="en">{cards}</html>'
+class ArabicAgent:
+    """Batch relevance: a title is relevant when it contains one of ``words``; records the calls."""
+
+    def __init__(self, *words):
+        self.words = words
+        self.calls = []
+
+    def filter_relevant(self, titles, query):
+        self.calls.append((list(titles), query))
+        return [any(w in t for w in self.words) for t in titles]
 
 
-def _gg_product(title, price="182 SAR"):
-    return f'<html lang="en"><h1 class="title-product">{title}</h1><p class="product-formatted-price">{price}</p></html>'
+def _gg_catalog(items):
+    boxes = "".join(f'<div class="product-box"><a class="tp-image-product" href="{href}">'
+                    f'<img alt="{title}"/></a></div>' for href, title in items)
+    return f'<html lang="ar" dir="rtl"><body>{boxes}</body></html>'
 
 
-def test_gogreen_arabic_only_store_fails_the_search(monkeypatch):
-    _site(monkeypatch, gg, {gg.BASE_URL: GG_HOME_AR})
-    browser = FakeBrowser()
-    with pytest.raises(gg.LanguageUnavailable, match="lang='ar'"):
-        gg.GoGreenScraper(browser, FakeAgent()).scrape("oven cleaner", "volume")
-    assert issubclass(gg.LanguageUnavailable, br.PageLoadError)
+def _gg_product(price="49"):
+    return f'<html lang="ar"><h1 class="title-product">x</h1><p class="product-formatted-price">{price} <svg/></p></html>'
 
 
-def test_gogreen_english_store_is_scraped(monkeypatch):
-    search = "https://gogreen.com.sa/products?search=oven%20cleaner"
-    _site(monkeypatch, gg, {gg.BASE_URL: GG_HOME_EN, search: _gg_results(["/products/a", "/products/b"]),
-                            "https://gogreen.com.sa/products/a": _gg_product("Good Oven Cleaner 500 ml", "1,182"),
-                            "https://gogreen.com.sa/products/b": _gg_product("Good Oven Cleaner")})  # no size
-    rows = gg.GoGreenScraper(FakeBrowser(), FakeAgent()).scrape("oven cleaner", "volume")
-    assert [(r["Product"], r["Price_SAR"], r["Total quantity"], r["Company"]) for r in rows] == [
-        ("Good Oven Cleaner 500 ml", "1182", 500.0, "GoGreen")]
+@pytest.mark.parametrize("title, mode, expected", [
+    ("شامبو غسيل الملابس باور جل من Go Green (3 لتر)", "volume", (3.0, "L")),
+    ("مزيل البقع على الجاف من Go Green - سعة 1 لتر", "volume", (1.0, "L")),
+    ("صابون ايدي مضاد للبكتيريا 350 مل - ورد", "volume", (350.0, "ml")),
+    ("صابون الأيدي 350 ملي 3 حبات مسك و توت و ورد", "volume", (1050.0, "ml")),
+    ("كرتون فلاش ليوبارد 12 حبة  (1لتر)", "volume", (12.0, "L")),
+    ("مطهر و معقم ضد الجراثيم ٥لتر", "volume", (5.0, "L")),  # Arabic-Indic digit, no space
+    ("ملمع الزجاج ١٫٥ لتر", "volume", (1.5, "L")),
+    ("مناديل مبللة 80 منديل", "units", (80, "units")),
+    ("Glass Cleaner 500 ml", "volume", (500.0, "ml")),  # an English title keeps the usual parser
+])
+def test_gogreen_arabic_sizes(title, mode, expected):
+    size = gg.title_size(title, mode)
+    assert (size["quantity"], size["unit"]) == expected
+
+
+@pytest.mark.parametrize("title", [
+    "شامبو غسيل السجاد 2 لتر  و  مزيل البقع على الجاف 1 لتر",  # two products
+    "صابون الأيدي 3.8 لتر  و  350 ملي صدف",
+    "مجموعة منظفات المطبخ",  # a set
+    "موزع صابون قو غرين + كيس مجاناً ( صابون ايدي برائحة العود)",  # dispenser + free refill
+    "سوبر جل الأخضر من Go Green للتنظيف - 1 كجم",  # a weight
+    "فلاش 1 لتر  و  سوبر غرين 500 جم",
+    "منظف كفرات و جنوط السيارة",  # no size
+    "صابون الايدي مضاد البكتيريا برائحة العود ( عرض خاص ) 1 لتر",  # special offer
+])
+def test_gogreen_titles_in_doubt_have_no_size(title):
+    assert gg.title_size(title, "volume") is None
+
+
+def test_gogreen_reads_the_catalog_once_and_the_ai_picks_by_keyword(monkeypatch):
+    site = _site(monkeypatch, gg, {
+        GG_PAGE.format(1): _gg_catalog([("/products/a", "منظف زجاج بدون عطر و لون 5 لتر"),
+                                        ("/products/b", "مجموعة منظفات المطبخ"),
+                                        ("/products/c", "منظف الارضيات 3 لتر - ليمون")]),
+        GG_PAGE.format(2): _gg_catalog([("/products/d", "ملمع الزجاج  650 مل")]),
+        "https://gogreen.com.sa/products/a": _gg_product("1,182"),
+        "https://gogreen.com.sa/products/d": _gg_product("23"),
+    })  # page 3 is a 404: the end of the catalog
+    agent = ArabicAgent("زجاج")
+    scraper = gg.GoGreenScraper(FakeBrowser(), agent)
+    rows = scraper.scrape("glass cleaner", "volume")
+    assert [(r["Product"], r["Price_SAR"], r["Total quantity"], r["Unit of measurement"], r["Company"])
+            for r in rows] == [("منظف زجاج بدون عطر و لون 5 لتر", "1182", 5.0, "L", "GoGreen"),
+                               ("ملمع الزجاج 650 مل", "23", 650.0, "ml", "GoGreen")]
     _check_contract(rows)
+    # the set has no size, so the AI never sees it; the floor cleaner is not relevant
+    assert agent.calls == [(["منظف زجاج بدون عطر و لون 5 لتر", "منظف الارضيات 3 لتر - ليمون",
+                             "ملمع الزجاج 650 مل"], "glass cleaner")]
+    assert "https://gogreen.com.sa/products/c" not in site.visited
+    scraper.scrape("floor cleaner", "volume")
+    assert site.visited.count(GG_PAGE.format(1)) == 1  # the catalog is read once per scraper
+
+
+def test_gogreen_catalog_errors_fail_the_search(monkeypatch):
+    _site(monkeypatch, gg, {GG_PAGE.format(1): br.HttpStatusError(403, "catalog")})
+    with pytest.raises(br.HttpStatusError):
+        gg.GoGreenScraper(FakeBrowser(), ArabicAgent()).scrape("x", "volume")
+    _site(monkeypatch, gg, {})  # the first page itself is a 404
+    with pytest.raises(br.HttpStatusError):
+        gg.GoGreenScraper(FakeBrowser(), ArabicAgent()).scrape("x", "volume")
+    _site(monkeypatch, gg, {GG_PAGE.format(1): '<html><body>nothing</body></html>'})
+    with pytest.raises(br.ElementNotFound):
+        gg.GoGreenScraper(FakeBrowser(), ArabicAgent()).scrape("x", "volume")
+
+
+def test_gogreen_no_relevant_product_is_an_empty_search(monkeypatch):
+    _site(monkeypatch, gg, {GG_PAGE.format(1): _gg_catalog([("/products/a", "منظف الارضيات 3 لتر")])})
+    assert gg.GoGreenScraper(FakeBrowser(), ArabicAgent("زجاج")).scrape("glass cleaner", "volume") == []
 
 
 def test_gogreen_parsers():
-    assert gg.page_language(GG_HOME_AR) == "ar"
-    assert gg.parse_search_results(_gg_results(["/products/a", "/products/a"])) == ["https://gogreen.com.sa/products/a"]
+    assert gg.parse_catalog_page(_gg_catalog([("/products/a", " x  1 لتر "), ("/products/a", "x")])) == [
+        ("https://gogreen.com.sa/products/a", "x 1 لتر")]
     with pytest.raises(br.SiteLayoutChanged):
-        gg.parse_product_page("<html><body>nothing</body></html>", "u", "volume")
+        gg.parse_product_page("<html><body>nothing</body></html>", "u", "t", {"quantity": 1, "unit": "L"})
 
 
 # --- browser layer --------------------------------------------------------------------------------
@@ -617,23 +681,14 @@ def test_fine_limit_holds_across_pages_and_products_are_not_repeated(monkeypatch
     assert site.visited.count("https://ksa.finestore.com/product/b") == 1
 
 
-def test_gogreen_sets_the_english_cookie_and_a_page_without_boxes_fails(monkeypatch):
-    search = "https://gogreen.com.sa/products?search=x"
-    _site(monkeypatch, gg, {gg.BASE_URL: GG_HOME_EN, search: '<html lang="en"><body>nothing</body></html>'})
-    browser = FakeBrowser()
-    with pytest.raises(br.ElementNotFound):
-        gg.GoGreenScraper(browser, FakeAgent()).scrape("x", "volume")
-    assert browser.opened[0].context.cookies == [gg.LOCALE_COOKIE]
-    assert gg.LOCALE_COOKIE["name"] == "locale" and gg.LOCALE_COOKIE["value"] == "en-sa"
-
-
-@pytest.mark.parametrize("module, html", [
-    (gg, '<div class="product-box"><a class="other" href="/p">x</a></div>'),
-    (osup, '<div class="ut2-gl__body"><a class="other" href="/p">x</a></div>'),
+@pytest.mark.parametrize("parse, html", [
+    (gg.parse_catalog_page, '<div class="product-box"><a class="other" href="/p">x</a></div>'),
+    (gg.parse_catalog_page, '<div class="product-box"><a class="tp-image-product" href="/p"><img alt=""/></a></div>'),
+    (osup.parse_search_results, '<div class="ut2-gl__body"><a class="other" href="/p">x</a></div>'),
 ])
-def test_result_cards_without_the_product_link_are_a_changed_site(module, html):
+def test_result_cards_without_the_product_link_are_a_changed_site(parse, html):
     with pytest.raises(br.SiteLayoutChanged):
-        module.parse_search_results(f"<html><body>{html}</body></html>")
+        parse(f"<html><body>{html}</body></html>")
 
 
 def test_collect_products_with_a_single_failed_page_fails_the_search():

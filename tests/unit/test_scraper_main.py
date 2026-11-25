@@ -133,6 +133,10 @@ def paths(tmp_path):
     return {"instr": instr, "out": tmp_path / "competitors_complete.csv", "cov": tmp_path / "cov" / "coverage.csv"}
 
 
+def _write_instructions(paths, rows):
+    pd.DataFrame(rows).to_csv(paths["instr"], index=False)
+
+
 class FakeBrowser:
     """Stands in for `services.browser.BrowserSession`; main closes it at the end of the run."""
     closed = 0
@@ -269,14 +273,21 @@ def test_fatal_ai_error_raised_by_a_scraper_aborts(paths):
 
 
 def test_one_site_error_is_logged_counted_and_does_not_abort(paths):
-    def flaky(self, keyword, mode):
-        raise TimeoutError("fake page timeout")
+    calls = []
 
+    def flaky(self, keyword, mode):  # the first search fails, the others work
+        calls.append(keyword)
+        if len(calls) == 1:
+            raise TimeoutError("fake page timeout")
+        return None  # default products
+
+    extra = {"Type of product": "H2-Glass cleaner", "Sub industry": "Home", "Industry": "Home care",
+             "Generic product type": "Glass cleaner", "Search Modifiers": ""}
+    _write_instructions(paths, INSTRUCTIONS + [extra])
     assert _main(paths, factory=_factory({"saco": flaky})) == 0
-    rows = _rows(paths["out"])
-    assert "saco" not in {r["source"] for r in rows} and "mumzworld" in {r["source"] for r in rows}
     saco = [r for r in _coverage(paths) if r["site"] == "saco"]
-    assert saco and all(r["error"] == "TimeoutError" and r["rows_written"] == "0" for r in saco)
+    assert [r["error"] for r in saco] == ["TimeoutError", ""]
+    assert "saco" in {r["source"] for r in _rows(paths["out"])}
 
 
 # --- coverage -----------------------------------------------------------------------------------
@@ -453,7 +464,11 @@ def test_apify_failures_over_the_rate_exit_1(paths, monkeypatch):
 
 def test_a_browser_site_error_is_not_counted_as_an_apify_failure(paths):
     assert config.APIFY_MAX_FAILED_KEYWORD_RATE == 0.05
-    assert _main(paths, factory=_factory({"saco": _raise(TimeoutError("fake page timeout"))})) == 0
+    extra = {"Type of product": "H2-Glass cleaner", "Sub industry": "Home", "Industry": "Home care",
+             "Generic product type": "Glass cleaner", "Search Modifiers": ""}
+    _write_instructions(paths, INSTRUCTIONS + [extra])
+    factory = _factory({"saco": _raise(TimeoutError("fake page timeout"), {"floor cleaner"})})
+    assert _main(paths, factory=factory) == 0
     cov = _coverage(paths)
     assert any(r["site"] == "saco" and r["error"] == "TimeoutError" for r in cov)
     assert m.apify_failed_keywords(cov) == []
@@ -606,18 +621,42 @@ def test_a_browser_that_cannot_start_exits_1_before_any_scraper_is_built(paths):
     assert built == []
 
 
-def test_a_site_that_fails_every_search_is_reported(paths, monkeypatch):
-    errors, warnings = [], []
+def test_a_site_that_fails_every_search_exits_1_and_keeps_the_previous_csv(paths, monkeypatch):
+    """Mafer, 2026-11-25: a broken site stops the run (the pipeline then sends the failure email)."""
+    errors = []
     monkeypatch.setattr(m.logger, "error", lambda msg, *a, **k: errors.append(msg))
-    monkeypatch.setattr(m.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    paths["out"].write_text(OLD_CSV, encoding="utf-8")
     from services.browser import HttpStatusError
     blocked = HttpStatusError(403, "https://example.invalid/")
-    assert _main(paths, factory=_factory({"mumzworld": _raise(blocked)})) == 0
-    rows = _rows(paths["cov"])
-    mumz = [r for r in rows if r["site"] == "mumzworld"]
+    assert _main(paths, factory=_factory({"mumzworld": _raise(blocked)})) == 1
+    assert paths["out"].read_text(encoding="utf-8") == OLD_CSV
+    mumz = [r for r in _rows(paths["cov"]) if r["site"] == "mumzworld"]
     assert mumz and all(r["error"] == type(blocked).__name__ and r["rows_written"] == "0" for r in mumz)
+    assert any("Sites that failed every search: 'mumzworld'" in e for e in errors)
     assert any("Site 'mumzworld' failed every search" in e for e in errors)
-    assert not any("Site 'saco' failed" in e for e in errors)
+    assert not any("'saco'" in e for e in errors)
+
+
+def test_a_site_failing_its_first_searches_stops_the_run_at_once(paths):
+    rows = [{"Type of product": f"H{i}-Cleaner {i}", "Sub industry": "Home", "Industry": "Home care",
+             "Generic product type": "Cleaner", "Search Modifiers": ""} for i in range(6)]
+    _write_instructions(paths, rows)
+    from services.browser import HttpStatusError
+    created = []
+    assert _main(paths, factory=_factory({"mumzworld": _raise(HttpStatusError(403, "u"))}, created)) == 1
+    assert not paths["out"].exists()
+    mumz = [r for r in _coverage(paths) if r["site"] == "mumzworld"]
+    assert len(mumz) == m.FAILED_SEARCHES_TO_ABORT == 3, "nothing is searched after the third failure"
+
+
+def test_site_failing_from_the_start():
+    entry = m.coverage_entry
+    failed = [entry("S", "T", "mumzworld", k, {}, 0, "HttpStatusError") for k in "abc"]
+    assert "site 'mumzworld' failed its first 3 searches (HttpStatusError)" in \
+        m.site_failing_from_the_start(failed, "mumzworld")
+    assert m.site_failing_from_the_start(failed[:2], "mumzworld") == ""
+    assert m.site_failing_from_the_start([entry("S", "T", "mumzworld", "z", {}, 1)] + failed, "mumzworld") == ""
+    assert m.site_failing_from_the_start(failed, "saco") == ""
 
 
 def test_sites_failing_every_search():

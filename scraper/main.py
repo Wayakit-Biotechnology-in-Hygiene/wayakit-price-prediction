@@ -235,10 +235,14 @@ SITES_WITHOUT_AI = {'aerosense'}
 # Sites scraped through Apify: failed keywords above config.APIFY_MAX_FAILED_KEYWORD_RATE make the run exit 1.
 APIFY_SITES = ('amazon', 'noon')
 SECONDS_BETWEEN_SUBINDUSTRIES = 5
+# A site whose first searches all failed is broken (blocked, moved, changed): the run stops at
+# once instead of scraping for hours without it (Mafer, 2026-11-25: fix the site, then rerun).
+FAILED_SEARCHES_TO_ABORT = 3
 
 
 class ScrapingAborted(Exception):
-    """A fatal error (relevance AI or Apify) that must stop the whole run."""
+    """A fatal error (relevance AI, Apify, or a site failing every search) that must stop the
+    whole run."""
 
 
 def parse_args(argv=None):
@@ -467,6 +471,16 @@ def sites_failing_every_search(coverage_entries):
     return {site: n for site, n in attempted.items() if failed.get(site, 0) == n}
 
 
+def site_failing_from_the_start(coverage_entries, site, limit=FAILED_SEARCHES_TO_ABORT):
+    """A message when ``site`` has had ``limit`` or more searches and every one failed, else ''."""
+    entries = [e for e in coverage_entries if e['site'] == site]
+    if len(entries) < limit or any(not e['error'] for e in entries):
+        return ''
+    errors = sorted({e['error'] for e in entries})
+    return (f"site '{site}' failed its first {len(entries)} searches ({', '.join(errors)}); "
+            f"fix the site or remove it from TARGET_MAP, then run again")
+
+
 def log_site_failures(coverage_entries):
     """Per-site error summary at the end of the run: a site that failed every search is an
     ERROR (it returned no rows because of the failures, not because nothing matched)."""
@@ -571,6 +585,9 @@ def run_scraping(df_instructions, writer, ai_agent, scraper_factory, browser, co
                         stats_delta(before, ai_agent.stats()), len(found_products), error,
                         uses_ai=uses_ai,
                     ))
+                    broken = site_failing_from_the_start(coverage_entries, site_name)
+                    if broken:
+                        raise ScrapingAborted(broken)
 
         if all_found_products_for_group:
             logger.info(f"Writing {len(all_found_products_for_group)} products found for '{sub_industry_group}' to the temporary file...")
@@ -662,8 +679,7 @@ def _scrape(args, df_instructions, coverage_entries, agent_factory, scraper_fact
             rows_written = run_scraping(df_instructions, writer, ai_agent, scraper_factory,
                                         browser, coverage_entries, sleep=sleep, file_handle=f)
     except ScrapingAborted as aborted:
-        logger.critical(f"Scraping aborted by a fatal error (relevance AI or Apify): {aborted}. "
-                        f"'{output_file}' was not modified.")
+        logger.critical(f"Scraping aborted: {aborted}. '{output_file}' was not modified.")
         return 1
     except Exception:
         logger.critical(f"Unexpected error in the scraping process. '{output_file}' was not modified.",
@@ -672,6 +688,14 @@ def _scrape(args, df_instructions, coverage_entries, agent_factory, scraper_fact
 
     if rows_written == 0:
         logger.error(f"No competitor rows were scraped. '{output_file}' was not modified.")
+        return 1
+
+    broken_sites = sites_failing_every_search(coverage_entries)
+    if broken_sites:
+        listed = ", ".join(f"'{site}' ({n} of {n})" for site, n in broken_sites.items())
+        logger.error(f"Sites that failed every search: {listed}. '{output_file}' was not modified; "
+                     f"partial rows are in '{temp_file}'. Fix the site or remove it from TARGET_MAP, "
+                     f"then run again.")
         return 1
 
     stats = ai_agent.stats()
