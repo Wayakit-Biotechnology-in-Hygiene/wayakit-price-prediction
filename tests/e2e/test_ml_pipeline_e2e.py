@@ -125,7 +125,17 @@ def test_clamp_to_market_range(report):
     # wins). The ceiling applies at every size; a volumetric size above the market's size range is
     # never lifted to the minimum, a pack of pieces is (the report does not say which side, so
     # outside rows skip that check).
-    assert (report["market_p75_found"] <= report["market_max_found"] + ROUND_TOL).all()
+    # A size-adjusted ceiling (2026-11-25) can exceed the raw maximum: bulk prices per liter
+    # adjusted up to a small bottle. Every other ceiling is a quantile of the raw rows.
+    raw_ceiling = report["market_match"] != "size_adjusted"
+    assert (report.loc[raw_ceiling, "market_p75_found"]
+            <= report.loc[raw_ceiling, "market_max_found"] + ROUND_TOL).all()
+    # Only larger rows are adjusted, up, and at most as if 4 times larger (b >= -1): a size-adjusted
+    # ceiling is never below the minimum and at most 4 times the maximum.
+    adjusted = (report["market_match"] == "size_adjusted") & (report["competitors_count"] > 0)
+    assert (report.loc[adjusted, "market_p75_found"] >= report.loc[adjusted, "market_min_found"] - ROUND_TOL).all()
+    assert (report.loc[adjusted, "market_p75_found"]
+            <= 4 * report.loc[adjusted, "market_max_found"] + ROUND_TOL).all()
     clamped_rows = ~few & (report["predicted_price_per_unit"] > 0)
     assert clamped_rows.any(), "no product went through the clamp; the check would prove nothing"
     floor = report["cost_per_unit"] * FLOOR_FACTOR
@@ -150,6 +160,17 @@ def test_confidence_and_counts_in_range(report):
     has_band = report["competitors_count"] >= MIN_COMPETITORS_FOR_CLAMP
     assert (report.loc[has_band, "ceiling_source"] == "all").all()
     assert report.loc[~has_band, "ceiling_source"].fillna("").eq("").all()
+    # 2026-11-25: model-only prices (no band) are flagged; the trained elasticity replaces the
+    # all-sizes band of volumetric SKUs; packs of pieces keep it.
+    assert report["low_confidence"].dtype == bool
+    assert (report["low_confidence"] == ~has_band).all()
+    volumetric = report["volume"].astype(str).str.endswith(" L")
+    sized = report["has_size"]
+    assert set(report.loc[volumetric & sized, "market_match"].fillna("")) <= {"size", "size_adjusted", ""}
+    assert set(report.loc[~volumetric & sized, "market_match"].fillna("")) <= {"size", "all", ""}
+    assert (report.loc[volumetric & sized, "market_match"] == "size_adjusted").any()
+    # No previous upload in the temporary copy: nothing is braked.
+    assert report["previous_price"].isna().all() and not report["stability_limited"].any()
 
 
 def test_products_without_a_size_get_only_the_floor(report):
@@ -183,3 +204,7 @@ def test_models_saved_and_loadable(run):
         assert rows["is_reference"].dtype == bool and not rows["is_reference"].any()
         assert len(rows) > 0 and (rows["price_per_unit"] > 0).all() and (rows["size"] > 0).all()
     assert (joblib.load(model_dir / "vol_market_rows.joblib")["size"] > 0.005).all(), "5 mL or less is dropped"
+    # 2026-11-25: one b per channel plus the pooled one (''), each in 2_train's clipped range.
+    elasticity = joblib.load(model_dir / "vol_size_elasticity.joblib")
+    assert isinstance(elasticity, dict) and set(elasticity) == {"", "B2B", "B2C"}, elasticity
+    assert all(-1.0 <= b <= -0.3 for b in elasticity.values()), elasticity

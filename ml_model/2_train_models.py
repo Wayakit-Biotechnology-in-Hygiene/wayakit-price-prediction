@@ -25,6 +25,19 @@ MIN_VOLUME_LITERS = 0.005
 # Market rows (the rows 3_predicted_prices.py computes each SKU's market band from).
 # `is_reference` (F7b): a Saudi reference price, used for the B2C ceiling (see is_saudi_reference).
 MARKET_ROWS_COLUMNS = ['type_of_product', 'price_per_unit', 'size', 'is_reference']
+# Price per liter vs size elasticity b (price_per_liter ~ size ** b), measured on the volumetric
+# competitor rows (Mafer, 2026-11-25). 3_predicted_prices.py uses it to adjust a price per liter
+# to the SKU's size when the market has too few similar-size rows. Clipped to a plausible range;
+# DEFAULT when it cannot be measured (no type with ELASTICITY_MIN_ROWS rows of different sizes).
+# Measured on the single-product rows after the variant collapse and BEFORE the p10-p90 trim:
+# trimming each type on the price per liter cuts the small (dear) and bulk (cheap) ends of the
+# curve and flattens the slope (2026-11-25 data: about -0.75 before the trim, -0.44 after).
+ELASTICITY_MIN_ROWS = 3
+ELASTICITY_BOUNDS = (-1.0, -0.3)
+ELASTICITY_DEFAULT = -0.6
+ELASTICITY_FILE = 'vol_size_elasticity.joblib'
+# Company values that name no brand: such rows are never collapsed as variants of each other.
+UNKNOWN_BRANDS = {'', 'brand not found', 'company not found', 'unknown', 'n/a', 'na', 'none', 'nan', 'generic'}
 
 def load_training_data():
     """Loads all CSV files necessary for training."""
@@ -74,6 +87,114 @@ def drop_implausible_sizes(df_vol):
     keep = df_vol['volume_liters'] > MIN_VOLUME_LITERS
     logger.info(f"Excluded {int((~keep).sum())} volumetric competitor rows of {MIN_VOLUME_LITERS * 1000:g} mL or less.")
     return df_vol[keep].copy()
+
+
+def collapse_identical_variants(df_comp, size_col, label):
+    """Keeps one row per (type_of_product, company, size, price_sar) (Mafer, 2026-11-25).
+
+    Identical variants (five scents of one floor cleaner at the same size and price, the same
+    product listed twice) are ONE competitor product: counted five times they passed the 3-row
+    band threshold alone and overweighted the forest. Runs before the p10-p90 trimming, so for
+    training and for the market rows. The company is compared trimmed and case-insensitive; rows
+    with no known brand (UNKNOWN_BRANDS) are never collapsed; a multipack and a single bottle never
+    collapse together; the size and the price to 1e-6 and to the cent. Of a group,
+    a Saudi reference row (`is_saudi_reference`) is kept if there is one, else the first row; the
+    input order is kept.
+    """
+    if df_comp.empty:
+        return df_comp.copy()
+    company = (df_comp['company'].astype('string').str.strip().str.lower().fillna('')
+               if 'company' in df_comp else pd.Series('', index=df_comp.index))
+    multipack = (df_comp['is_multipack'].astype('boolean').fillna(False).astype(bool)
+                 if 'is_multipack' in df_comp else pd.Series(False, index=df_comp.index))
+    key = pd.DataFrame({
+        'type': df_comp['type_of_product'],
+        'company': company,
+        'size': pd.to_numeric(df_comp[size_col], errors='coerce').round(6),
+        'price': pd.to_numeric(df_comp['price_sar'], errors='coerce').round(2),
+        'multipack': multipack,
+    }, index=df_comp.index)
+    # Reference rows first, so the one kept of a group is a reference row when the group has one.
+    order = (~is_saudi_reference(df_comp)).sort_values(kind='stable').index
+    duplicated = key.loc[order].duplicated(keep='first').reindex(df_comp.index)
+    # Without a known brand, the same size and price is not evidence of the same product.
+    duplicated &= ~company.isin(UNKNOWN_BRANDS)
+    logger.info(f"Collapsed {int(duplicated.sum())} identical competitor variants ({label}): "
+                f"{len(df_comp)} -> {int((~duplicated).sum())} rows.")
+    return df_comp[~duplicated].copy()
+
+
+def estimate_size_elasticity(market_rows):
+    """Price per liter vs size elasticity b from the volumetric market rows (`MARKET_ROWS_COLUMNS`).
+
+    Pooled within-type OLS of log(price per liter) on log(size): both are demeaned within each
+    type, so b compares sizes of the same kind of product, never one type with another. Only types
+    with ELASTICITY_MIN_ROWS rows or more and at least two different sizes count. Returns
+    `(b, raw, types_used, rows_used)`: b clipped to ELASTICITY_BOUNDS, or ELASTICITY_DEFAULT
+    (raw None) when it cannot be estimated.
+    """
+    prices = pd.to_numeric(market_rows['price_per_unit'], errors='coerce')
+    sizes = pd.to_numeric(market_rows['size'], errors='coerce')
+    valid = (prices > 0) & (sizes > 0) & market_rows['type_of_product'].notna()
+    data = pd.DataFrame({'type': market_rows['type_of_product'][valid],
+                         'y': np.log(prices[valid]), 'x': np.log(sizes[valid])})
+    groups = data.groupby('type')['x']
+    usable = (groups.transform('count') >= ELASTICITY_MIN_ROWS) & (groups.transform('nunique') >= 2)
+    data = data[usable]
+    if data.empty:
+        return ELASTICITY_DEFAULT, None, 0, 0
+    x = data['x'] - data.groupby('type')['x'].transform('mean')
+    y = data['y'] - data.groupby('type')['y'].transform('mean')
+    denominator = float((x * x).sum())
+    if not denominator > 0:
+        return ELASTICITY_DEFAULT, None, 0, 0
+    raw = float((x * y).sum() / denominator)
+    if not np.isfinite(raw):
+        return ELASTICITY_DEFAULT, None, 0, 0
+    b = float(min(max(raw, ELASTICITY_BOUNDS[0]), ELASTICITY_BOUNDS[1]))
+    return b, raw, int(data['type'].nunique()), int(len(data))
+
+
+def size_curve_rows(df_vol):
+    """The rows the elasticity is measured on, as `MARKET_ROWS_COLUMNS`: the volumetric competitor
+    rows given (main passes them after the variant collapse, before the trim) without multipacks."""
+    multipack = df_vol['is_multipack'] if 'is_multipack' in df_vol else False
+    multipack = pd.Series(multipack, index=df_vol.index).fillna(False).astype(bool)
+    rows = df_vol[~multipack]
+    return pd.DataFrame({
+        'type_of_product': rows['type_of_product'].values,
+        'price_per_unit': rows['price_per_liter'].astype(float).values,
+        'size': rows['volume_liters'].astype(float).values,
+        'is_reference': is_saudi_reference(rows).values,
+    }, columns=MARKET_ROWS_COLUMNS)
+
+
+def save_size_elasticity(df_vol, model_dir):
+    """Estimates the elasticity (`estimate_size_elasticity`) on `df_vol` (volumetric competitor rows,
+    collapsed and not trimmed) once over every row and once per channel, logs them and saves a dict
+    {channel: b, '': pooled b} to ELASTICITY_FILE next to the models. Bulk B2B prices fall less
+    with size than retail ones (2026-11-25 data with these fixes: pooled -0.76, B2B -0.63, B2C -0.85), so each SKU uses
+    its own channel's b; a channel that cannot be estimated gets the pooled one."""
+    def estimate(rows, label):
+        b, raw, types_used, rows_used = estimate_size_elasticity(size_curve_rows(rows))
+        if raw is None:
+            logger.warning(f"Price per liter vs size elasticity ({label}) could not be estimated.")
+            return None
+        logger.info(f"Price per liter vs size elasticity ({label}): {b:.3f} (raw {raw:.3f}, clipped to "
+                    f"{list(ELASTICITY_BOUNDS)}; {types_used} types, {rows_used} rows).")
+        return b
+
+    pooled = estimate(df_vol, 'all channels')
+    elasticities = {'': ELASTICITY_DEFAULT if pooled is None else pooled}
+    if pooled is None:
+        logger.warning(f"Using the default elasticity {ELASTICITY_DEFAULT}.")
+    channels = df_vol['channel'].astype('string').str.strip().fillna('') if 'channel' in df_vol else None
+    if channels is not None:
+        for channel in sorted(set(channels) - {''}):
+            b = estimate(df_vol[channels == channel], channel)
+            elasticities[channel] = elasticities[''] if b is None else b
+    joblib.dump(elasticities, os.path.join(model_dir, ELASTICITY_FILE))
+    return elasticities
 
 
 def filter_outliers_with_percentiles(df_comp, metric_col, p_lower=0.10, p_upper=0.90):
@@ -189,8 +310,11 @@ def main():
     # Wayakit data preparation
     df_wayakit_base = prepare_wayakit_training_data(df_quotes, df_products)
 
-    # Trimming per type (not for small types), after dropping implausible sizes.
+    # Trimming per type (not for small types), after dropping implausible sizes and collapsing
+    # identical variants (one competitor product, one row).
     df_vol_comp = drop_implausible_sizes(df_vol_comp)
+    df_vol_comp = collapse_identical_variants(df_vol_comp, 'volume_liters', 'volumetric')
+    df_unit_comp = collapse_identical_variants(df_unit_comp, 'total_quantity', 'units')
     df_vol_comp_cleaned = filter_outliers_with_percentiles(df_vol_comp, 'price_per_liter')
     df_unit_comp_cleaned = filter_outliers_with_percentiles(df_unit_comp, 'price_per_item')
 
@@ -244,6 +368,7 @@ def main():
     save_market_stats(build_market_rows(df_vol_comp_cleaned, 'price_per_liter', 'volume_liters'),
                       build_market_rows(df_unit_comp_cleaned, 'price_per_item', 'total_quantity'),
                       model_dir)
+    save_size_elasticity(df_vol_comp, model_dir)  # collapsed, not trimmed
     
     logger.info("🎉 Models and columns successfully saved.")
 

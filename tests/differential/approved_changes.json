@@ -10,5 +10,167 @@
     "date": "2026-11-17",
     "approved_by": "Mafer"
   },
-  "changes": []
+  "changes": [
+    {
+      "file": "ml_model/competitor_volumetric_processed.csv",
+      "type": "row_count",
+      "expected_cells": 1,
+      "reason": "1a drops competitor rows whose company is Wayakit (our own price): one Odoo competitor.product row in Aviation A2 (8,400 mL, 245.88 SAR).",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "column_added",
+      "column": "low_confidence",
+      "expected_cells": 1,
+      "reason": "New report column: the price comes from the model alone (fewer than 3 market rows). Report only, not uploaded.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "column_added",
+      "column": "previous_price",
+      "expected_cells": 1,
+      "reason": "New report column: the previous run's price used by the stability brake (NaN without a previous report, as here).",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "column_added",
+      "column": "stability_limited",
+      "expected_cells": 1,
+      "reason": "New report column: True when the stability brake (±15 % with an unchanged market) changed the price. All False here: no previous report.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "ceiling_source",
+      "expected_cells": 4,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "clamped_to_market",
+      "expected_cells": 22,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "competitors_count",
+      "expected_cells": 296,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "market_match",
+      "expected_cells": 356,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "market_max_found",
+      "expected_cells": 54,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "market_median_found",
+      "expected_cells": 321,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "market_min_found",
+      "expected_cells": 132,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "market_p75_found",
+      "expected_cells": 346,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "model_confidence",
+      "expected_cells": 442,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "porcentaje_de_ganancia",
+      "expected_cells": 614,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "predicted_price",
+      "expected_cells": 617,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "predicted_price_per_unit",
+      "expected_cells": 693,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "volume_capped",
+      "expected_cells": 7,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "value_changed",
+      "column": "volume_outside_market",
+      "expected_cells": 12,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "date": "2026-11-25",
+      "approved_by": "Mafer"
+    }
+  ]
 }

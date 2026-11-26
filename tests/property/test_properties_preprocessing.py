@@ -139,3 +139,52 @@ def test_unit_keeps_exactly_the_valid_rows(tmp_dir, rows):
     """The output has exactly the valid rows (numeric quantity > 0, price > 0)."""
     input_df, output = _run_unit(tmp_dir, rows)
     assert sorted(output["row_id"]) == sorted(_valid_unit(input_df)["row_id"])
+
+
+# --- Case packs (audit 2026-11-25: AeroSense "<size> <container> x N", "N cartons", GoGreen
+# Arabic cartons). No false positives on dimensions or on a single carton. -----------------------
+
+NAMES = st.sampled_from(["Cabin Cleaner", "Microfiber Mat", "Leather Conditioner", "Avionics Wipes",
+                         "Glass Cleaner Triple Action", "Floor Towel"])
+ARABIC_NAMES = st.sampled_from(["مطهر و معقم الاسطح", "مزيل البقع للملابس البيضاء", "منظف الارضيات"])
+SIZES = st.one_of(st.integers(1, 5000).map(str), st.decimals("0.1", "99.9", places=1).map(str))
+VOLUME_WORDS = st.sampled_from(["ml", "ML", "litre", "liter", "L", "ltr"])
+CONTAINERS = st.sampled_from(["spray bottle", "bottle", "can", "jerrycan", "canister", "drum", "pouch"])
+LENGTHS = st.sampled_from(["cm", "mm", "m", "in", "inch", "inches", "ft"])
+SCENTS = st.sampled_from(["", " - Fresh Lemon", " Linen Breeze"])
+
+
+@given(name=NAMES, a=SIZES, b=SIZES, length=LENGTHS, size=SIZES, volume=VOLUME_WORDS, container=CONTAINERS,
+       with_size=st.booleans())
+@example(name="Microfiber Mat", a="40", b="40", length="cm", size="500", volume="ml", container="bottle",
+         with_size=True)
+def test_dimensions_are_never_a_case_pack(name, a, b, length, size, volume, container, with_size):
+    """'40 x 40 cm', and a container followed by 'x 40 cm', are a dimension, never a pack."""
+    prefix = f"{name} {size} {volume} {container}" if with_size else name
+    for title in (f"{prefix} {a} x {b} {length}", f"{prefix} x {b} {length}", f"{prefix} x {b}{length}"):
+        assert preprocessing.case_pack(title) == 1, title
+        assert preprocessing.flag_multipacks([title], ["units"], [1.0]) == [False], title
+        if with_size:
+            assert preprocessing.flag_multipacks([title], ["ml"], [500.0]) == [False], title
+
+
+@given(name=NAMES, pieces=st.integers(1, 5000), scent=SCENTS, arabic=ARABIC_NAMES, liters=st.integers(1, 30))
+def test_a_single_carton_is_not_a_case_pack(name, pieces, scent, arabic, liters):
+    """'1 carton (500 pcs)' is one package; an Arabic carton without a count of 2 or more too."""
+    english = f"{name} - 1 carton ({pieces} pcs){scent}"
+    assert preprocessing.case_pack(english) == 1
+    assert preprocessing.flag_multipacks([english], ["units"], [float(pieces)]) == [False]
+    for title in (f"كرتون {arabic} 1 حبة ({liters}لتر)", f"كرتون {arabic} {liters} لتر", f"{arabic} {liters} لتر"):
+        assert preprocessing.case_pack(title) == 1, title
+        assert preprocessing.flag_multipacks([title], ["l"], [float(liters)]) == [False], title
+
+
+@given(name=NAMES, size=SIZES, volume=VOLUME_WORDS, container=CONTAINERS, n=st.integers(2, 9999), scent=SCENTS,
+       arabic=ARABIC_NAMES, liters=st.integers(1, 30))
+def test_case_notations_are_flagged(name, size, volume, container, n, scent, arabic, liters):
+    """Every '<size> <container> x N', 'N cartons' and Arabic carton with N >= 2 is a multipack."""
+    for title, unit in ((f"{name} - {size} {volume} {container} x {n}{scent}", "ml"),
+                        (f"{name} - {n} cartons ({n * 500} pcs){scent}", "units"),
+                        (f"كرتون {arabic} {n} حبة ({liters}لتر)", "l")):
+        assert preprocessing.case_pack(title) == n, title
+        assert preprocessing.flag_multipacks([title], [unit], [float(n * 500)]) == [True], title

@@ -61,11 +61,11 @@ P6-Aquarium cleaner ,Liquid treatment
 A1-Leather cleaner,aerosense:deep cleaner leather; aerosense:leather cleaner conditioner
 A1-Leather conditioner,aerosense:leather conditioner; aerosense:leather cleaner conditioner
 A1-Wet wipes for various cleaning purposes,aerosense:cabin cleaning wipes triple action; aerosense:avionics wipes
-A2-Broad-spectrum disinfectant for surfaces,aerosense:cabin disinfectant ready use; aerosense:cabin disinfectant concentrate
-A3-Streak-free window cleaner,aerosense:windshield cleaner; aerosense:airframe cleaner
-A3-Cockpit glass cleaner,aerosense:windshield cleaner; aerosense:airframe cleaner
-A3-Mirror and plexiglass cleaner,aerosense:windshield cleaner; aerosense:airframe cleaner
-A4-Lavatory disinfectant,aerosense:flushman lavatory additive
+A2-Broad-spectrum disinfectant for surfaces,aerosense:cabin disinfectant ready use
+A3-Streak-free window cleaner,aerosense:windshield cleaner
+A3-Cockpit glass cleaner,aerosense:windshield cleaner
+A3-Mirror and plexiglass cleaner,aerosense:windshield cleaner
+A4-Lavatory disinfectant,
 A4-Toilet and urinal cleaner,
 A4-Odor urinal neutralizer,
 A4-Aircraft air freshener,aerosense:aeroscent air freshener
@@ -143,10 +143,10 @@ F2-FM general hard floor cleaner,fine:Floor Cleaner; gogreen:floor cleaner; offi
 F2-FM hard floor polish,
 F2-FM high performance waterless carpet cleaner,
 F2-FM high performance carpet shampoo,gogreen:carpet shampoo
-F2-FM stain spot remover,gogreen:stain remover
+F2-FM stain spot remover,gogreen:carpet and upholstery stain remover
 F2-FM marble floor cleaner,
 F2-FM hardwood and laminate floor cleaner,officesupply: wood floor cleaner
-F3-FM broad-spectrum disinfectant for surfaces and touchpoints,fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+F3-FM broad-spectrum disinfectant for surfaces and touchpoints,fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 F3-FM surface sanitizing wipes,
 F4-FM heavy-duty toilet and urinal cleaner,officesupply:toilet cleaner
 F4-FM restroom deodorizer,officesupply:Blue Drops Automatic Bowl Cleaner - Hygiene Supplies | unbranded
@@ -175,8 +175,8 @@ I2-Marble floor cleaner,
 I2-Hardwood and laminate floor cleaner,officesupply:wood floor cleaner
 I3-Low-moisture waterless carpet cleaner,
 I3-High performance carpet shampoo,gogreen:carpet shampoo
-I3-Stain spot remover,gogreen: stain remover
-"I4-Broad-spectrum disinfectant for surfaces, shoe racks and storage areas",fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+I3-Stain spot remover,gogreen:carpet and upholstery stain remover
+"I4-Broad-spectrum disinfectant for surfaces, shoe racks and storage areas",fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 I4-Surface sanitizing wipes,
 I5-Mildew and mold remover for wet areas,
 I6-Heavy-duty toilet and urinal cleaner,officesupply:toilet cleaner
@@ -204,13 +204,13 @@ S1-Hard floor polish,
 S1-Hardwood and laminate floor cleaner,officesupply:wood floor cleaner
 S1-Marble floor cleaner,
 S1-High performance carpet shampoo,gogreen:carpet shampoo
-S1-Stain spot remover,gogreen:Dry Stain Remover
+S1-Stain spot remover,gogreen:carpet and upholstery stain remover
 S2-Toilet bowl and urinal cleaner,officesupply:toilet cleaner
 S2-Mildew and mold remover for wet areas,
 S2-Antibacterial hand soap,gogreen:Anti-bacterial Hand Soap; officesupply:hand soap
 S2-Shower and tile cleaner,officesupply:bathroom cleaner
 S2-Body wash gel,
-S3-Broad-spectrum disinfectant for surfaces,fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+S3-Broad-spectrum disinfectant for surfaces,fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 S4-Stain remover for laundry,gogreen:stain remover clothes
 S4-Sanitizing fabric refresher for towels and sports clothes,officesupply:Air and Fabric Freshener
 S5-Disinfectant wipes and sprays for gym equipment,
@@ -300,9 +300,9 @@ L1-Marble floor cleaner,
 L1-Hardwood and laminate floor cleaner,officesupply:wood floor cleaner
 L1-Low-moisture waterless carpet cleaner,
 L1-High performance carpet shampoo,gogreen:carpet shampoo
-L1-Stain spot remover,gogreen:stain remover
+L1-Stain spot remover,gogreen:carpet and upholstery stain remover
 L1-Streak-free glass cleaner for mirrors and windows,fine:Glass cleaner; gogreen:glass cleaner; officesupply:glass cleaner
-L2-Broad-spectrum disinfectant for spas and salons equipment,fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+L2-Broad-spectrum disinfectant for spas and salons equipment,fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 L2-Surface disinfectant wet rags for spas and salons equipment,
 L3-Toilet bowl and urinal cleaner,officesupply:toilet cleaner
 L3-Mildew and mold remover for wet areas,
@@ -324,10 +324,10 @@ E2-General hard floor cleaner,fine:Floor Cleaner; gogreen:floor cleaner; offices
 E2-Hard floor polish,
 E2-High performance waterless carpet cleaner,
 E2-High performance carpet shampoo,gogreen:carpet shampoo
-E2-Stain spot remover,gogreen:Dry Stain Remover
+E2-Stain spot remover,gogreen:carpet and upholstery stain remover
 E2-Marble floor cleaner,
 E2-Hardwood and laminate floor cleaner,officesupply:wood floor cleaner
-"E3-Broad-spectrum disinfectant for surfaces, mattress and touchpoints",fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+"E3-Broad-spectrum disinfectant for surfaces, mattress and touchpoints",fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 E3-Surface disinfectant wet rags,
 E4-Heavy-duty toilet and urinal cleaner,officesupply:toilet cleaner
 E4-Restroom deodorizer,officesupply:Blue Drops Automatic Bowl Cleaner - Hygiene Supplies | unbranded
@@ -357,7 +357,7 @@ E10-HVAC system cleaner,gogreen:Air Conditioner and Coil Cleaner
 E10-HVAC system deodorizer,
 E11-Stain remover for laundry,gogreen:stain remover
 "E11-Fabric refresher for linen, towels, curtains, mattresses and upholstery",officesupply:Air and Fabric Freshener
-E13-Broad-spectrum disinfectant for spas and salons equipment,fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+E13-Broad-spectrum disinfectant for spas and salons equipment,fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 E14-Non-slip floor cleaner for gym floors and exercise areas,fine:Floor Cleaner; gogreen:floor cleaner; officesupply:floor cleaner
 E14-Lubricant for maintaining machinery and weight systems,
 "E14-Disinfectant spray for gym equipment, yoga mats and exercise mats",gogreen:Surface Cleaner and Disinfectant
@@ -484,9 +484,9 @@ U2-Marble floor cleaner,
 U2-Hardwood and laminate floor cleaner,officesupply:wood floor cleaner
 U2-High performance waterless carpet cleaner,
 U2-High performance carpet shampoo,gogreen: carpet shampoo
-U2-Stain spot remover,gogreen:Dry Stain Remover
+U2-Stain spot remover,gogreen:carpet and upholstery stain remover
 U3-Streak-free glass cleaner for large window areas,fine:Glass cleaner; gogreen:glass cleaner; officesupply:glass cleaner
-U4-Broad-spectrum disinfectants for sanitizing work areas and break rooms ,fine:Disinfectant; gogreen:disinfectant; officesupply:disinfectant
+U4-Broad-spectrum disinfectants for sanitizing work areas and break rooms ,fine:Disinfectant; gogreen:surface disinfectant; officesupply:disinfectant
 U4-Surface disinfectant wet rags,
 U5-Toilet and urinal cleaner,officesupply:toilet cleaner
 U5-Restroom deodorizer,officesupply:Blue Drops Automatic Bowl Cleaner - Hygiene Supplies | unbranded

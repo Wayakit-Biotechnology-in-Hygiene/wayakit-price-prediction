@@ -189,3 +189,89 @@ def test_odoo_source_channel_is_carried_and_older_files_get_empty(tmp_path, monk
     (tmp_path / "b").mkdir()
     volume, _ = _run_main(tmp_path / "b", monkeypatch, [_scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0)])
     assert volume["source_channel"].fillna("").tolist() == ["", ""]
+
+
+# Real titles of the 2026-11-25 run (AeroSense and GoGreen), copied as literals: (title, unit,
+# total_quantity, is_multipack). The totals were already right; only the case flag was missing.
+CASE_PACK_TITLES = [
+    ("Deep Cleaner for Leather - 946 ml spray bottle x 12", "ml", 11352.0, True),
+    ("Leather Cleaner & Conditioner - 946 ml spray bottle x 12", "ml", 11352.0, True),
+    ("Leather Conditioner - 473 ml bottle x 12", "ml", 5676.0, True),
+    ("Cabin Disinfectant Ready-to-use - 750 ml spray bottle x 6", "ml", 4500.0, True),
+    ("Cabin Disinfectant Ready-to-use - 750 ml spray bottle x 18", "ml", 13500.0, True),
+    ("Cabin Disinfectant Concentrate - 5 litre can x 4", "ml", 20000.0, True),
+    ("Windshield Cleaner - 750 ml spray bottle x 6", "ml", 4500.0, True),
+    ("Airframe Cleaner - 5 litre can x 4", "ml", 20000.0, True),
+    ("Flushman Lavatory Additive - 5 litre can x 4", "ml", 20000.0, True),
+    ("AeroScent Air Freshener - 150 ml spray bottle x 24 Fresh Lemon", "ml", 3600.0, True),
+    ("AeroScent Air Freshener - 150 ml spray bottle x 144 Fresh Lemon", "ml", 21600.0, True),
+    ("Cabin Cleaner Triple Action - 150 ml spray bottle x 24 Linen Breeze", "ml", 3600.0, True),
+    ("Cabin Cleaner Triple Action - 150 ml spray bottle x 144 Fresh Lemon", "ml", 21600.0, True),
+    ("Hangar Floor Cleaner - 5 litre can x 4", "ml", 20000.0, True),
+    ("Carpet Cleaner - 5 litre can x 4", "ml", 20000.0, True),
+    ("Insect Remover - 750 ml spray bottle x 6", "ml", 4500.0, True),
+    ("Cabin Cleaning Wipes Triple Action - 4 cartons (2000 pcs) - Fresh Lemon", "units", 2000.0, True),
+    ("Cabin Cleaning Wipes Triple Action - 20-pack x 40 - Fresh Lemon", "units", 800.0, True),
+    ("كرتون مطهر و معقم الاسطح 4 حبة (5لتر)", "l", 20.0, True),
+    ("كرتون مزيل البقع للملابس البيضاء ليوبارد 12 حبة (1لتر)", "l", 12.0, True),
+    ("كرتون 12 حبة مزيل البقع 1 لتر", "l", 12.0, True),  # the count before the size
+    ("مطهر و معقم الاسطح 4 كراتين (5 لتر)", "l", 20.0, True),  # the plural: 4 cartons
+    ("مناديل مبللة ٤ كراتين", "units", 400.0, True),  # Arabic-Indic digits
+    ("مطهر 2 كرتونات 1 لتر", "l", 2.0, True),
+    # Single packages: never flagged.
+    ("Deep Cleaner for Leather - 946 ml spray bottle", "ml", 946.0, False),
+    ("Leather Conditioner - 473 ml bottle", "ml", 473.0, False),
+    ("Cabin Disinfectant Ready-to-use - 20 litre can", "ml", 20000.0, False),
+    ("Airframe Cleaner - 20 litre can", "ml", 20000.0, False),
+    ("Cabin Cleaning Wipes Triple Action - 1 carton (500 pcs) - Fresh Lemon", "units", 500.0, False),
+    ("Avionics Wipes - 1 carton (400 pcs)", "units", 400.0, False),
+    ("منظف الارضيات 3 لتر - ليمون", "l", 3.0, False),
+    ("كرتون مطهر و معقم الاسطح 1 حبة (5لتر)", "l", 5.0, False),  # a carton of one is one package
+    ("مطهر و معقم الاسطح 1 كراتين (5 لتر)", "l", 5.0, False),  # a count of one
+    ("منظف و مطهر الاسطح بدون عطر ولون 30 لتر", "l", 30.0, False),
+    ("صابون ايدي مضاد للبكتيريا 350 مل - ورد", "ml", 350.0, False),
+    ("شامبو غسيل السجاد من GO GREEN - تنظيف وتعقيم (2 لتر)", "l", 2.0, False),
+    ("Microfiber Cloth 40 x 40 cm", "units", 1.0, False),
+    ("Glass Cleaner 4 L (1 Gallon)", "l", 4.0, False),  # the same single size said twice
+    ("Degreaser 24oz - 709ml spray bottle", "ml", 709.0, False),
+]
+
+
+@pytest.mark.parametrize("title,unit,quantity,expected", CASE_PACK_TITLES)
+def test_flag_multipacks_reads_aerosense_and_gogreen_case_packs(title, unit, quantity, expected):
+    """Audit 2026-11-25 (AS-3, GG-11): case packs written "<size> <container> x N", "N cartons" or
+    as an Arabic carton with a count are multipacks; a single package (one carton included) is not."""
+    assert preprocessing.flag_multipacks([title], [unit], [quantity]) == [expected]
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("AeroScent Air Freshener - 150 ml spray bottle x 144 Fresh Lemon", 144),  # above volume_pack's 100
+    ("Cabin Disinfectant Concentrate - 5 litre can x 4", 4),
+    ("Cabin Cleaning Wipes Triple Action - 4 cartons (2000 pcs) - Fresh Lemon", 4),
+    ("كرتون مطهر و معقم الاسطح ٤ حبات (٥ لتر)", 4),  # Arabic-Indic digits
+    ("Avionics Wipes - 1 carton (400 pcs)", 1),
+    ("مطهر 4 حبة (5لتر)", 1),  # no carton word: left to the adapters' readers
+    ("كرتون 4 حبة و 2 عبوة 5 لتر", 1),  # two counts: not one case
+    ("Cleaner 750 ml spray bottle x 2.5", 1),
+    ("Mat 60 ml bottle x 40 cm", 1),
+    (None, 1),
+])
+def test_case_pack_examples(title, expected):
+    assert preprocessing.case_pack(title) == expected
+
+
+def test_main_excludes_wayakit_company_rows(tmp_path, monkeypatch):
+    """Audit 2026-11-25 (AS-4): an Odoo competitor.product row with company WAYAKIT (8,400 mL at
+    245.88 SAR in Aviation A2) is our own price: it is never in training or in the market band.
+    Scraper rows with a Wayakit company are dropped too; another company is kept."""
+    wayakit_odoo = {**ODOO_ROW, "Total quantity": 8400.0, "Price per unit SAR": 245.88, "Company": "WAYAKIT"}
+    scraper_rows = [
+        {**_scraper_row("Cleaner 500 ml", 10.0, "ml", 500.0), "company": " Wayakit "},
+        {**_scraper_row("Cleaner 1 L", 11.0, "L", 1.0), "company": "WAYAKIT GreenTech"},
+        {**_scraper_row("Wipes 80", 8.0, "units", 80.0), "company": "wayakit"},
+        _scraper_row("Cleaner 750 ml", 12.0, "ml", 750.0),
+    ]
+    volume, units = _run_main(tmp_path, monkeypatch, scraper_rows, [wayakit_odoo, ODOO_ROW])
+    assert sorted(volume["company"]) == ["Brand", "Callington"]
+    assert sorted(volume["price_sar"]) == [12.0, 1000.50]
+    assert units.empty

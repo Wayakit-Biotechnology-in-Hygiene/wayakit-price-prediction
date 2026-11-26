@@ -350,6 +350,15 @@ def test_gogreen_arabic_sizes(title, mode, expected):
 
 
 @pytest.mark.parametrize("title", [
+    "مطهر 4 كراتين 5 لتر",        # four cartons, bottles per carton unknown
+    "كرتون منظف الارضيات 3 لتر",   # a carton with no count
+    "كرتونة صابون ايدي 350 مل",
+])
+def test_gogreen_a_carton_without_a_bottle_count_has_no_size(title):
+    assert gg.arabic_size(title, "volume") is None
+
+
+@pytest.mark.parametrize("title", [
     "شامبو غسيل السجاد 2 لتر  و  مزيل البقع على الجاف 1 لتر",  # two products
     "صابون الأيدي 3.8 لتر  و  350 ملي صدف",
     "مجموعة منظفات المطبخ",  # a set

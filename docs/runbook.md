@@ -210,6 +210,25 @@ Since F3 (one run, no stages):
 
 Running the whole script (`bash run_pipeline.sh`, with no arguments since F3; with the pre-F2 code, `bash run_pipeline.sh` for stage 1 and `--stage 2` for stage 2) also works, but **it shuts down the instance when it finishes**. See [The monthly run (after the cutover)](#the-monthly-run-after-the-cutover) to run it with the service's environment.
 
+### Scraping only some sites (one-off)
+
+Used on 2026-11-25 to add GoGreen and AeroSense to the 2026-11-24 data without paying Apify again (decision of that day). There is no CLI option for it; on the instance, outside the code folder (`/home/ec2-user/pi-manual-run/`):
+
+1. Back up the outputs of the run you add to: `scraper/competitors_complete.csv`, `scraper/analysis-odoo.csv` (step 2 rewrote it; a pull restores the versioned one) and the ignored/untracked files (`git ls-files -o -i --exclude-standard`).
+2. A wrapper that limits the sites and runs the unchanged scraper:
+   ```python
+   import os, signal, sys
+   sys.path.insert(0, os.path.join(os.getcwd(), 'scraper'))
+   import main
+   KEEP = {'gogreen', 'aerosense'}
+   main.config.TARGET_MAP = {k: [s for s in v if s in KEEP] for k, v in main.config.TARGET_MAP.items()}
+   main.config.TARGET_MAP = {k: v for k, v in main.config.TARGET_MAP.items() if v}
+   signal.signal(signal.SIGTERM, main._exit_on_sigterm)
+   sys.exit(main.main(sys.argv[1:], apify_preflight=lambda: None))  # no Apify site scraped
+   ```
+   run from the repo root with `--analysis_file <the backed-up search list> --output_mode append --output_file scraper/competitors_complete.csv` (the CSV is replaced only if scraping succeeds). If `modifiers_mapping.csv` changed since that search list was made, regenerate it from the backed-up `ml_model/wayakit_products.csv` with `scraper/odoo_api_connection_products.py` first.
+3. A copy of `run_pipeline.sh` with steps 1, 2, 4a and 4b removed, step 3 replaced by the wrapper and step 10 with `--dry-run`, started as a transient systemd unit (`systemd-run --unit=<name> --uid=ec2-user --gid=ec2-user -p WorkingDirectory=<repo> -p EnvironmentFile=/etc/price-intelligence.env -p KillMode=control-group /bin/bash <copy>`), so the timeout, the alert and the shutdown work as in a scheduled run.
+
 ---
 
 ## Pausing the run
@@ -255,6 +274,14 @@ What to check:
 What PI reads from Odoo: `product.master` (active), `sale.order.line` (confirmed sales; since F2 the **last 12 rolling months** up to the run date, before fixed to 2025), `competitor.product` (all records) and, before writing, `res.company` (since F2).
 
 ---
+
+## Stability brake and low confidence
+
+Since 2026-11-25 (decision of that day). `3_predicted_prices.py` compares each SKU with the previous run's report, `$PI_LOG_DIR/state/last_uploaded_prediction_report.csv` (`--previous_report <file>` uses another one). When the SKU's market did not change (same `competitors_count`, `ceiling_source` and `volume`; `market_min_found` and `market_max_found` within 0.5 %) and the band does not set its price (`clamped_to_market` False), its price per liter or per piece is kept within ±15 % of `previous_price` / size and then clipped back to its band (never above the p75, never below the minimum where the minimum applies); the report says `stability_limited`. This happens inside `generate_predictions()`, after the band clamp and before the smaller-sibling cap, so a SKU above the market is capped at its sibling's braked price; the margin floor still wins. A missing file means no brake (logged).
+
+- **Who writes the file:** `odoo_api_price_suggestion.py`, atomically, as soon as a real upload's create returns and before the cleanup of the previous batch (the new prices are then what Odoo shows); never `--dry-run`, a failed create or `--cleanup-previous`. A failed cleanup therefore leaves the file with the new prices (finish it with `--cleanup-previous` as usual). If only the copy fails, the upload stands, an older file is removed, the cleanup still runs, the script exits 1 and the alert fires: copy `ml_model/wayakit_prediction_report.csv` there by hand; do not upload again.
+- **Seeding it (first upload, 2026-11):** before running step 3, copy the 2026-11-24 report there (from `/home/ec2-user/pi-manual-run/run_20261124/outputs.tgz`, `ml_model/wayakit_prediction_report.csv`), with Mafer's OK.
+- **`low_confidence`** (report only): fewer than 3 competitor rows, so the price comes from the model alone. Review these first; Odoo has no field for it yet.
 
 ## Re-uploading suggestions
 
