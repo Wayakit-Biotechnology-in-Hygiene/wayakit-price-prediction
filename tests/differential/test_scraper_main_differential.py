@@ -36,6 +36,10 @@ saved search and product pages and require the same rows and the same relevance-
 Hypothesis property over product titles for the product-page parsers. When the base is already a
 Playwright version (after this change is merged) the same tests still compare base and new.
 
+The removed and added sites (Mumzworld out of Home, GoGreen into Home, both 2026-11-25) only count
+while the base still has, or still lacks, them: against a base that already has the change the
+whole CSV and every TARGET_MAP entry must match, with no exception left.
+
 Selenium is not installed any more: the base `scraper/main.py` and scrapers import the fake one.
 
 If the base ref does not exist locally the tests FAIL (`git fetch origin`).
@@ -183,6 +187,24 @@ def _materialize_base(tmp: Path) -> Path:
         pytest.fail(f"cannot extract '{ref}' (git fetch origin?): {error}", pytrace=False)
 
 
+def _base_config(base_root: Path):
+    """The base `scraper/config.py`, loaded on its own (it imports nothing from the tree)."""
+    spec = importlib.util.spec_from_file_location("pi_base_scraper_config", base_root / "scraper" / "config.py")
+    base_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(base_config)
+    return base_config
+
+
+def _sites_still_removed(base_map):
+    """REMOVED_SITES the base still scrapes (a base that already removed them has nothing to filter)."""
+    return {k: tuple(s for s in v if s in base_map.get(k, ())) for k, v in REMOVED_SITES.items()}
+
+
+def _sites_still_added(base_map):
+    """ADDED_SITES the base does not scrape yet (a base that already has them must match fully)."""
+    return {k: tuple(s for s in v if s not in base_map.get(k, ())) for k, v in ADDED_SITES.items()}
+
+
 def _run_base(base_root: Path, tmp: Path, out: Path) -> bool:
     """Runs the base scraper into ``out``. Returns True when the base already has the F6 shape."""
     script = base_root / "scraper" / "main.py"
@@ -198,7 +220,11 @@ def _run_base(base_root: Path, tmp: Path, out: Path) -> bool:
             is_f6 = "apify_preflight" in inspect.signature(base.main).parameters
             kwargs = dict(agent_factory=FakeAgent,
                           scraper_factory=lambda d, a: {s: FakeScraper(s) for s in SITES},
-                          driver_installer=lambda: "/fake/chromedriver", sleep=lambda s: None)
+                          sleep=lambda s: None)
+            if "browser_factory" in inspect.signature(base.main).parameters:  # Playwright base
+                kwargs["browser_factory"] = lambda: "/fake/browser"
+            else:  # Selenium base
+                kwargs["driver_installer"] = lambda: "/fake/chromedriver"
             if is_f6:
                 # F6 shape: same fakes as the new version, and no real Apify preflight.
                 kwargs.update(scraper_factory=lambda d, a: {s: FakeScraper(s, with_new_keys=s in APIFY_SITES)
@@ -250,23 +276,30 @@ def test_same_scraper_outputs_give_the_same_rows_except_the_removed_and_added_si
     assert _run_new(new_out, tmp_path / "coverage.csv") == 0
     base_header, base_rows = _read(base_out)
     new_header, new_rows = _read(new_out)
+    base_map = _base_config(base_root).TARGET_MAP
     # Mafer, 2026-11-25: Mumzworld leaves TARGET_MAP (HTTP 403 to every automated client). The
-    # base still writes its rows; the new version writes none and every other row is unchanged.
-    removed = [r for r in base_rows if r["source"] in REMOVED_SOURCES]
-    assert removed, "the test would prove nothing: the base wrote no Mumzworld rows"
+    # new version writes no Mumzworld rows; a base that still scrapes it writes some, and every
+    # other row is unchanged.
     assert not [r for r in new_rows if r["source"] in REMOVED_SOURCES], "Mumzworld is still scraped"
-    base_rows = [r for r in base_rows if r["source"] not in REMOVED_SOURCES]
-    # GoGreen in Home (2026-11-25): rows only the new version writes; every other row is unchanged.
-    added = [r for r in new_rows if _added(r)]
-    assert added, "the test would prove nothing: the new version wrote no GoGreen rows in Home"
-    assert all(r["channel"] == "B2C" for r in added)
-    assert not [r for r in base_rows if _added(r)], "the base already scraped GoGreen in Home"
-    new_rows = [r for r in new_rows if not _added(r)]
+    still_removed = _sites_still_removed(base_map)
+    removed = [r for r in base_rows if r["source"] in still_removed.get(r["subindustry"], ())]
+    if any(still_removed.values()):
+        assert removed, "the test would prove nothing: the base wrote no Mumzworld rows"
+    base_rows = [r for r in base_rows if r not in removed]
+    # GoGreen in Home (2026-11-25): against a base without it, rows only the new version writes;
+    # against a base that has it, the same rows on both sides.
+    assert [r for r in new_rows if _added(r)], "the new version wrote no GoGreen rows in Home"
+    assert all(r["channel"] == "B2C" for r in new_rows if _added(r))
+    still_added = _sites_still_added(base_map)
+    added = [r for r in new_rows if r["source"] in still_added.get(r["subindustry"], ())]
+    assert not [r for r in base_rows if r["source"] in still_added.get(r["subindustry"], ())], \
+        "the base wrote rows for a site its TARGET_MAP does not have"
+    new_rows = [r for r in new_rows if r not in added]
 
     if base_is_f6:
         # The base already has F6: same fakes, so every other row must not change at all.
         assert new_header == base_header
-        assert new_rows == base_rows, "the CSV changed against an F6 base (Mumzworld and GoGreen in Home aside)"
+        assert new_rows == base_rows, "the CSV changed against an F6 base (sites removed or added since aside)"
     else:
         assert new_header == base_header + ["seller", "origin"]
         for source in [s for s in SITES if s not in REMOVED_SOURCES]:
@@ -302,19 +335,21 @@ def test_shared_parsers_ai_and_exclusions_are_unchanged(tmp_path):
     assert diff.returncode == 0, f"ticket A: these files must stay identical to '{ref}': {UNCHANGED_FILES}"
 
     base_root = _materialize_base(tmp_path)
-    spec = importlib.util.spec_from_file_location("pi_base_scraper_config", base_root / "scraper" / "config.py")
-    base_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(base_config)
+    base_config = _base_config(base_root)
     new_config = load_module("scraper/main.py").config
     assert new_config.MUMZWORLD_EXCLUSIONS == base_config.MUMZWORLD_EXCLUSIONS
     assert new_config.SACO_EXCLUSIONS == base_config.SACO_EXCLUSIONS
     assert new_config.USER_AGENT == base_config.USER_AGENT  # the base Selenium scrapers sent it
     assert set(new_config.TARGET_MAP) == set(base_config.TARGET_MAP)
     base_has_noon = any("noon" in sites for sites in base_config.TARGET_MAP.values())
+    still_removed = _sites_still_removed(base_config.TARGET_MAP)
+    still_added = _sites_still_added(base_config.TARGET_MAP)
     for key, base_sites in base_config.TARGET_MAP.items():
         new_sites = new_config.TARGET_MAP[key]
-        base_sites = [s for s in base_sites if s not in REMOVED_SITES.get(key, ())]
-        new_sites = [s for s in new_sites if s not in ADDED_SITES.get(key, ())]
+        assert not set(REMOVED_SITES.get(key, ())) & set(new_sites), f"TARGET_MAP[{key!r}] has a removed site"
+        assert set(ADDED_SITES.get(key, ())) <= set(new_sites), f"TARGET_MAP[{key!r}] lost an added site"
+        base_sites = [s for s in base_sites if s not in still_removed.get(key, ())]
+        new_sites = [s for s in new_sites if s not in still_added.get(key, ())]
         if base_has_noon:  # the base already has F6: no site may change at all
             assert new_sites == base_sites, f"TARGET_MAP[{key!r}] changed"
         else:
@@ -485,8 +520,10 @@ def test_mumzworld_and_saco_give_the_same_rows_from_the_same_saved_html(base_mod
     base_arg = SavedBrowser() if "browser" in inspect.signature(base_cls.__init__).parameters else "/fake/chromedriver"
     if base_arg != "/fake/chromedriver":
         for module in base_modules:
-            monkeypatch.setattr(module, "fetch_html", _saved_fetch(MUMZ_SITE | SACO_SITE, sys.modules[
-                new_mumz.collect_products.__module__]), raising=False)
+            # The base `services.browser` (its own exception classes, which its collect_products
+            # catches), not the new one that `sys.modules` holds again after the isolated import.
+            base_browser = types.SimpleNamespace(**module.fetch_html.__globals__)
+            monkeypatch.setattr(module, "fetch_html", _saved_fetch(MUMZ_SITE | SACO_SITE, base_browser))
     base_rows, base_calls = _run_scraper(base_cls, base_arg, searches)
     new_rows, new_calls = _run_scraper(new_cls, SavedBrowser(), searches)
     assert new_rows == base_rows
