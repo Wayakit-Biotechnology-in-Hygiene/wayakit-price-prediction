@@ -17,6 +17,7 @@ The generated products resemble the F1 ``wayakit_products_to_predict_odoo.csv``:
 liters or pieces, and products with neither set to 0 or empty (F1 has 26 like that; the cost
 can be 0).
 """
+import io
 import math
 
 import numpy as np
@@ -42,6 +43,21 @@ NUMERIC_COLUMNS = [
 FLOOR_FACTOR = 1.30
 CENT = 0.01  # rounding to the cent; the floor is rounded up, so up to a whole cent
 MARKET_COLUMNS = ["type_of_product", "price_per_unit", "size", "is_reference"]
+# Size adjustment (2026-11-25): only rows larger than the SKU are adjusted, and a row counts as at most
+# 4 times larger; rows smaller than the SKU are taken as they are.
+MAX_SIZE_RATIO = 4.0
+
+
+def _ratio(size, row_sizes):
+    """The size ratio of the size-adjusted ceiling, clipped exactly as in production (np.clip)."""
+    return np.clip(size / np.asarray(row_sizes, dtype=float), 1 / MAX_SIZE_RATIO, 1.0)
+
+
+def _b_for(elasticity, channel):
+    """Oracle of the elasticity a SKU uses: its channel's b, else the pooled one ('')."""
+    if elasticity is None or not isinstance(elasticity, dict):
+        return elasticity
+    return elasticity.get(channel, elasticity[""])
 
 
 class FakeTree:
@@ -110,7 +126,7 @@ def _size(p):
     return None, 0.0
 
 
-def _run(product_list, vol_market, unit_market, trees):
+def _run(product_list, vol_market, unit_market, trees, elasticity=None, previous_report=None):
     vol_prices = [p["model_price"] for p in product_list if _size(p)[0] == "Volume_Liters"]
     unit_prices = [p["model_price"] for p in product_list if _size(p)[0] == "Pack_quantity_Units"]
     df = pd.DataFrame(product_list).drop(columns="model_price")
@@ -122,20 +138,32 @@ def _run(product_list, vol_market, unit_market, trees):
         ["total_quantity"],
         vol_market,
         unit_market,
+        vol_elasticity=elasticity,
+        previous_report=previous_report,
     )
 
 
-def _p75(rows, size):
+def _p75(rows, size, elasticity=None):
+    """p75 of the similar-size rows when there are 3; else of every row, adjusted to `size` with
+    `elasticity` when it is given (volumetric only, 2026-11-25), the size ratio clipped to [1/4, 1],
+    and capped at the rows' highest price per unit (2026-11-26)."""
     similar = rows[(rows["size"] * 2 >= size) & (rows["size"] <= size * 2)]
-    used = similar if len(similar) >= 3 else rows
-    return float(np.quantile(used["price_per_unit"], 0.75))
+    if len(similar) >= 3:
+        return float(np.quantile(similar["price_per_unit"], 0.75))
+    if elasticity is None:
+        return float(np.quantile(rows["price_per_unit"], 0.75))
+    adjusted = rows["price_per_unit"].to_numpy(dtype=float) * _ratio(size, rows["size"]) ** elasticity
+    # Audit 2026-11-26 (E3): never above the highest price per unit of the rows.
+    return float(min(np.quantile(adjusted, 0.75), rows["price_per_unit"].max()))
 
 
-def _band(product, vol_market, unit_market):
+def _band(product, vol_market, unit_market, elasticity=None):
     """Independent oracle of the market band: (count, low, p75, size_min, size_max) or None.
 
     F7b: for a B2C product with 3 or more Saudi reference rows of its type, the p75 comes from
-    those rows only; the minimum always comes from every row."""
+    those rows only; the minimum always comes from every row. 2026-11-25: with `elasticity`, a
+    volumetric product with fewer than 3 similar-size rows gets the p75 of the rows' prices per
+    liter adjusted to its size (only larger rows, only upward, so never below the minimum)."""
     column, size = _size(product)
     if column is None:
         return None
@@ -143,6 +171,7 @@ def _band(product, vol_market, unit_market):
     rows = market[market["type_of_product"] == product["type_of_product"]]
     if rows.empty:
         return None
+    elasticity = _b_for(elasticity, product["channel"]) if column == "Volume_Liters" else None
     reference = rows[rows["is_reference"].astype(bool)] if "is_reference" in rows else rows.iloc[:0]
 
     def similar_count(r):
@@ -150,8 +179,39 @@ def _band(product, vol_market, unit_market):
 
     use_reference = (product["channel"] == "B2C" and len(rows) >= 3 and len(reference) >= 3
                      and (similar_count(reference) >= 3 or similar_count(rows) < 3))
-    p75 = _p75(reference if use_reference else rows, size)
-    return (len(rows), rows["price_per_unit"].min(), p75, rows["size"].min(), rows["size"].max())
+    used = reference if use_reference else rows
+    low = rows["price_per_unit"].min()
+    p75 = _p75(used, size, elasticity)
+    return (len(rows), low, p75, rows["size"].min(), rows["size"].max())
+
+
+def _assert_family_rule(product_list, report):
+    """Audit 2026-11-26 (D4): among SKUs that are not held, no SKU costs less in total than a
+    strictly smaller SKU of the same subindustry, type and kind; a raised SKU costs exactly the
+    dearest such smaller SKU; held SKUs and SKUs without a size are never raised."""
+    rows = list(report.itertuples())
+    for i, (big, big_row) in enumerate(zip(product_list, rows)):
+        column, size = _size(big)
+        eligible = column is not None and big_row.hold_reason == ""
+        if not eligible:
+            assert not big_row.family_raised, (big, big_row)
+            continue
+        smaller = [row.predicted_price for small, row in zip(product_list, rows)
+                   if _size(small)[0] == column and _size(small)[1] < size and row.hold_reason == ""
+                   and small["type_of_product"] == big["type_of_product"]
+                   and small["subindustry"] == big["subindustry"]]
+        if smaller:
+            assert big_row.predicted_price >= max(smaller), (big, big_row, smaller)
+        if big_row.family_raised:
+            assert smaller and big_row.predicted_price == max(smaller), (big, big_row, smaller)
+
+
+# None: artifacts from before 2026-11-25 (no elasticity file); a bare b (the first file format);
+# or {channel: b, '': pooled b}, possibly without one of the channels; b in 2_train's clipped range.
+ELASTICITIES = st.one_of(
+    st.none(), st.floats(-1.0, -0.3),
+    st.fixed_dictionaries({"": st.floats(-1.0, -0.3)},
+                          optional={"B2B": st.floats(-1.0, -0.3), "B2C": st.floats(-1.0, -0.3)}))
 
 
 @given(
@@ -159,14 +219,19 @@ def _band(product, vol_market, unit_market):
     vol_market=market_rows(),
     unit_market=market_rows(),
     trees=st.lists(positives, min_size=1, max_size=5),
+    elasticity=ELASTICITIES,
 )
-def test_margin_floor_and_market_band(product_list, vol_market, unit_market, trees):
-    report = _run(product_list, vol_market, unit_market, trees)
+def test_margin_floor_and_market_band(product_list, vol_market, unit_market, trees, elasticity):
+    report = _run(product_list, vol_market, unit_market, trees, elasticity)
 
     assert len(report) == len(product_list)
     for column in NUMERIC_COLUMNS:
         assert np.isfinite(report[column].astype(float)).all(), f"NaN or infinity in {column}"
+    # Model-only prices (no band) are flagged for the review (2026-11-25).
+    assert report["low_confidence"].dtype == bool
+    assert (report["low_confidence"] == (report["competitors_count"] < 3)).all()
 
+    _assert_family_rule(product_list, report)
     for product, (_, row) in zip(product_list, report.iterrows()):
         cost = product["Unit_cost_SAR"]
         floor = cost * FLOOR_FACTOR
@@ -174,14 +239,24 @@ def test_margin_floor_and_market_band(product_list, vol_market, unit_market, tre
         assert math.isfinite(price)
         # Margin floor (C17): never below cost × 1.30, not even by rounding.
         assert price >= floor - 1e-9 * max(1.0, floor), (product, row.to_dict())
+        # Cost 0 is held from the upload (2026-11-26, D3); a positive cost never is here (the
+        # names carry no size and the subindustries are not held).
+        assert (row["hold_reason"] != "") == (_size(product)[0] is not None and not cost > 0)
+        if row["family_raised"]:
+            continue  # raised to a smaller sibling's price: checked by _assert_family_rule
         column, size = _size(product)
         assert bool(row["has_size"]) == (column is not None)
-        band = _band(product, vol_market, unit_market)
+        band = _band(product, vol_market, unit_market, elasticity)
         assert row["competitors_count"] == (band[0] if band else 0)
         if band is None:
             assert not row["clamped_to_market"] and not row["volume_outside_market"]
             continue
         count, low, p75, size_min, size_max = band
+        lifted = size <= size_max or column == "Pack_quantity_Units"
+        if column == "Pack_quantity_Units" or elasticity is None:
+            assert row["market_match"] in ("size", "all")
+        else:
+            assert row["market_match"] in ("size", "size_adjusted")
         # Nothing but the market minimum (or the floor) can raise the model price.
         assert price <= max(floor, product["model_price"] * size, low * size) + 0.01 + 1e-9 * max(1.0, price)
         assert bool(row["volume_outside_market"]) == (not size_min <= size <= size_max)
@@ -190,14 +265,14 @@ def test_margin_floor_and_market_band(product_list, vol_market, unit_market, tre
         if count >= 3:
             # Ceiling: the p75 x size at every size (the floor wins if it is higher).
             assert price <= max(p75 * size, floor) + tolerance, (product, row.to_dict())
-            # Lifted to the minimum, except a volume above the size range. The reference rows are part of
-            # every row, so the minimum is never above a reference ceiling (F7b).
+            # The minimum is never above the ceiling: the reference rows are part of every row (F7b)
+            # and the size adjustment only moves larger rows, upward (b < 0; 2026-11-25).
             assert row["market_min_found"] <= row["market_p75_found"] + tolerance, (product, row.to_dict())
-            if size <= size_max or column == "Pack_quantity_Units":
+            # Lifted to the minimum, except a volume above the size range.
+            if lifted:
                 assert price >= low * size - tolerance, (product, row.to_dict())
         else:
             assert not row["clamped_to_market"], (product, row.to_dict())
-        lifted = size <= size_max or column == "Pack_quantity_Units"
         in_band = (not lifted or low <= product["model_price"]) and product["model_price"] <= p75
         if not row["volume_capped"] and (count < 3 or in_band):
             # Not clamped and not capped: max(model price, floor) to the cent.
@@ -397,3 +472,570 @@ def test_no_ceiling_source_without_a_clamp():
         pd.DataFrame([_product("A", 1.0) | {"channel": "B2C"}]), FakeModel([30.0], [1.0]), FakeModel([], [1.0]),
         ["volume_liters"], ["total_quantity"], market, _market([]))
     assert report.iloc[0]["ceiling_source"] == "" and report.iloc[0]["predicted_price"] == pytest.approx(30.0)
+
+
+# --- Size-adjusted ceiling (Mafer, 2026-11-25) -------------------------------------------------
+B = -0.6
+
+
+def _predict(products, model_prices, vol_market, elasticity=B, unit_market=None, unit_prices=()):
+    return prediction.generate_predictions(
+        pd.DataFrame(products), FakeModel(model_prices, [1.0]), FakeModel(list(unit_prices), [1.0]),
+        ["volume_liters"], ["total_quantity"], vol_market,
+        _market([]) if unit_market is None else unit_market, vol_elasticity=elasticity)
+
+
+def _raw_adjusted_p75(rows, size, b=B):
+    """The size-adjusted p75 before the 2026-11-26 cap."""
+    prices, sizes = zip(*rows)
+    return float(np.quantile(np.asarray(prices) * _ratio(size, sizes) ** b, 0.75))
+
+
+def _adjusted_p75(rows, size, b=B):
+    """The size-adjusted p75, capped at the rows' highest price per unit (audit 2026-11-26, E3)."""
+    return min(_raw_adjusted_p75(rows, size, b), max(price for price, _ in rows))
+
+
+def test_a_small_bottle_among_bulk_cans_gets_a_size_adjusted_ceiling():
+    """GG-03 / F8: a 0.7 L degreaser whose market is 5 L and 20 L cans was capped at the bulk
+    price per liter (-76 %). With the elasticity each can's price per liter is first adjusted to
+    0.7 L, so the ceiling is a small-bottle price."""
+    rows = [(12.25, 5.0), (14.0, 5.0), (10.0, 20.0), (11.0, 20.0)]
+    market = _market([("T0", p, s, False) for p, s in rows])
+    old = _predict([_product("SMALL", 0.7) | {"channel": "B2B"}], [200.0], market, elasticity=None).iloc[0]
+    new = _predict([_product("SMALL", 0.7) | {"channel": "B2B"}], [200.0], market).iloc[0]
+    assert old["market_match"] == "all"
+    assert old["predicted_price"] == pytest.approx(round(float(np.quantile([12.25, 14.0, 10.0, 11.0], 0.75)) * 0.7, 2))
+    # Every can is more than 4 times the SKU's size: each counts as 2.8 L (ratio 1/4), so the
+    # adjusted p75 is the all-rows p75 x 4 ** 0.6, not up to x (0.7 / 20) ** -0.6 (a 1/28 size ratio).
+    all_rows_p75 = float(np.quantile([12.25, 14.0, 10.0, 11.0], 0.75))
+    assert _raw_adjusted_p75(rows, 0.7) == pytest.approx(all_rows_p75 * 4 ** -B)
+    # 2026-11-26 (E3): that is above every price per liter seen (14.0), so the ceiling is 14.0.
+    ceiling = _adjusted_p75(rows, 0.7)
+    assert ceiling == 14.0
+    assert new["market_match"] == "size_adjusted" and new["clamped_to_market"]
+    assert new["predicted_price"] == pytest.approx(round(ceiling * 0.7, 2))
+    assert new["market_p75_found"] == pytest.approx(round(ceiling * 0.7, 2))
+    assert new["predicted_price"] > old["predicted_price"]
+
+
+def test_the_similar_size_path_is_unchanged_by_the_elasticity():
+    rows = [("T0", p, 1.0, False) for p in (10.0, 12.0, 14.0)] + [("T0", 2.0, 20.0, False)]
+    report = _predict([_product("ONE-LITER", 1.0)], [50.0], _market(rows))
+    assert report.iloc[0]["market_match"] == "size"
+    assert report.iloc[0]["predicted_price"] == pytest.approx(float(np.quantile([10.0, 12.0, 14.0], 0.75)))
+
+
+def test_a_size_adjusted_ceiling_is_never_below_the_minimum_inside_the_size_range():
+    """15 L inside a 0.1-20 L market: the small bottles are taken as they are (never adjusted down
+    below the cheapest price per liter) and only the 20 L can is adjusted, up, to 15 L."""
+    rows = [(100.0, 0.1), (90.0, 0.2), (10.0, 20.0)]
+    ceiling = _adjusted_p75(rows, 15.0)
+    assert ceiling == pytest.approx(float(np.quantile([100.0, 90.0, 10.0 * 0.75 ** B], 0.75)))
+    assert ceiling >= 10.0
+    report = _predict([_product("BULK", 15.0)], [500.0], _market([("T0", p, s, False) for p, s in rows]))
+    row = report.iloc[0]
+    assert row["market_match"] == "size_adjusted" and not row["volume_outside_market"]
+    assert row["market_min_found"] == pytest.approx(150.0)
+    assert row["market_p75_found"] == pytest.approx(round(ceiling * 15.0, 2))
+    assert row["predicted_price"] == pytest.approx(round(ceiling * 15.0, 2)) and row["clamped_to_market"]
+    low_model = _predict([_product("BULK", 15.0)], [1.0], _market([("T0", p, s, False) for p, s in rows])).iloc[0]
+    assert low_model["predicted_price"] == pytest.approx(150.0)  # lifted to the minimum inside the range
+
+
+def test_a_size_above_the_market_gets_the_all_rows_ceiling_and_no_minimum():
+    """F2 / F5: a 4 L SKU above a market of 0.5 L bottles: smaller rows are never adjusted down
+    (a ratio of 1), so its ceiling is their plain p75, still reported as 'size_adjusted', and it
+    is never lifted to the minimum."""
+    rows = [(40.0, 0.5), (50.0, 0.5), (60.0, 0.5)]
+    market = _market([("T0", p, s, False) for p, s in rows])
+    row = _predict([_product("BIG", 4.0)], [70.0], market).iloc[0]
+    assert _adjusted_p75(rows, 4.0) == pytest.approx(55.0)
+    assert row["market_match"] == "size_adjusted" and row["volume_outside_market"] and row["clamped_to_market"]
+    assert row["predicted_price"] == pytest.approx(220.0) == row["market_p75_found"]  # 55/L x 4 L
+    low_model = _predict([_product("BIG", 4.0)], [1.0], market).iloc[0]
+    assert low_model["predicted_price"] == pytest.approx(4.0) and not low_model["clamped_to_market"]
+
+
+def test_a_20_l_sku_among_half_liter_rows_is_not_adjusted():
+    """The SKU is 40 times larger than every row: they are taken as they are, at any elasticity."""
+    rows = [(10.0, 0.5), (12.0, 0.5), (14.0, 0.5), (16.0, 0.5)]
+    market = _market([("T0", p, s, False) for p, s in rows])
+    plain = float(np.quantile([10.0, 12.0, 14.0, 16.0], 0.75))
+    for b in (-1.0, B, -0.3):
+        row = _predict([_product("DRUM", 20.0)], [100.0], market, elasticity=b).iloc[0]
+        assert row["market_match"] == "size_adjusted"
+        assert row["market_p75_found"] == pytest.approx(round(plain * 20.0, 2))
+        assert row["predicted_price"] == pytest.approx(round(plain * 20.0, 2))
+
+
+def test_a_half_liter_sku_among_20_l_rows_is_adjusted_as_if_they_were_2_l():
+    """The size ratio is clipped at 1/4: a 0.5 L SKU among 20 L cans (ratio 1/40 unclipped) uses
+    (0.5 / 2) ** b, so the curve is never extrapolated more than 4-fold."""
+    rows = [(10.0, 20.0), (11.0, 20.0), (12.0, 20.0)]
+    market = _market([("T0", p, s, False) for p, s in rows])
+    row = _predict([_product("SMALL", 0.5)], [500.0], market).iloc[0]
+    ceiling = float(np.quantile([10.0, 11.0, 12.0], 0.75)) * (0.5 / 2.0) ** B
+    assert _raw_adjusted_p75(rows, 0.5) == pytest.approx(ceiling) and ceiling > 12.0
+    ceiling = 12.0  # 2026-11-26 (E3): capped at the highest price per liter seen
+    assert row["market_match"] == "size_adjusted" and row["clamped_to_market"]
+    assert row["market_p75_found"] == pytest.approx(round(ceiling * 0.5, 2))
+    assert row["predicted_price"] == pytest.approx(round(ceiling * 0.5, 2))
+    assert prediction.SIZE_ADJUST_MAX_RATIO == MAX_SIZE_RATIO
+
+
+def test_the_reference_ceiling_is_size_adjusted_too():
+    """F7b path: a B2C 0.7 L SKU whose type has 3 Saudi reference rows, none of similar size."""
+    reference = [(20.0, 5.0), (22.0, 5.0), (24.0, 4.0)]
+    market = _market([("T0", p, s, True) for p, s in reference] + [("T0", 90.0, 20.0, False)] * 3)
+    row = _predict([_product("SMALL", 0.7) | {"channel": "B2C"}], [500.0], market).iloc[0]
+    assert row["ceiling_source"] == "reference" and row["market_match"] == "size_adjusted"
+    assert row["predicted_price"] == pytest.approx(round(_adjusted_p75(reference, 0.7) * 0.7, 2))
+
+
+def test_packs_of_pieces_never_get_a_size_adjusted_ceiling():
+    cloths = _market([("C7", p, s, False) for p, s in [(2.0, 10.0), (3.0, 40.0), (4.0, 80.0)]])
+    pack = _product("PACK-1", 0.0, product_type="C7") | {"Pack_quantity_Units": 1.0}
+    row = _predict([pack], [], _market([]), unit_market=cloths, unit_prices=[9.0]).iloc[0]
+    assert row["market_match"] == "all"
+    assert row["predicted_price"] == pytest.approx(float(np.quantile([2.0, 3.0, 4.0], 0.75)))
+
+
+def test_old_artifacts_without_the_elasticity_file_keep_the_all_sizes_band(tmp_path):
+    assert prediction.load_size_elasticity(str(tmp_path)) is None
+    rows = [(12.25, 5.0), (14.0, 5.0), (10.0, 20.0), (11.0, 20.0)]
+    row = _predict([_product("SMALL", 0.7)], [200.0], _market([("T0", p, s, False) for p, s in rows]),
+                   elasticity=prediction.load_size_elasticity(str(tmp_path))).iloc[0]
+    assert row["market_match"] == "all"
+
+
+def test_load_size_elasticity_reads_a_per_channel_dict_and_a_legacy_float(tmp_path):
+    import joblib
+    path = tmp_path / prediction.ELASTICITY_FILE
+    joblib.dump({"": -0.76, "B2B": -0.63, "B2C": np.float64(-0.85)}, path)
+    loaded = prediction.load_size_elasticity(str(tmp_path))
+    assert loaded == {"": -0.76, "B2B": -0.63, "B2C": -0.85}
+    assert all(type(b) is float for b in loaded.values())
+    joblib.dump(-0.75, path)  # the first format: one pooled b
+    assert prediction.load_size_elasticity(str(tmp_path)) == {"": -0.75}
+
+
+@pytest.mark.parametrize("saved", [float("nan"), float("inf"), {"": float("nan")}, {"": -0.7, "B2B": float("inf")},
+                                   {"B2B": -0.63, "B2C": -0.85}, {}])
+def test_load_size_elasticity_refuses_a_non_finite_b_or_a_dict_without_the_pooled_one(tmp_path, saved):
+    import joblib
+    joblib.dump(saved, tmp_path / prediction.ELASTICITY_FILE)
+    with pytest.raises(ValueError):
+        prediction.load_size_elasticity(str(tmp_path))
+
+
+@pytest.mark.parametrize("saved", [0.0, 0.2, -0.29, -1.01, {"": -0.6, "B2B": 0.0}, {"": -2.0}, {"": -0.6, "B2C": -0.1}])
+def test_load_size_elasticity_refuses_a_b_outside_the_trained_range(tmp_path, saved):
+    """b >= 0 would adjust larger rows down (the ceiling could fall below the band minimum); 2_train
+    clips b to [-1, -0.3], so anything else is a broken artifact."""
+    import joblib
+    joblib.dump(saved, tmp_path / prediction.ELASTICITY_FILE)
+    with pytest.raises(ValueError, match="outside"):
+        prediction.load_size_elasticity(str(tmp_path))
+    joblib.dump({"": -1.0, "B2B": -0.3}, tmp_path / prediction.ELASTICITY_FILE)  # the bounds themselves
+    assert prediction.load_size_elasticity(str(tmp_path)) == {"": -1.0, "B2B": -0.3}
+    assert prediction.ELASTICITY_BOUNDS == (-1.0, -0.3)
+
+
+@pytest.mark.parametrize("elasticities, channel, expected", [
+    ({"": -0.76, "B2B": -0.63, "B2C": -0.85}, "B2B", -0.63),    # the channel's own b
+    ({"": -0.76, "B2B": -0.63, "B2C": -0.85}, " B2C ", -0.85),  # compared trimmed
+    ({"": -0.76, "B2B": -0.63}, "B2C", -0.76),                  # no b of its own: the pooled one
+    ({"": -0.76, "B2B": -0.63}, None, -0.76),
+    ({"": -0.76, "B2B": -0.63}, "", -0.76),
+    (-0.6, "B2B", -0.6),                                         # a bare b: the pooled one for all
+    (None, "B2B", None),                                         # no elasticity file
+])
+def test_elasticity_for_picks_the_channel_else_the_pooled_b(elasticities, channel, expected):
+    assert prediction.elasticity_for(elasticities, channel) == expected
+
+
+def test_each_sku_uses_its_own_channel_elasticity():
+    """Same market and size, different channel: the B2B SKU's ceiling uses the B2B b, the B2C one
+    (with no b of its own) the pooled one."""
+    rows = [(10.0, 20.0), (11.0, 20.0), (12.0, 20.0), (400.0, 20.0)]  # 400: the E3 cap never binds
+    market = _market([("T0", p, s, False) for p, s in rows])
+    products = [_product("B", 0.5) | {"channel": "B2B"}, _product("C", 0.5) | {"channel": "B2C"}]
+    report = _predict(products, [5000.0, 5000.0], market, elasticity={"": -0.9, "B2B": -0.4})
+    p75 = float(np.quantile([10.0, 11.0, 12.0, 400.0], 0.75))
+    assert report.iloc[0]["predicted_price"] == pytest.approx(round(p75 * 0.25 ** -0.4 * 0.5, 2))
+    assert report.iloc[1]["predicted_price"] == pytest.approx(round(p75 * 0.25 ** -0.9 * 0.5, 2))
+
+
+def test_model_only_prices_are_flagged_low_confidence():
+    market = _market([("T0", 10.0, 1.0, False), ("T0", 12.0, 1.0, False), ("T1", 10.0, 1.0, False),
+                      ("T1", 11.0, 1.0, False), ("T1", 12.0, 1.0, False)])
+    products = [_product("TWO", 1.0), _product("THREE", 1.0, product_type="T1"),
+                _product("NONE", 1.0, product_type="T9"), _product("NO-SIZE", 0.0)]
+    report = _predict(products, [20.0, 11.0, 5.0], market)
+    assert report["low_confidence"].tolist() == [True, False, True, True]
+
+
+# --- Stability brake (Mafer, 2026-11-25), inside generate_predictions ----------------------------
+# A 1 L SKU of type T0 in this market has the band [20, 140] per liter (5 rows, all of 1 L), and
+# the report columns market_min_found 20.0, market_max_found 300.0, competitors_count 5.
+BRAKE_MARKET = _market([("T0", p, 1.0, False) for p in (20.0, 60.0, 100.0, 140.0, 300.0)])
+NO_BAND_MARKET = _market([("T0", 20.0, 1.0, False), ("T0", 300.0, 1.0, False)])
+
+
+def _generate(products, vol_prices, vol_market, previous=None, unit_market=None, unit_prices=()):
+    return prediction.generate_predictions(
+        pd.DataFrame(products), FakeModel(list(vol_prices), [1.0]), FakeModel(list(unit_prices), [1.0]),
+        ["volume_liters"], ["total_quantity"], vol_market,
+        _market([]) if unit_market is None else unit_market, previous_report=previous)
+
+
+def _previous(products, previous_prices, vol_market=BRAKE_MARKET, unit_market=None, **changes):
+    """The report of a run on the same market with `previous_prices` as its prices (what the
+    upload saved), with `changes` applied to its columns."""
+    first = _generate(products, [1.0] * len(products), vol_market, unit_market=unit_market,
+                      unit_prices=[1.0] * len(products))
+    first["predicted_price"] = previous_prices
+    first["hold_reason"] = ""  # what the upload saved was uploaded (the test products cost 0)
+    for column, value in changes.items():
+        first[column] = value
+    return first
+
+
+@pytest.mark.parametrize("new, expected", [(140.0, 115.0), (60.0, 85.0), (110.0, 110.0), (88.0, 88.0)])
+def test_the_model_moves_at_most_15_percent_when_the_market_did_not_change(new, expected):
+    products = [_product("FP-1", 1.0, cost=10.0)]
+    row = _generate(products, [new], BRAKE_MARKET, _previous(products, [100.0])).iloc[0]
+    assert row["predicted_price"] == pytest.approx(expected)
+    assert bool(row["stability_limited"]) == (new != expected)
+    assert row["previous_price"] == 100.0 and not row["clamped_to_market"]
+    assert row["porcentaje_de_ganancia"] == pytest.approx(round((expected - 10.0) / 10.0 * 100, 2))
+    assert row["predicted_price_per_unit"] == new  # the model's own price per unit, as generated
+
+
+@pytest.mark.parametrize("change", [
+    {"competitors_count": 6}, {"market_min_found": 19.0}, {"market_max_found": 310.0},
+    {"ceiling_source": "reference"}, {"market_min_found": float("nan")}, {"market_max_found": float("nan")},
+])
+def test_a_changed_market_is_not_braked(change):
+    products = [_product("FP-1", 1.0)]
+    row = _generate(products, [140.0], BRAKE_MARKET, _previous(products, [100.0], **change)).iloc[0]
+    assert row["predicted_price"] == 140.0 and not row["stability_limited"] and row["previous_price"] == 100.0
+
+
+@pytest.mark.parametrize("old_match", ["size_adjusted", "all", "size"])
+@pytest.mark.parametrize("old_p75", [160.0, 151.0, float("nan")])
+def test_a_changed_p75_alone_is_not_a_changed_market(old_match, old_p75):
+    """A size-adjusted p75 moves with the elasticity measured every run: with the same competitors
+    (count, minimum, maximum, ceiling source, size) the price is still braked."""
+    products = [_product("FP-1", 1.0)]
+    previous = _previous(products, [100.0], market_p75_found=old_p75, market_match=old_match)
+    row = _generate(products, [140.0], BRAKE_MARKET, previous).iloc[0]
+    assert row["predicted_price"] == pytest.approx(115.0) and row["stability_limited"]
+
+
+def test_market_values_within_half_a_percent_count_as_unchanged():
+    products = [_product("FP-1", 1.0)]
+    previous = _previous(products, [100.0], market_min_found=20.0 * 1.004, market_max_found=300.0 / 1.004)
+    assert _generate(products, [140.0], BRAKE_MARKET, previous).iloc[0]["predicted_price"] == pytest.approx(115.0)
+    previous = _previous(products, [100.0], market_min_found=20.0 * 1.006)
+    assert _generate(products, [140.0], BRAKE_MARKET, previous).iloc[0]["predicted_price"] == 140.0
+
+
+@pytest.mark.parametrize("new, old, same", [(1.0, 1.0, True), (100.0, 100.4, True), (100.0, 100.6, False),
+                                            (0.0, 0.0, True), (float("nan"), float("nan"), True),
+                                            (float("nan"), 1.0, False), (1.0, None, False), (1.0, "x", False)])
+def test_same_value_is_within_half_a_percent_or_both_missing(new, old, same):
+    assert prediction._same_value(new, old) == same
+
+
+def test_a_different_sku_size_is_not_braked():
+    """Repeated Product_IDs are matched by occurrence: a row whose `volume` text differs from the
+    previous row's is another SKU, so its market changed; the same `volume` is braked."""
+    products = [_product("FP-1", 1.0), _product("FP-1", 1.0)]
+    previous = _previous(products, [100.0, 100.0], volume=["4.0 L", "1.0 L"])
+    report = _generate(products, [140.0, 140.0], BRAKE_MARKET, previous)
+    assert report["predicted_price"].tolist() == [140.0, pytest.approx(115.0)]
+    assert report["stability_limited"].tolist() == [False, True]
+    # Without `volume` in the previous report (older reports), the size is not compared.
+    previous = _previous(products[:1], [100.0]).drop(columns="volume")
+    assert _generate(products[:1], [140.0], BRAKE_MARKET, previous).iloc[0]["predicted_price"] == pytest.approx(115.0)
+
+
+def test_the_brake_never_lifts_a_banded_price_above_its_p75_ceiling():
+    """FP-HEA-00601 (Nov 25 measurement): a previous price from an older run above today's ceiling.
+    previous x 0.85 = 153 would be above the 140 p75; the ceiling wins, and the margin floor still
+    wins over the ceiling."""
+    products = [_product("FP-1", 1.0, cost=30.0)]
+    row = _generate(products, [130.0], BRAKE_MARKET, _previous(products, [180.0])).iloc[0]
+    assert row["predicted_price"] == pytest.approx(140.0) and row["stability_limited"]
+    assert row["porcentaje_de_ganancia"] == pytest.approx(round((140.0 - 30.0) / 30.0 * 100, 2))
+    products = [_product("FP-1", 1.0, cost=120.0)]
+    floored = _generate(products, [130.0], BRAKE_MARKET, _previous(products, [180.0])).iloc[0]
+    assert floored["predicted_price"] == pytest.approx(156.0)  # cost x 1.30 above the ceiling: the floor wins
+    # Without a band (fewer than MIN_COMPETITORS_FOR_CLAMP rows) the p75 is not a ceiling.
+    products = [_product("FP-1", 1.0, cost=30.0)]
+    row = _generate(products, [130.0], NO_BAND_MARKET, _previous(products, [180.0], NO_BAND_MARKET)).iloc[0]
+    assert row["predicted_price"] == pytest.approx(153.0) and row["stability_limited"]
+
+
+def test_the_brake_never_leaves_a_banded_price_below_the_minimum_where_it_applies():
+    """A previous price below today's minimum (an older rule): previous x 1.15 = 11.5 per liter is
+    below the 20 minimum, so the price is lifted back to it. A pack of pieces gets the minimum at
+    every size, also above the market's size range."""
+    products = [_product("FP-1", 1.0)]
+    row = _generate(products, [25.0], BRAKE_MARKET, _previous(products, [10.0])).iloc[0]
+    assert row["predicted_price"] == pytest.approx(20.0) and row["stability_limited"]
+    cloths = _market([("C7", p, s, False) for p, s in [(2.69, 10.0), (3.35, 5.0), (3.58, 8.0), (3.71, 3.0)]])
+    pack = [_product("PACK-20", 0.0, product_type="C7") | {"Pack_quantity_Units": 20.0}]
+    previous = _previous(pack, [20.0], _market([]), unit_market=cloths)  # 1.00 per cloth
+    row = _generate(pack, [], _market([]), previous, unit_market=cloths, unit_prices=[3.0]).iloc[0]
+    assert row["volume_outside_market"] and row["stability_limited"]
+    assert row["predicted_price"] == pytest.approx(53.80)  # 2.69 x 20, not 1.15 x 20 = 23.00
+
+
+def test_a_braked_sku_never_ends_cheaper_than_a_larger_sibling_capped_at_it():
+    """Review finding (I-3): the brake runs before the sibling cap, so a 20 L SKU above the market
+    is capped at the 4 L sibling's BRAKED price per liter, never at its pre-brake one."""
+    market = _market([("T0", p, s, False) for p, s in [(20.0, 1.0), (30.0, 2.0), (40.0, 4.0), (50.0, 5.0)]])
+    products = [_product("MID", 4.0), _product("BIG", 20.0)]
+    previous = _previous(products, [100.0, 2000.0], market)  # the 4 L at 25 per liter
+    report = _generate(products, [45.0, 45.0], market, previous)
+    mid, big = report.iloc[0], report.iloc[1]
+    assert mid["stability_limited"] and mid["predicted_price"] == pytest.approx(115.0)  # 28.75 per liter
+    assert big["volume_capped"] and big["predicted_price"] == pytest.approx(28.75 * 20)
+    assert big["predicted_price"] / 20 <= mid["predicted_price"] / 4 + 1e-9
+
+
+def test_a_price_set_by_the_band_or_without_size_is_not_braked():
+    products = [_product("FP-1", 1.0)]
+    row = _generate(products, [500.0], BRAKE_MARKET, _previous(products, [100.0])).iloc[0]
+    assert row["clamped_to_market"] and row["predicted_price"] == 140.0 and not row["stability_limited"]
+    no_size = [_product("FP-2", 0.0, cost=10.0)]
+    row = _generate(no_size, [], BRAKE_MARKET, _previous(no_size, [100.0])).iloc[0]
+    assert row["predicted_price"] == 13.0 and not row["stability_limited"] and row["previous_price"] == 100.0
+
+
+def test_the_margin_floor_still_wins_over_the_brake():
+    """Cost rose: the floor (cost x 1.30 = 26.00) is far above the previous x 1.15 = 11.50."""
+    products = [_product("FP-1", 1.0, cost=20.0)]
+    row = _generate(products, [20.0], NO_BAND_MARKET, _previous(products, [10.0], NO_BAND_MARKET)).iloc[0]
+    assert row["predicted_price"] == 26.0 and row["stability_limited"]
+    products = [_product("FP-1", 1.0, cost=10.0)]
+    row = _generate(products, [5.0], NO_BAND_MARKET, _previous(products, [40.0], NO_BAND_MARKET)).iloc[0]
+    assert row["predicted_price"] == pytest.approx(34.0) and row["stability_limited"]
+
+
+def test_rows_match_by_product_id_and_occurrence_and_new_products_are_left_alone():
+    old_products = [_product("B", 1.0), _product("A", 1.0), _product("A", 1.0)]
+    previous = _previous(old_products, [100.0, 100.0, 100.0])
+    products = [_product("A", 1.0), _product("B", 1.0), _product("A", 1.0), _product("NEW", 1.0)]
+    result = _generate(products, [130.0, 100.0, 60.0, 99.0], BRAKE_MARKET, previous)
+    assert result["predicted_price"].tolist() == [115.0, 100.0, 85.0, 99.0]
+    assert result["stability_limited"].tolist() == [True, False, True, False]
+    assert result["previous_price"].tolist()[:3] == [100.0, 100.0, 100.0]
+    assert math.isnan(result["previous_price"].iloc[3])
+
+
+def test_without_a_previous_report_nothing_is_braked_and_the_columns_exist():
+    products = [_product("FP-1", 1.0)]
+    for previous in (None, pd.DataFrame()):
+        result = _generate(products, [140.0], BRAKE_MARKET, previous)
+        assert result["predicted_price"].tolist() == [140.0] and not result["stability_limited"].any()
+        assert result["previous_price"].isna().all() and result["stability_limited"].dtype == bool
+
+
+def test_the_brake_reads_a_previous_report_from_csv_and_never_changes_it(tmp_path):
+    """As the CSV round trip gives it: booleans as text, an empty ceiling_source as NaN."""
+    products = [_product("FP-1", 1.0)]
+    path = tmp_path / "previous.csv"
+    _previous(products, [100.0], NO_BAND_MARKET).to_csv(path, index=False)
+    previous = prediction.load_previous_report(str(path))
+    assert previous["ceiling_source"].isna().all()
+    before = previous.copy()
+    row = _generate(products, [140.0], NO_BAND_MARKET, previous).iloc[0]
+    pd.testing.assert_frame_equal(previous, before)
+    assert row["predicted_price"] == pytest.approx(115.0) and row["stability_limited"]
+    assert prediction.load_previous_report(str(tmp_path / "missing.csv")) is None
+
+
+def test_a_previous_report_without_prices_is_refused():
+    with pytest.raises(ValueError):
+        _generate([_product("FP-1", 1.0)], [100.0], BRAKE_MARKET, pd.DataFrame([{"Product_ID": "FP-1"}]))
+
+
+def test_previous_report_default_is_the_last_upload_in_the_log_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("PI_LOG_DIR", str(tmp_path / "pi-logs"))
+    expected = str(tmp_path / "pi-logs" / "state" / "last_uploaded_prediction_report.csv")
+    assert prediction.parse_args([]).previous_report == expected
+    assert prediction.parse_args(["--previous_report", "x.csv"]).previous_report == "x.csv"
+
+
+def _same_market(new, old):
+    """Oracle of the brake's "same market" on two report rows."""
+    def close(a, b):
+        return abs(a - b) <= 0.005 * max(abs(a), abs(b))
+    return (new["competitors_count"] == old["competitors_count"]
+            and (new["ceiling_source"] or "") == (old["ceiling_source"] if isinstance(old["ceiling_source"], str) else "")
+            and close(new["market_min_found"], old["market_min_found"])
+            and close(new["market_max_found"], old["market_max_found"])
+            and new["volume"] == old["volume"])
+
+
+@given(
+    product_list=st.lists(products(), min_size=1, max_size=8),
+    vol_market=market_rows(),
+    unit_market=market_rows(),
+    trees=st.lists(positives, min_size=1, max_size=5),
+    elasticity=ELASTICITIES,
+    factors=st.lists(st.floats(0.3, 3.0), min_size=8, max_size=8),
+    new_prices=st.lists(positives, min_size=8, max_size=8),
+    change_volume_market=st.booleans(),
+    via_csv=st.booleans(),
+    add_big_siblings=st.booleans(),
+)
+def test_the_brake_chained_through_generate_predictions(product_list, vol_market, unit_market, trees, elasticity,
+                                                        factors, new_prices, change_volume_market, via_csv,
+                                                        add_big_siblings):
+    """Review finding (I-3). A first run, its prices moved by `factors` as the previous upload, then
+    a second run with new model prices (and, optionally, every volumetric competitor price x 1.1):
+    (1) a SKU capped at a smaller sibling is never dearer per unit than that sibling's final price;
+    (2) the price is at least the minimum x size wherever the minimum applies (packs of pieces at
+    every size, volumes inside or below the range) and at most max(p75 x size, floor);
+    (3) a sized SKU with an unchanged market, priced by the model and not capped, ends within
+    ±15 % of its previous price, at a band edge or at the floor; any other SKU is never braked."""
+    if add_big_siblings:  # each product gets a sibling of its type above every market row (up to 1000)
+        product_list = product_list[:4] + [
+            dict(p, Product_ID=p["Product_ID"] + "-BIG", Volume_Liters=2000.0 if _size(p)[0] == "Volume_Liters" else 0.0,
+                 Pack_quantity_Units=2000.0 if _size(p)[0] == "Pack_quantity_Units" else 0.0)
+            for p in product_list[:4]]
+    n = len(product_list)
+    first = _run(product_list, vol_market, unit_market, trees, elasticity)
+    previous = first.copy()
+    previous["predicted_price"] = (first["predicted_price"] * factors[:n]).round(2)
+    if via_csv:
+        buffer = io.StringIO()
+        previous.to_csv(buffer, index=False)
+        previous = pd.read_csv(io.StringIO(buffer.getvalue()))
+    second_list = [dict(p, model_price=q) for p, q in zip(product_list, new_prices)]
+    market = vol_market.assign(price_per_unit=vol_market["price_per_unit"] * 1.1) if change_volume_market else vol_market
+    report = _run(second_list, market, unit_market, trees, elasticity, previous_report=previous)
+
+    assert len(report) == n and report["stability_limited"].dtype == bool
+    if not change_volume_market:  # the same market: the brake can apply to every sized row
+        for column in ("competitors_count", "market_min_found", "market_max_found", "volume", "ceiling_source"):
+            assert first[column].tolist() == report[column].tolist(), column
+    for i, (product, (_, row)) in enumerate(zip(second_list, report.iterrows())):
+        old = previous.iloc[i]
+        cost, price = product["Unit_cost_SAR"], row["predicted_price"]
+        floor_price = prediction.apply_margin_floor(0.0, cost)
+        assert price >= cost * FLOOR_FACTOR - 1e-9 * max(1.0, cost * FLOOR_FACTOR)
+        assert row["previous_price"] == pytest.approx(old["predicted_price"], nan_ok=True)
+        column, size = _size(product)
+        band = _band(product, market, unit_market, elasticity)
+        tolerance = CENT + 1e-9 * max(1.0, price)
+        if band is not None and band[0] >= 3:
+            count, low, p75, size_min, size_max = band
+            tolerance += 1e-9 * max(low * size, p75 * size)
+            # (2) The band, also after the brake and the sibling cap (the family rule may raise a
+            # price above its p75 to a smaller sibling's price: checked by _assert_family_rule).
+            if not row["family_raised"]:
+                assert price <= max(p75 * size, floor_price) + tolerance, (product, row.to_dict())
+            if size <= size_max or column == "Pack_quantity_Units":
+                assert price >= low * size - tolerance, (product, row.to_dict())
+        # (3) The brake.
+        held_before = isinstance(old.get("hold_reason"), str) and old["hold_reason"].strip() != ""
+        brakeable = (column is not None and old["predicted_price"] > 0 and not row["clamped_to_market"]
+                     and not held_before and _same_market(row, old))
+        if not brakeable:
+            assert not row["stability_limited"], (product, row.to_dict(), old.to_dict())
+        elif not row["volume_capped"] and not row["family_raised"]:
+            last = old["predicted_price"]
+            edges = [round(band[1] * size, 2), round(band[2] * size, 2)] if band is not None and band[0] >= 3 else []
+            cent = 0.005 + 1e-9 * max(1.0, last)  # rounded to the cent
+            assert (last * 0.85 - cent <= price <= last * 1.15 + cent or price == floor_price
+                    or any(abs(price - edge) <= tolerance for edge in edges)), (product, row.to_dict(), last)
+
+    _assert_family_rule(second_list, report)
+    # (1) Sibling invariant on the final prices: a SKU above its market's size range costs, per
+    # unit, at most what a smaller sibling inside the range costs (unless the floor or the family
+    # rule sets its price).
+    for i, (big, big_row) in enumerate(zip(second_list, report.itertuples())):
+        column, size = _size(big)
+        band = _band(big, market, unit_market, elasticity)
+        if (band is None or size <= band[4] or big_row.family_raised
+                or big_row.predicted_price <= prediction.apply_margin_floor(0.0, big["Unit_cost_SAR"])):
+            continue
+        for j, (small, small_row) in enumerate(zip(second_list, report.itertuples())):
+            small_column, small_size = _size(small)
+            if (j != i and small_column == column and small["type_of_product"] == big["type_of_product"]
+                    and small["subindustry"] == big["subindustry"] and small_size < size
+                    and small_size <= band[4]):
+                slack = 0.005 / size + 0.005 / small_size
+                assert big_row.predicted_price / size <= small_row.predicted_price / small_size * (1 + 1e-9) + slack, \
+                    (big, small, report.to_dict("records"))
+
+
+# --- Audit 2026-11-26: family rule (D4), held SKUs (D3, E2), adjusted-ceiling cap (E3) ------------
+def test_a_larger_size_never_costs_less_in_total_than_a_smaller_one():
+    """FP-AUT-01302 (4 L) at 78.18 below FP-AUT-01301 (0.7 L) at 80.21 in the 2026-11-26 run: the
+    4 L is raised to the 0.7 L's price; a 20 L priced above both keeps its own price."""
+    products = [_product("SMALL", 0.7, cost=6.66), _product("BIG", 4.0, cost=26.72),
+                _product("BULK", 20.0, cost=60.0)]
+    report = _predict(products, [80.21 / 0.7, 78.18 / 4.0, 400.0 / 20.0], _market([]), elasticity=None)
+    assert report["predicted_price"].tolist() == [pytest.approx(80.21), pytest.approx(80.21), pytest.approx(400.0)]
+    assert report["family_raised"].tolist() == [False, True, False]
+
+
+def test_the_family_rule_stays_inside_one_subindustry_type_and_kind_and_ignores_held_skus():
+    products = [_product("SMALL", 0.7, cost=5.0), _product("OTHER-TYPE", 4.0, cost=5.0, product_type="T1"),
+                _product("OTHER-SUB", 4.0, cost=5.0, subindustry="Home"),
+                _product("HELD", 0.5, cost=0.0),  # cost 0: held, never sets a sibling's price
+                _product("BIG", 4.0, cost=5.0)]
+    report = _predict(products, [100.0, 1.0, 1.0, 1000.0, 10.0], _market([]), elasticity=None)
+    assert report["family_raised"].tolist() == [False, False, False, False, True]
+    assert report.iloc[4]["predicted_price"] == pytest.approx(70.0)  # 40 raised to the 0.7 L price (100/L x 0.7), not the held 500
+    assert report.iloc[1]["predicted_price"] == report.iloc[2]["predicted_price"] == pytest.approx(6.5)  # floor
+
+
+@pytest.mark.parametrize("name, volume, cost, subindustry, low, expected", [
+    ("WAYAKIT Car odor eliminator [700 mL Jasmine]", 0.7, 6.66, "Automotive", False, ""),
+    ("WAYAKIT Dishwashing soap [500 mL]", 0.5, 0.0, "Restaurants", False, "cost is 0 or missing in Odoo"),
+    ("WAYAKIT Dishwashing soap [500 mL]", 0.5, float("nan"), "Restaurants", False, "cost is 0 or missing in Odoo"),
+    ("WAYAKIT Stain spot remover [100 mL]", 8.4, 146.66, "Facilities management", False,
+     "the name says 0.1 L but Volume_Liters is 8.4"),
+    ("WAYAKIT Floor cleaner [4 L]", 4.0, 20.0, "Hotels", True, ""),  # low confidence elsewhere: uploaded
+    ("WAYAKIT Shampoo [700 mL]", 0.7, 9.0, "Aviation", True, "model-only price in Aviation (held for review)"),
+    ("WAYAKIT Shampoo [700 mL]", 0.7, 9.0, "Aviation", False, ""),  # banded Aviation prices go up
+    ("WAYAKIT Box of 12 x 700 mL", 8.4, 100.0, "Hotels", False, ""),  # no bracketed size: not compared
+])
+def test_hold_reason(name, volume, cost, subindustry, low, expected):
+    row = {"Product_Name": name, "Volume_Liters": volume, "Unit_cost_SAR": cost, "subindustry": subindustry}
+    assert prediction.hold_reason(row, True, low) == expected
+    assert prediction.hold_reason(row, False, low) == ""  # no size: the upload skips it anyway
+
+
+def test_two_hold_reasons_are_joined():
+    row = {"Product_Name": "WAYAKIT Umrah spray [20 mL]", "Volume_Liters": 0.2, "Unit_cost_SAR": 0.0,
+           "subindustry": "Home"}
+    assert prediction.hold_reason(row, True, False) == \
+        "cost is 0 or missing in Odoo; the name says 0.02 L but Volume_Liters is 0.2"
+
+
+def test_a_previous_price_that_was_held_is_never_a_brake():
+    products = [_product("FP-1", 1.0, cost=10.0)]
+    previous = _previous(products, [100.0], hold_reason="model-only price in Aviation (held for review)")
+    row = _generate(products, [140.0], BRAKE_MARKET, previous).iloc[0]
+    assert row["predicted_price"] == 140.0 and not row["stability_limited"]
+
+
+def test_market_band_caps_the_size_adjusted_ceiling_at_the_highest_price_per_unit():
+    """FP-RES-02100 (2026-11-26): a 0.7 L bottle among 4-5 L cans got x2.17 their price per liter,
+    above any price seen at any size. The adjusted median and p75 now stop at the highest one."""
+    rows = _market([("T0", p, s, False) for p, s in [(19.5, 5.0), (25.0, 4.0), (31.8, 4.0)]])
+    band = prediction.market_band(rows, 0.7, -0.558)
+    assert band["match"] == "size_adjusted"
+    assert band["p75"] == pytest.approx(31.8) and band["median"] == pytest.approx(31.8)
+    assert band["max"] == pytest.approx(31.8)
+    loose = prediction.market_band(rows, 3.0, -0.558)  # close to the cans' size: below the cap
+    assert loose["p75"] < 31.8

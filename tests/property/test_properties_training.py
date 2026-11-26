@@ -169,3 +169,78 @@ def test_prepare_quotations_channel_and_company_rules(data):
     assert (base.loc[is_b2c, "channel"] == "B2C").all()
     assert (base.loc[~is_b2c, "channel"] == "B2B").all()
     assert {"industry", "subindustry", "generic_product_type", "type_of_product"} <= set(base.columns)
+
+
+# --- collapse_identical_variants (Mafer, 2026-11-25) --------------------------------------------
+variant_rows = st.lists(
+    st.tuples(st.sampled_from(["A", "B"]), st.sampled_from(["X", " x", "Y", None, "", " Brand not found", "N/A"]),
+              st.sampled_from([0.5, 1.0, 4.0]), st.sampled_from([10.0, 10.004, 12.5]),
+              st.sampled_from(["local", "unknown"]), st.sampled_from([False, True])),
+    max_size=40,
+)
+# Company values that name no brand (spec, Mafer 2026-11-25): compared trimmed and lower-case.
+NO_BRAND = {"", "brand not found", "company not found", "unknown", "n/a", "na", "none", "nan", "generic"}
+
+
+def _variants_df(generated):
+    df = pd.DataFrame(generated, columns=["type_of_product", "company", "volume_liters", "price_sar", "origin",
+                                          "is_multipack"])
+    df["volume_liters"] = df["volume_liters"].astype(float)
+    df["price_sar"] = df["price_sar"].astype(float)
+    df["is_multipack"] = df["is_multipack"].astype(bool)
+    df["row_id"] = range(len(df))
+    return df
+
+
+def _company(df):
+    return df["company"].astype("string").str.strip().str.lower().fillna("")
+
+
+def _variant_keys(df):
+    return list(zip(df["type_of_product"], _company(df), df["volume_liters"].round(6), df["price_sar"].round(2),
+                    df["is_multipack"]))
+
+
+@given(variant_rows)
+def test_collapse_keeps_exactly_one_row_per_key_in_the_input_order(generated):
+    df = _variants_df(generated)
+    copy = df.copy()
+    output = training.collapse_identical_variants(df, "volume_liters", "test")
+    pd.testing.assert_frame_equal(df, copy)  # the input is not modified
+    assert output["row_id"].is_monotonic_increasing
+    pd.testing.assert_frame_equal(output, df.loc[output.index])  # kept rows are untouched
+    # Rows without a known brand are never collapsed.
+    no_brand = _company(df).isin(NO_BRAND)
+    assert set(df.index[no_brand]) <= set(output.index)
+    # Branded rows: exactly one per key (type, company, size, price, multipack).
+    branded, kept = df[~no_brand], output[~_company(output).isin(NO_BRAND)]
+    keys = _variant_keys(kept)
+    assert len(keys) == len(set(keys)) and set(keys) == set(_variant_keys(branded))
+    # A key that has a Saudi reference row keeps a reference row.
+    reference_keys = {k for k, ref in zip(_variant_keys(branded), training.is_saudi_reference(branded)) if ref}
+    kept_reference = {k for k, ref in zip(keys, training.is_saudi_reference(kept)) if ref}
+    assert reference_keys == kept_reference
+    again = training.collapse_identical_variants(output, "volume_liters", "test")
+    assert again.index.tolist() == output.index.tolist()  # idempotent
+
+
+# --- estimate_size_elasticity -------------------------------------------------------------------
+@given(
+    st.floats(-3.0, 1.0),
+    st.lists(st.tuples(st.floats(0.1, 1000.0),
+                       st.lists(st.floats(0.01, 50.0), min_size=3, max_size=6, unique=True)),
+             min_size=1, max_size=4),
+)
+def test_elasticity_recovers_a_power_law_and_stays_in_bounds(true_b, types):
+    rows = []
+    for i, (level, sizes) in enumerate(types):
+        rows += [(f"T{i}", level * s ** true_b, s, False) for s in sizes]
+    market = pd.DataFrame(rows, columns=training.MARKET_ROWS_COLUMNS)
+    b, raw, _, _ = training.estimate_size_elasticity(market)
+    low, high = training.ELASTICITY_BOUNDS
+    assert low <= b <= high
+    log_size = np.log(market["size"])
+    spread = (log_size - log_size.groupby(market["type_of_product"]).transform("mean")).pow(2).sum()
+    if spread > 1e-6:  # enough size spread for a numerically stable slope
+        assert raw == pytest.approx(true_b, abs=1e-6)
+        assert b == pytest.approx(min(max(true_b, low), high), abs=1e-6)

@@ -5,6 +5,9 @@ Modes:
 - Products without a size (no-size parent templates: `has_size` False or `volume` 0) are never
   uploaded: their price is only the cost x 1.30 floor (F7a). In full mode their previous
   suggestions are removed with the rest.
+- Rows with a `hold_reason` (3_predicted_prices.py, audit 2026-11-26: cost 0, a name whose size
+  disagrees with Volume_Liters, Aviation's model-only prices) are not uploaded either; in full
+  mode their previous suggestions are removed with the rest.
 - `--dry-run`: builds the records and writes them to a CSV (default
   ml_model/price_suggestion_dry_run.csv). Reads no secrets and connects to nothing.
 - `--run_mode partial` (default): creates the new records; deletes nothing.
@@ -26,6 +29,13 @@ Modes:
   starts again: it re-reads every current ID, so whatever that create did is replaced too. A file
   WITH `created_ids` means a cleanup is pending: the upload refuses until `--cleanup-previous`.
 
+As soon as a real upload's create returns (partial or full; never `--dry-run` or
+`--cleanup-previous`), before the cleanup of the previous batch, the uploaded report is copied
+atomically to `--state-file` (default state/last_uploaded_prediction_report.csv in the log
+folder): the new prices are what Odoo now shows, and they are what 3_predicted_prices.py's
+stability brake compares the next run against, also when the cleanup then fails. If only that
+copy fails, the upload and the cleanup still go on, and the script exits 1 (see `upload`).
+
 Before any write the script checks that the Odoo user sees exactly one company (the PI
 database is KSA only); if it sees more, it exits 1: a company filter is needed, not a guess.
 
@@ -33,10 +43,13 @@ Importing this module does not read secrets or connect to Odoo. The functions ta
 `OdooSession` (pi_odoo) so tests can pass a fake `models`.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -67,6 +80,9 @@ def log_dir(environ=os.environ, project_dir: str = PROJECT_DIR) -> str:
 
 
 PREVIOUS_IDS_FILE = os.path.join(log_dir(), 'odoo_previous_suggestion_ids.json')
+# The report of the last real upload: 3_predicted_prices.py's stability brake compares the next
+# run against it (LAST_UPLOADED_REPORT there). Written by a real upload as soon as its create returns.
+LAST_UPLOADED_REPORT_FILE = os.path.join(log_dir(), 'state', 'last_uploaded_prediction_report.csv')
 
 # More unparseable rows than this means a broken report, not a few bad products.
 MAX_SKIPPED_FRACTION = 0.05
@@ -100,6 +116,15 @@ FLOAT_FIELDS = {
 
 class UploadError(RuntimeError):
     """The upload cannot go on safely. The message says what state Odoo was left in."""
+
+
+class StateFileError(UploadError):
+    """The upload to Odoo succeeded, but the uploaded report could not be saved as the stability
+    brake's state. `created_ids` are the records the upload created (they stay in Odoo)."""
+
+    def __init__(self, message, created_ids):
+        super().__init__(message)
+        self.created_ids = created_ids
 
 
 # --- Records (pure) ---------------------------------------------------------------------------
@@ -151,6 +176,14 @@ def without_size(df: pd.DataFrame) -> pd.Series:
     if 'has_size' in df:
         no_size |= df['has_size'].astype(str).str.strip().str.lower().isin(['false', '0'])
     return no_size.fillna(False).astype(bool)
+
+
+def held(df: pd.DataFrame) -> pd.Series:
+    """True for report rows with a non-empty `hold_reason` (False for reports without the
+    column, written before 2026-11-26). Pure."""
+    if 'hold_reason' not in df:
+        return pd.Series(False, index=df.index)
+    return (df['hold_reason'].fillna('').astype(str).str.strip() != '').astype(bool)
 
 
 def build_records(df: pd.DataFrame) -> tuple:
@@ -251,6 +284,22 @@ def check_new_batch_exists(session: 'OdooSession', created_ids: list, ids_file: 
         )
 
 
+def save_uploaded_report(report_file: str, state_file: str) -> None:
+    """Copies the uploaded report to `state_file` atomically: a temp file in the same folder,
+    then `os.replace`, so a reader never sees half a file and a failure leaves no partial one."""
+    folder = os.path.dirname(os.path.abspath(state_file))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.last_uploaded_', suffix='.tmp', dir=folder)
+    try:
+        with os.fdopen(fd, 'wb') as target, open(report_file, 'rb') as source:
+            shutil.copyfileobj(source, target)
+        os.replace(tmp, state_file)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
 # --- Odoo steps -------------------------------------------------------------------------------
 
 def confirm_company(session: 'OdooSession') -> str:
@@ -292,11 +341,22 @@ def archive_and_unlink(session: 'OdooSession', previous_ids: list, ids_file: str
 
 
 def upload(session: 'OdooSession', records: list, run_mode: str,
-           ids_file: str = PREVIOUS_IDS_FILE) -> list:
+           ids_file: str = PREVIOUS_IDS_FILE, report_file: str = None,
+           state_file: str = LAST_UPLOADED_REPORT_FILE) -> list:
     """Company guard, then the partial or full flow described in the module docstring.
 
     Returns the IDs of the created records. Raises `UploadError` (or the Odoo exception) on any
     failure; the message says what state Odoo was left in.
+
+    With `report_file`, right after the create returns (the new prices are then what Odoo shows)
+    and before the cleanup of the previous batch, that report is copied to `state_file`
+    (`save_uploaded_report`) for the next run's stability brake; a failed cleanup therefore leaves
+    the state with the new prices, and `--cleanup-previous` never writes it. If the copy fails,
+    nothing in Odoo is undone: the error is logged, an older state file is removed so the next run
+    does not brake against prices that are no longer the uploaded ones, the cleanup of the
+    previous batch still runs, and then `StateFileError` is raised so the run exits 1 and the
+    pipeline alert fires (a failed cleanup raises its own `UploadError` instead; the state error
+    is already in the log).
     """
     if run_mode not in ('partial', 'full'):
         raise UploadError(f"Unknown run mode '{run_mode}'.")
@@ -336,6 +396,7 @@ def upload(session: 'OdooSession', records: list, run_mode: str,
         ) from e
     new_ids = new_ids if isinstance(new_ids, list) else [new_ids]
     logger.info(f"Created {len(new_ids)} new records.")
+    state_error = _save_state(report_file, state_file, len(new_ids)) if report_file else None
 
     if run_mode == 'full' and previous_ids:
         try:
@@ -350,7 +411,28 @@ def upload(session: 'OdooSession', records: list, run_mode: str,
                 f"'{ids_file}'; retry with 'python ml_model/odoo_api_price_suggestion.py --cleanup-previous'."
             ) from e
         logger.info(f"Replaced {removed} previous suggestions with {len(new_ids)} new ones.")
+
+    if state_error is not None:
+        raise StateFileError(
+            f"Uploaded, but the stability-brake state '{state_file}' was not written "
+            f"({type(state_error).__name__}).", new_ids) from state_error
     return new_ids
+
+
+def _save_state(report_file: str, state_file: str, created: int):
+    """`save_uploaded_report` for `upload`: returns None, or the exception after logging it and
+    removing an older `state_file` (it would hold prices that are no longer the uploaded ones)."""
+    try:
+        save_uploaded_report(report_file, state_file)
+    except Exception as e:
+        logger.error(f"The new suggestions are in Odoo ({created} created), but saving '{report_file}' "
+                     f"as '{state_file}' for the stability brake failed ({type(e).__name__}: {e}). "
+                     f"Copy it there by hand; there is no need to upload again.")
+        with contextlib.suppress(OSError):
+            os.remove(state_file)
+        return e
+    logger.info(f"Uploaded report saved as '{state_file}' for the next run's stability brake.")
+    return None
 
 
 def cleanup_previous(session: 'OdooSession', ids_file: str = PREVIOUS_IDS_FILE) -> int:
@@ -390,6 +472,10 @@ def parse_args(argv=None):
     parser.add_argument('--ids-file', default=PREVIOUS_IDS_FILE,
                         help="Where full mode stores the previous IDs until they are deleted "
                              f"(default: {PREVIOUS_IDS_FILE}, from PI_LOG_DIR or <repo>/../logs).")
+    parser.add_argument('--state-file', default=LAST_UPLOADED_REPORT_FILE,
+                        help="Where a real upload copies --input, right after its create, for the next run's "
+                             f"stability brake (default: {LAST_UPLOADED_REPORT_FILE}). Never written "
+                             "by --dry-run.")
     return parser.parse_args(argv)
 
 
@@ -417,6 +503,12 @@ def main(argv=None, session: 'OdooSession' = None) -> int:
                            "margin floor, not a suggestion; fix their size in Odoo): "
                            f"{sorted(df_results.loc[no_size, 'Product_ID'].astype(str).unique())}")
             df_results = df_results[~no_size]
+        on_hold = held(df_results)
+        if on_hold.any():
+            for product_id, reason in df_results.loc[on_hold, ['Product_ID', 'hold_reason']].drop_duplicates().itertuples(index=False):
+                logger.warning(f"Held, not uploaded: {product_id}: {reason}")
+            logger.warning(f"{int(on_hold.sum())} rows held from the upload (see hold_reason in the report).")
+            df_results = df_results[~on_hold]
         records, skipped = build_records(df_results)
         check_parse_quality(records, skipped)
         logger.info(f"{len(records)} records ready ({len(skipped)} rows skipped).")
@@ -430,9 +522,14 @@ def main(argv=None, session: 'OdooSession' = None) -> int:
         logger.info(f"--- RUN MODE: {args.run_mode.upper()} ---")
         if session is None:
             session = _connect()
-        upload(session, records, args.run_mode, args.ids_file)
+        upload(session, records, args.run_mode, args.ids_file,
+               report_file=args.input, state_file=args.state_file)
         logger.info("Upload finished.")
         return 0
+    except StateFileError:
+        # Already logged by upload(). Exit 1 so the run is reported, but the suggestions are in Odoo.
+        logger.error("Upload finished in Odoo; only the stability-brake state file is missing.")
+        return 1
     except Exception:
         logger.exception("CRITICAL ERROR in the price suggestion upload.")
         return 1

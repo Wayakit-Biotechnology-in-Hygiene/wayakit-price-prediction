@@ -17,6 +17,11 @@ What it proves:
 - IDs file location (Pending 17, resolved 2026-11-18): without `--ids-file` it lives in the single
   log folder, `PI_LOG_DIR` if set and non-empty, else `<repo>/../logs` (never inside the code), so a
   `--cleanup-previous` run in a later process finds the file the failed upload left.
+- Stability-brake state (2026-11-25): a real upload copies the report to `--state-file`
+  (atomically) as soon as its create returns, before the cleanup, so a failed cleanup still leaves
+  the new prices there; a dry run, a failed create and `--cleanup-previous` never write it; a
+  failed copy keeps the upload, still runs the cleanup, removes the older state file and exits 1.
+  Its default is the path `3_predicted_prices.py` reads.
 """
 from __future__ import annotations
 
@@ -123,8 +128,14 @@ def ids_file(tmp_path):
     return tmp_path / "logs" / "odoo_previous_suggestion_ids.json"
 
 
+def _state_file(ids_file):
+    """The stability-brake state file of a test: next to its IDs file, in tmp."""
+    return ids_file.parent / "state" / "last_uploaded_prediction_report.csv"
+
+
 def _main(report_path, ids_file, *extra, odoo=None):
-    argv = ["--input", str(report_path), "--ids-file", str(ids_file), *extra]
+    argv = ["--input", str(report_path), "--ids-file", str(ids_file),
+            "--state-file", str(_state_file(ids_file)), *extra]
     return up.main(argv, session=odoo.session() if odoo else None)
 
 
@@ -242,6 +253,32 @@ def test_dry_run_never_touches_the_session_and_writes_the_records(report, ids_fi
     assert df["product_id_str"].tolist() == ["FP-000", "FP-001", "FP-002"]
     assert df["suggested_price"].tolist() == [9.99] * 3
     assert not ids_file.exists()
+
+
+def test_held_rows_are_never_uploaded(report, ids_file, tmp_path):
+    """Audit 2026-11-26 (D3, E2): a row with a `hold_reason` is left out, like a row without a size;
+    an empty reason (written back as NaN by a CSV) is uploaded."""
+    out = tmp_path / "dry.csv"
+    rows = [_row(0, hold_reason=""), _row(1, hold_reason="cost is 0 or missing in Odoo"),
+            _row(2, hold_reason="model-only price in Aviation (held for review)"), _row(3)]
+    argv = ["--input", str(report(rows)), "--ids-file", str(ids_file), "--run_mode", "full",
+            "--dry-run", "--dry-run-output", str(out)]
+    assert up.main(argv, session=Untouchable()) == 0
+    assert pd.read_csv(out)["product_id_str"].tolist() == ["FP-000", "FP-003"]
+
+
+def test_held_rows_are_not_created_in_odoo(report, ids_file):
+    odoo = FakeOdoo(existing=2)
+    rows = [_row(0), _row(1, hold_reason="the name says 0.1 L but Volume_Liters is 8.4"), _row(2)]
+    assert _main(report(rows), ids_file, "--run_mode", "full", odoo=odoo) == 0
+    # The old suggestions are archived and removed; only the two uploadable rows are left.
+    assert sorted(r["product_id_str"] for r in odoo.table.values()) == ["FP-000", "FP-002"]
+
+
+def test_held_marks_only_non_empty_reasons():
+    df = pd.DataFrame({"hold_reason": ["", None, float("nan"), "  ", "cost is 0"]})
+    assert up.held(df).tolist() == [False, False, False, False, True]
+    assert up.held(pd.DataFrame({"x": [1, 2]})).tolist() == [False, False]
 
 
 def test_dry_run_still_fails_on_a_broken_report(report, ids_file, tmp_path):
@@ -566,3 +603,141 @@ def test_skipped_row_numbers_stay_the_report_rows_after_no_size_rows_are_left_ou
     df = pd.read_csv(report(rows))
     records, skipped = up.build_records(df[~up.without_size(df)])
     assert [(n, pid) for n, pid, _ in skipped] == [(6, "FP-005")] and len(records) == 28
+
+
+# --- Stability-brake state: the report of the last real upload (2026-11-25) --------------------
+@pytest.mark.parametrize("mode", ["full", "partial"])
+def test_a_successful_upload_saves_the_report_as_the_brake_state(report, ids_file, mode):
+    path = report([_row(i) for i in range(3)])
+    state = _state_file(ids_file)
+    assert _main(path, ids_file, "--run_mode", mode, odoo=FakeOdoo(existing=2)) == 0
+    assert state.read_bytes() == path.read_bytes()
+    assert [p.name for p in state.parent.iterdir()] == [state.name], "no temporary file is left"
+
+
+def test_a_new_upload_replaces_the_previous_state(report, ids_file):
+    state = _state_file(ids_file)
+    state.parent.mkdir(parents=True)
+    state.write_text("Product_ID,predicted_price\nOLD,1.0\n", encoding="utf-8")
+    path = report([_row(1)])
+    assert _main(path, ids_file, "--run_mode", "full", odoo=FakeOdoo(existing=1)) == 0
+    assert state.read_bytes() == path.read_bytes()
+
+
+def test_a_dry_run_never_writes_the_state(report, ids_file, tmp_path):
+    argv = ["--input", str(report([_row(1)])), "--ids-file", str(ids_file), "--run_mode", "full",
+            "--state-file", str(_state_file(ids_file)), "--dry-run", "--dry-run-output", str(tmp_path / "dry.csv")]
+    assert up.main(argv, session=Untouchable()) == 0
+    assert not _state_file(ids_file).exists()
+
+
+def test_a_failed_create_never_writes_the_state(report, ids_file):
+    """Nothing new is in Odoo: the previous state stays as it was."""
+    state = _state_file(ids_file)
+    state.parent.mkdir(parents=True)
+    state.write_text("previous upload", encoding="utf-8")
+    odoo = FakeOdoo(existing=2, fail={(SUG, "create")})
+    assert _main(report([_row(1)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    assert state.read_text(encoding="utf-8") == "previous upload"
+
+
+@pytest.mark.parametrize("fail", [(SUG, "read"), (HIST, "create"), (SUG, "unlink")])
+def test_a_failed_cleanup_still_leaves_the_new_prices_as_the_state(report, ids_file, fail):
+    """The create returned, so Odoo shows the new prices: the state is written before the cleanup
+    and stays written when the cleanup fails (exit 1, IDs file kept for --cleanup-previous)."""
+    state = _state_file(ids_file)
+    state.parent.mkdir(parents=True)
+    state.write_text("previous upload", encoding="utf-8")
+    path = report([_row(1)])
+    assert _main(path, ids_file, "--run_mode", "full", odoo=FakeOdoo(existing=2, fail={fail})) == 1
+    assert state.read_bytes() == path.read_bytes()
+    assert ids_file.exists()
+
+
+def test_cleanup_previous_never_writes_the_state(report, ids_file):
+    state = _state_file(ids_file)
+    path = report([_row(1)])
+    odoo = FakeOdoo(existing=2, fail={(SUG, "unlink")})
+    assert _main(path, ids_file, "--run_mode", "full", odoo=odoo) == 1
+    state.write_text("written by the upload", encoding="utf-8")
+    odoo.fail.clear()
+    assert _main(path, ids_file, "--cleanup-previous", odoo=odoo) == 0
+    assert not ids_file.exists()
+    assert state.read_text(encoding="utf-8") == "written by the upload"
+
+
+def test_a_failed_state_copy_and_a_failed_cleanup_exit_1_without_a_stale_state(report, ids_file, monkeypatch):
+    """Both fail: the cleanup's own error is reported (IDs file kept for --cleanup-previous) and
+    no older state is left to brake against."""
+    state = _state_file(ids_file)
+    state.parent.mkdir(parents=True)
+    state.write_text("previous upload", encoding="utf-8")
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        if str(dst) == str(state):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(up.os, "replace", failing_replace)
+    odoo = FakeOdoo(existing=2, fail={(SUG, "unlink")})
+    assert _main(report([_row(1)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    assert ids_file.exists() and list(state.parent.iterdir()) == []
+
+
+def test_a_failed_state_copy_keeps_the_upload_removes_the_stale_state_and_exits_1(report, ids_file, monkeypatch):
+    state = _state_file(ids_file)
+    state.parent.mkdir(parents=True)
+    state.write_text("previous upload", encoding="utf-8")
+    odoo = FakeOdoo(existing=2)
+    old_ids = set(odoo.table)
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        if str(dst) == str(state):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(up.os, "replace", failing_replace)
+    assert _main(report([_row(i) for i in range(3)]), ids_file, "--run_mode", "full", odoo=odoo) == 1
+    # The upload stands: the new batch is in Odoo and the previous one was archived and removed.
+    assert len(odoo.table) == 3 and not set(odoo.table) & old_ids and len(odoo.history) == 2
+    assert not ids_file.exists()
+    # No stale state (the next run must not brake against prices that are no longer uploaded),
+    # and no temporary file left behind.
+    assert list(state.parent.iterdir()) == []
+
+
+def test_upload_raises_state_file_error_with_the_created_ids(report, tmp_path):
+    odoo = FakeOdoo(existing=0)
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("x", encoding="utf-8")
+    records, _ = up.build_records(pd.DataFrame([_row(1)]))
+    with pytest.raises(up.StateFileError) as error:
+        up.upload(odoo.session(), records, "partial", str(tmp_path / "ids.json"),
+                  report_file=str(report([_row(1)])), state_file=str(blocker / "state.csv"))
+    assert error.value.created_ids == sorted(odoo.table) and len(odoo.table) == 1
+
+
+def test_upload_without_a_report_file_writes_no_state(tmp_path):
+    odoo = FakeOdoo(existing=0)
+    records, _ = up.build_records(pd.DataFrame([_row(1)]))
+    state = tmp_path / "state" / "s.csv"
+    up.upload(odoo.session(), records, "partial", str(tmp_path / "ids.json"), state_file=str(state))
+    assert not state.parent.exists()
+
+
+@pytest.mark.parametrize("value", [None, "", "{tmp}/pi-logs"])
+def test_state_default_is_where_the_prediction_reads_the_previous_report(monkeypatch, tmp_path, value):
+    """The upload writes the state where 3_predicted_prices.py's --previous_report looks by default:
+    <log folder>/state/last_uploaded_prediction_report.csv, outside the code."""
+    if value is None:
+        monkeypatch.delenv("PI_LOG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("PI_LOG_DIR", value.format(tmp=tmp_path))
+    fresh = _fresh_upload_module()
+    prediction = load_module("ml_model/3_predicted_prices.py")
+    expected = os.path.join(fresh.log_dir(), "state", "last_uploaded_prediction_report.csv")
+    assert fresh.LAST_UPLOADED_REPORT_FILE == expected == fresh.parse_args([]).state_file
+    assert prediction.parse_args([]).previous_report == expected
+    assert not expected.startswith(str(REPO_ROOT) + os.sep), "state never lives in the code folder"
