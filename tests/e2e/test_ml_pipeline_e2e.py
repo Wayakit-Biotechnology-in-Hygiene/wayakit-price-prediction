@@ -125,11 +125,9 @@ def test_clamp_to_market_range(report):
     # wins). The ceiling applies at every size; a volumetric size above the market's size range is
     # never lifted to the minimum, a pack of pieces is (the report does not say which side, so
     # outside rows skip that check).
-    # A size-adjusted ceiling (2026-11-25) can exceed the raw maximum: bulk prices per liter
-    # adjusted up to a small bottle. Every other ceiling is a quantile of the raw rows.
-    raw_ceiling = report["market_match"] != "size_adjusted"
-    assert (report.loc[raw_ceiling, "market_p75_found"]
-            <= report.loc[raw_ceiling, "market_max_found"] + ROUND_TOL).all()
+    # Every ceiling is at most the raw maximum: a quantile of the raw rows, or (since 2026-11-26,
+    # E3) a size-adjusted p75 capped at the rows' highest price per unit.
+    assert (report["market_p75_found"] <= report["market_max_found"] + ROUND_TOL).all()
     # Only larger rows are adjusted, up, and at most as if 4 times larger (b >= -1): a size-adjusted
     # ceiling is never below the minimum and at most 4 times the maximum.
     adjusted = (report["market_match"] == "size_adjusted") & (report["competitors_count"] > 0)
@@ -142,10 +140,30 @@ def test_clamp_to_market_range(report):
     upper = np.maximum(report["market_p75_found"], floor)
     below = (clamped_rows & ~report["volume_outside_market"]
              & (report["predicted_price"] < report["market_min_found"] - ROUND_TOL))
-    above = clamped_rows & (report["predicted_price"] > upper + ROUND_TOL)
+    # The family rule (2026-11-26, D4) may raise a SKU above its ceiling to a smaller sibling's
+    # price: test_family_rule_orders_total_prices checks those rows.
+    above = clamped_rows & ~report["family_raised"] & (report["predicted_price"] > upper + ROUND_TOL)
     cols = ["Product_ID", "predicted_price", "market_min_found", "market_max_found", "cost_per_unit"]
     assert not below.any(), _fail_rows(report, below, cols, "price below the market minimum")
     assert not above.any(), _fail_rows(report, above, cols, "price above the market maximum and the floor")
+
+
+def test_family_rule_orders_total_prices(report):
+    """2026-11-26 (D4): among SKUs not held from the upload, none costs less in total than a strictly
+    smaller SKU of the same subindustry, type and kind; a raised SKU costs exactly the dearest one."""
+    assert report["family_raised"].dtype == bool
+    sized = report[report["has_size"] & (report["hold_reason"].fillna("") == "")].copy()
+    sized["size"] = sized["volume"].str.split(" ").str[0].astype(float)
+    sized["kind"] = sized["volume"].str.split(" ").str[1]
+    for _, family in sized.groupby(["subindustry", "product_type", "kind"]):
+        for _, row in family.iterrows():
+            smaller = family.loc[family["size"] < row["size"], "predicted_price"]
+            if len(smaller):
+                assert row["predicted_price"] >= smaller.max() - 1e-9, row.to_dict()
+            if row["family_raised"]:
+                assert len(smaller) and row["predicted_price"] == pytest.approx(smaller.max()), row.to_dict()
+    held = report["hold_reason"].fillna("") != ""
+    assert not (held & report["family_raised"]).any()
 
 
 def test_confidence_and_counts_in_range(report):

@@ -59,8 +59,8 @@
       "file": "ml_model/wayakit_prediction_report.csv",
       "type": "value_changed",
       "column": "clamped_to_market",
-      "expected_cells": 22,
-      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "expected_cells": 20,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes. Counts updated on 2026-11-26 (Mafer: \"Sí, todo\") for the 2026-11-26 audit fixes on top: Arabic packs next to a liquid size flagged, wrong-size outliers dropped in single-catalog stores, the size-adjusted median and p75 capped at the rows' highest price per unit, and the family rule (a SKU never cheaper in total than a smaller sibling).",
       "date": "2026-11-25",
       "approved_by": "Mafer"
     },
@@ -95,8 +95,8 @@
       "file": "ml_model/wayakit_prediction_report.csv",
       "type": "value_changed",
       "column": "market_median_found",
-      "expected_cells": 321,
-      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "expected_cells": 275,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes. Counts updated on 2026-11-26 (Mafer: \"Sí, todo\") for the 2026-11-26 audit fixes on top: Arabic packs next to a liquid size flagged, wrong-size outliers dropped in single-catalog stores, the size-adjusted median and p75 capped at the rows' highest price per unit, and the family rule (a SKU never cheaper in total than a smaller sibling).",
       "date": "2026-11-25",
       "approved_by": "Mafer"
     },
@@ -113,8 +113,8 @@
       "file": "ml_model/wayakit_prediction_report.csv",
       "type": "value_changed",
       "column": "market_p75_found",
-      "expected_cells": 346,
-      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "expected_cells": 300,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes. Counts updated on 2026-11-26 (Mafer: \"Sí, todo\") for the 2026-11-26 audit fixes on top: Arabic packs next to a liquid size flagged, wrong-size outliers dropped in single-catalog stores, the size-adjusted median and p75 capped at the rows' highest price per unit, and the family rule (a SKU never cheaper in total than a smaller sibling).",
       "date": "2026-11-25",
       "approved_by": "Mafer"
     },
@@ -131,8 +131,8 @@
       "file": "ml_model/wayakit_prediction_report.csv",
       "type": "value_changed",
       "column": "porcentaje_de_ganancia",
-      "expected_cells": 614,
-      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "expected_cells": 617,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes. Counts updated on 2026-11-26 (Mafer: \"Sí, todo\") for the 2026-11-26 audit fixes on top: Arabic packs next to a liquid size flagged, wrong-size outliers dropped in single-catalog stores, the size-adjusted median and p75 capped at the rows' highest price per unit, and the family rule (a SKU never cheaper in total than a smaller sibling).",
       "date": "2026-11-25",
       "approved_by": "Mafer"
     },
@@ -140,8 +140,8 @@
       "file": "ml_model/wayakit_prediction_report.csv",
       "type": "value_changed",
       "column": "predicted_price",
-      "expected_cells": 617,
-      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
+      "expected_cells": 620,
+      "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes. Counts updated on 2026-11-26 (Mafer: \"Sí, todo\") for the 2026-11-26 audit fixes on top: Arabic packs next to a liquid size flagged, wrong-size outliers dropped in single-catalog stores, the size-adjusted median and p75 capped at the rows' highest price per unit, and the family rule (a SKU never cheaper in total than a smaller sibling).",
       "date": "2026-11-25",
       "approved_by": "Mafer"
     },
@@ -170,6 +170,24 @@
       "expected_cells": 12,
       "reason": "2026-11-25 audit fixes on the F1 data: identical variants collapsed (known brand, same size, price and multipack flag), AeroSense case packs flagged as multipacks, the Wayakit Odoo row excluded, the size-adjusted ceiling for volumetric SKUs with fewer than 3 similar-size rows (larger rows only, per-channel elasticity), and the retrained forests that follow from these input changes.",
       "date": "2026-11-25",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "column_added",
+      "column": "family_raised",
+      "expected_cells": 1,
+      "reason": "New report column (2026-11-26 audit, D4): True when the SKU cost less in total than a smaller SKU of the same subindustry, type and kind and was raised to that price.",
+      "date": "2026-11-26",
+      "approved_by": "Mafer"
+    },
+    {
+      "file": "ml_model/wayakit_prediction_report.csv",
+      "type": "column_added",
+      "column": "hold_reason",
+      "expected_cells": 1,
+      "reason": "New report column (2026-11-26 audit, D3 and E2): why a sized SKU is held from the upload (cost 0 or missing, a name size that disagrees with Volume_Liters, a model-only price in Aviation); empty when it may be uploaded.",
+      "date": "2026-11-26",
       "approved_by": "Mafer"
     }
   ]

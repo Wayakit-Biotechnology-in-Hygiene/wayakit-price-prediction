@@ -218,6 +218,10 @@ CASE_PACK_TITLES = [
     ("مطهر و معقم الاسطح 4 كراتين (5 لتر)", "l", 20.0, True),  # the plural: 4 cartons
     ("مناديل مبللة ٤ كراتين", "units", 400.0, True),  # Arabic-Indic digits
     ("مطهر 2 كرتونات 1 لتر", "l", 2.0, True),
+    # Audit 2026-11-26 (D2): an Arabic count next to a liquid size, without a carton word.
+    ("سائل الصحون 1 لتر 3 حبات متنوعة", "l", 3.0, True),
+    ("سائل الصحون 500 ملي 3 حبات متنوعة", "ml", 1500.0, True),
+    ("صابون الأيدي 350 ملي 3 حبات مسك و توت و ورد", "ml", 1050.0, True),
     # Single packages: never flagged.
     ("Deep Cleaner for Leather - 946 ml spray bottle", "ml", 946.0, False),
     ("Leather Conditioner - 473 ml bottle", "ml", 473.0, False),
@@ -226,6 +230,9 @@ CASE_PACK_TITLES = [
     ("Cabin Cleaning Wipes Triple Action - 1 carton (500 pcs) - Fresh Lemon", "units", 500.0, False),
     ("Avionics Wipes - 1 carton (400 pcs)", "units", 400.0, False),
     ("منظف الارضيات 3 لتر - ليمون", "l", 3.0, False),
+    ("منظف الأرضيات جو جرين برائحة الصنوبر - عبوة اقتصادية 30 لتر", "l", 30.0, False),  # "package", no count
+    ("صابون الأيدي 350 ملي 1 حبة", "ml", 350.0, False),  # a count of one
+    ("أكياس نفايات 50 حبة", "units", 50.0, False),  # a piece count, no liquid size
     ("كرتون مطهر و معقم الاسطح 1 حبة (5لتر)", "l", 5.0, False),  # a carton of one is one package
     ("مطهر و معقم الاسطح 1 كراتين (5 لتر)", "l", 5.0, False),  # a count of one
     ("منظف و مطهر الاسطح بدون عطر ولون 30 لتر", "l", 30.0, False),
@@ -250,7 +257,8 @@ def test_flag_multipacks_reads_aerosense_and_gogreen_case_packs(title, unit, qua
     ("Cabin Cleaning Wipes Triple Action - 4 cartons (2000 pcs) - Fresh Lemon", 4),
     ("كرتون مطهر و معقم الاسطح ٤ حبات (٥ لتر)", 4),  # Arabic-Indic digits
     ("Avionics Wipes - 1 carton (400 pcs)", 1),
-    ("مطهر 4 حبة (5لتر)", 1),  # no carton word: left to the adapters' readers
+    ("مطهر 4 حبة (5لتر)", 4),  # no carton word, but a liquid size (2026-11-26, D2)
+    ("مناديل 80 حبة", 1),  # a count with no liquid size and no carton: a piece count
     ("كرتون 4 حبة و 2 عبوة 5 لتر", 1),  # two counts: not one case
     ("Cleaner 750 ml spray bottle x 2.5", 1),
     ("Mat 60 ml bottle x 40 cm", 1),
@@ -275,3 +283,74 @@ def test_main_excludes_wayakit_company_rows(tmp_path, monkeypatch):
     assert sorted(volume["company"]) == ["Brand", "Callington"]
     assert sorted(volume["price_sar"]) == [12.0, 1000.50]
     assert units.empty
+
+
+# --- Audit 2026-11-26 (D1): a price per liter far above the rest of its search in one store --------
+def _search_row(product, price, unit, quantity, source="gogreen", type_of_product="F3-Disinfectant", url=None):
+    row = _scraper_row(product, price, unit, quantity)
+    row.update({"source": source, "type_of_product": type_of_product, "channel": "B2B",
+                "url": url or f"https://example.invalid/{source}/{abs(hash(product)) % 10**8}"})
+    return row
+
+
+# The GoGreen search of the 2026-11-26 run: the "750 مل" at 220 SAR is a 5 L can (its URL says 5لتر).
+GOGREEN_SEARCH = [
+    ("مطهر و معقم ضد الجراثيم 750 مل", 220.0, "ml", 750.0),
+    ("مطهر و معقم الاسطح 750 مل", 26.0, "ml", 750.0),
+    ("مطهر 500 مل", 20.0, "ml", 500.0),
+    ("مطهر و معقم الاسطح 5 لتر", 58.0, "L", 5.0),
+    ("مطهر و معقم الاسطح 30 لتر", 288.0, "L", 30.0),
+]
+
+
+def test_a_wrong_size_far_above_its_search_is_flagged_in_every_search():
+    rows = [_search_row(*r) for r in GOGREEN_SEARCH]
+    # The same product in another search with too few products to compare: dropped there too.
+    rows.append(_search_row(*GOGREEN_SEARCH[0], type_of_product="L2-Disinfectant", url=rows[0]["url"]))
+    flags = preprocessing.price_per_liter_outliers(pd.DataFrame(rows))
+    assert flags.tolist() == [True, False, False, False, False, True]
+
+
+def test_bulk_and_small_sizes_of_a_store_are_compared_at_the_same_size():
+    """A 50 ml bottle costs far more per liter than a 30 L can, and is not an outlier: the others
+    are first brought to its size (price per liter ~ size ** -0.5)."""
+    rows = [_search_row("Spray 50 ml", 15.0, "ml", 50.0), _search_row("Can 30 L", 288.0, "L", 30.0),
+            _search_row("Can 5 L", 58.0, "L", 5.0), _search_row("Bottle 750 ml", 26.0, "ml", 750.0)]
+    assert not preprocessing.price_per_liter_outliers(pd.DataFrame(rows)).any()
+
+
+@pytest.mark.parametrize("source", ["amazon", "noon", "saco", "mumzworld"])
+def test_marketplaces_and_ticket_a_sites_are_never_checked(source):
+    rows = [_search_row(*r, source=source) for r in GOGREEN_SEARCH]
+    assert not preprocessing.price_per_liter_outliers(pd.DataFrame(rows)).any()
+
+
+def test_a_search_needs_three_other_products_to_compare():
+    rows = [_search_row(*r) for r in GOGREEN_SEARCH[:3]]
+    assert not preprocessing.price_per_liter_outliers(pd.DataFrame(rows)).any()
+
+
+def test_the_threshold_is_4_times_the_median_at_the_same_size():
+    base = [("A 1 L", 10.0, "L", 1.0), ("B 1 L", 10.0, "L", 1.0), ("C 1 L", 10.0, "L", 1.0)]
+    for price, flagged in ((40.0, False), (40.5, True)):
+        rows = [_search_row(*r, source="officesupply") for r in base + [("D 1 L", price, "L", 1.0)]]
+        assert preprocessing.price_per_liter_outliers(pd.DataFrame(rows)).tolist()[-1] is flagged
+
+
+def test_main_drops_the_outlier_before_training(tmp_path, monkeypatch):
+    volume, _ = _run_main(tmp_path, monkeypatch, [_search_row(*r) for r in GOGREEN_SEARCH])
+    assert 220.0 not in volume["price_sar"].tolist()
+    assert len(volume[volume["company"] == "Brand"]) == 4
+
+
+@pytest.mark.parametrize("wrong_first", [False, True])
+def test_sizes_sold_on_one_page_are_separate_products(wrong_first):
+    """AeroSense lists every size and case pack of a product on one URL: a wrong size is caught
+    whatever the row order, and the right case pack on the same page is kept."""
+    page = "https://example.invalid/aerosense/cabin-cleaner"
+    right = _search_row("Cabin Cleaner - 150 ml spray bottle x 24", 663.77, "ml", 3600.0, source="aerosense", url=page)
+    wrong = _search_row("Cabin Cleaner - 150 ml spray bottle x 144", 3002.76, "ml", 150.0, source="aerosense", url=page)
+    others = [_search_row(f"Cleaner {i} 5 litre can", 400.0 + i, "L", 5.0, source="aerosense") for i in range(3)]
+    rows = ([wrong, right] if wrong_first else [right, wrong]) + others
+    flags = preprocessing.price_per_liter_outliers(pd.DataFrame(rows)).tolist()
+    assert flags == ([True, False] if wrong_first else [False, True]) + [False] * 3

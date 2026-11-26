@@ -255,6 +255,32 @@ def test_dry_run_never_touches_the_session_and_writes_the_records(report, ids_fi
     assert not ids_file.exists()
 
 
+def test_held_rows_are_never_uploaded(report, ids_file, tmp_path):
+    """Audit 2026-11-26 (D3, E2): a row with a `hold_reason` is left out, like a row without a size;
+    an empty reason (written back as NaN by a CSV) is uploaded."""
+    out = tmp_path / "dry.csv"
+    rows = [_row(0, hold_reason=""), _row(1, hold_reason="cost is 0 or missing in Odoo"),
+            _row(2, hold_reason="model-only price in Aviation (held for review)"), _row(3)]
+    argv = ["--input", str(report(rows)), "--ids-file", str(ids_file), "--run_mode", "full",
+            "--dry-run", "--dry-run-output", str(out)]
+    assert up.main(argv, session=Untouchable()) == 0
+    assert pd.read_csv(out)["product_id_str"].tolist() == ["FP-000", "FP-003"]
+
+
+def test_held_rows_are_not_created_in_odoo(report, ids_file):
+    odoo = FakeOdoo(existing=2)
+    rows = [_row(0), _row(1, hold_reason="the name says 0.1 L but Volume_Liters is 8.4"), _row(2)]
+    assert _main(report(rows), ids_file, "--run_mode", "full", odoo=odoo) == 0
+    # The old suggestions are archived and removed; only the two uploadable rows are left.
+    assert sorted(r["product_id_str"] for r in odoo.table.values()) == ["FP-000", "FP-002"]
+
+
+def test_held_marks_only_non_empty_reasons():
+    df = pd.DataFrame({"hold_reason": ["", None, float("nan"), "  ", "cost is 0"]})
+    assert up.held(df).tolist() == [False, False, False, False, True]
+    assert up.held(pd.DataFrame({"x": [1, 2]})).tolist() == [False, False]
+
+
 def test_dry_run_still_fails_on_a_broken_report(report, ids_file, tmp_path):
     rows = [_row(i, predicted_price="n/a") for i in range(3)]
     argv = ["--input", str(report(rows)), "--ids-file", str(ids_file), "--dry-run",

@@ -1,5 +1,6 @@
 import argparse
 import math
+import re
 
 import pandas as pd
 import numpy as np
@@ -27,6 +28,11 @@ CEILING_QUANTILE = 0.75        # the ceiling is the p75 per liter / per piece x 
 # (Nov 25 data) cut 4-20 L SKUs with an unchanged market by up to 56 %; the stability brake bounds
 # those instead.
 SIZE_ADJUST_MAX_RATIO = 4.0
+# Audit 2026-11-26 (Mafer): these subindustries' model-only prices (low_confidence) are held, not
+# uploaded: Aviation has no market reference at all, and its model prices reached 5-20x cost.
+HOLD_LOW_CONFIDENCE_SUBINDUSTRIES = ('Aviation',)
+# A liquid size written in a product name, "[700 mL Jasmine]", "[4 L]".
+_NAME_SIZE_RE = re.compile(r"\[\s*(\d+(?:[.,]\d+)?)\s*(ml|l)\b", re.I)
 CAT_FEATURES = ['type_of_product', 'subindustry', 'channel', 'generic_product_type', 'industry', 'company']
 MODEL_DIR = 'ml_model/trained_models'
 # Saved by 2_train_models.py (ELASTICITY_FILE there): price per liter ~ size ** b.
@@ -149,7 +155,9 @@ def market_band(rows, size, elasticity=None):
       2026-11-25), from each row's price per unit adjusted to the SKU's size,
       price x (size / row size) ** elasticity, with the size ratio clipped to
       [1 / SIZE_ADJUST_MAX_RATIO, 1] (`match` = 'size_adjusted'): bulk cans must not set a small
-      bottle's ceiling per liter. Rows smaller than the SKU are not adjusted.
+      bottle's ceiling per liter. Rows smaller than the SKU are not adjusted. The adjusted median
+      and p75 never exceed the highest price per unit of the rows (`max`; audit 2026-11-26, E3:
+      35 adjusted ceilings were above any price per liter seen at any size).
     Returns None when the type has no market rows.
     """
     if rows is None or len(rows) == 0:
@@ -166,7 +174,8 @@ def market_band(rows, size, elasticity=None):
         match, used = 'all', prices
     return {
         'count': len(prices), 'low': float(prices.min()), 'max': float(prices.max()),
-        'median': float(np.quantile(used, 0.5)), 'p75': float(np.quantile(used, CEILING_QUANTILE)),
+        'median': float(min(np.quantile(used, 0.5), prices.max())),
+        'p75': float(min(np.quantile(used, CEILING_QUANTILE), prices.max())),
         'size_min': float(sizes.min()), 'size_max': float(sizes.max()), 'match': match,
     }
 
@@ -224,6 +233,13 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
        per liter or per piece, what the smallest-priced smaller SKU of the same subindustry and
        type costs after steps 2 and 3 (`volume_capped`).
     5. x size, then the margin floor (`apply_margin_floor`), which always wins.
+    6. Family rule (`family_floor`, audit 2026-11-26): a SKU never costs less in total than a
+       smaller SKU of the same subindustry, type and kind; it is raised to that price
+       (`family_raised`). Raising keeps the margin floor. Held SKUs take no part.
+
+    `hold_reason` (`hold_reason()`) is '' for a price the upload may send, else why it is held:
+    cost 0 or missing, a size in the name that disagrees with Volume_Liters, or a model-only price
+    in HOLD_LOW_CONFIDENCE_SUBINDUSTRIES.
 
     `previous_price` is the previous row's `predicted_price` (NaN without one) and
     `stability_limited` is True when the brake changed the price per unit (steps 4 and 5 may still
@@ -294,7 +310,8 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
         if previous is None:
             continue
         last = item['previous_price'] = _number(previous.get('predicted_price'))
-        if (item['kind'] is None or not last > 0 or item['clamped']
+        # A price held from the upload never reached Odoo: nothing to keep stable.
+        if (item['kind'] is None or not last > 0 or item['clamped'] or _text(previous.get('hold_reason'))
                 or not _same_market(_market_columns(item), previous)):
             continue
         braked = min(max(item['pu'], last / item['size'] * (1 - limit)), last / item['size'] * (1 + limit))
@@ -322,11 +339,15 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
             item['pu'] = min(sibling_prices)
             item['capped'] = True
 
+    finals = [apply_margin_floor(item['pu'] * item['size'], item['row']['Unit_cost_SAR']) for item in items]
+    lows = [_market_columns(item)['competitors_count'] < MIN_COMPETITORS_FOR_CLAMP for item in items]
+    holds = [hold_reason(item['row'], item['kind'] is not None, low) for item, low in zip(items, lows)]
+    raised = family_floor(items, finals, eligible=[not reason for reason in holds])
+
     report_list = []
-    for item in items:
+    for item, final_price, family_raised, low_confidence, held in zip(items, finals, raised, lows, holds):
         row, band, size = item['row'], item['band'], item['size']
         cost = row['Unit_cost_SAR']
-        final_price = apply_margin_floor(item['pu'] * size, cost)
         profit_margin = ((final_price - cost) / cost) * 100 if cost > 0 else 0
         market = _market_columns(item)
 
@@ -349,12 +370,71 @@ def generate_predictions(df_wayakit, model_vol, model_unit, vol_cols, unit_cols,
             'volume_capped': item['capped'],
             'has_size': item['kind'] is not None,
             'ceiling_source': market['ceiling_source'],
-            'low_confidence': market['competitors_count'] < MIN_COMPETITORS_FOR_CLAMP,
+            'low_confidence': low_confidence,
             'previous_price': item['previous_price'],
             'stability_limited': item['limited'],
+            'family_raised': family_raised,
+            'hold_reason': held,
         })
 
     return pd.DataFrame(report_list)
+
+
+def family_floor(items, finals, eligible=None):
+    """Raises `finals` in place so that no SKU costs less in total than a strictly smaller SKU of
+    the same subindustry, type of product and kind (volume or pieces); returns, per item, True
+    where it raised the price. Items without a size, and those not `eligible` (held from the
+    upload: their size or cost may be wrong), are left alone and never set another's price. The new price is a smaller
+    SKU's final price, which already holds its own margin floor, and it is only ever raised, so the
+    item's floor holds too."""
+    raised = [False] * len(items)
+    eligible = [True] * len(items) if eligible is None else eligible
+    families = {}
+    for index, item in enumerate(items):
+        if item['kind'] is None or not finals[index] > 0 or not eligible[index]:
+            continue
+        row = item['row']
+        families.setdefault((row.get('subindustry'), row.get('type_of_product'), item['kind']), []).append(index)
+    for members in families.values():
+        members.sort(key=lambda index: items[index]['size'])
+        dearest_smaller, position = 0.0, 0
+        while position < len(members):
+            size = items[members[position]]['size']
+            same_size = [index for index in members[position:] if items[index]['size'] == size]
+            for index in same_size:
+                if finals[index] < dearest_smaller:
+                    finals[index], raised[index] = dearest_smaller, True
+            dearest_smaller = max([dearest_smaller] + [finals[index] for index in same_size])
+            position += len(same_size)
+    return raised
+
+
+def name_size_liters(name):
+    """The liquid size written in brackets in a product name ("[700 mL Jasmine]" -> 0.7), or None."""
+    match = _NAME_SIZE_RE.search(_text(name))
+    if not match:
+        return None
+    value = float(match.group(1).replace(',', '.'))
+    return value / 1000 if match.group(2).lower() == 'ml' else value
+
+
+def hold_reason(row, has_size, low_confidence):
+    """'' when the upload may send this SKU's price, else why it is held (audit 2026-11-26, D3 and
+    E2): Odoo master data to fix first, or a model-only price in HOLD_LOW_CONFIDENCE_SUBINDUSTRIES.
+    Products without a size are skipped by the upload anyway (no reason here)."""
+    if not has_size:
+        return ''
+    reasons = []
+    cost = _number(row.get('Unit_cost_SAR'))
+    if not cost > 0:
+        reasons.append('cost is 0 or missing in Odoo')
+    named = name_size_liters(row.get('Product_Name'))
+    volume = _number(row.get('Volume_Liters'))
+    if named is not None and not (volume > 0 and abs(named - volume) <= 0.01 * volume):
+        reasons.append(f'the name says {named:g} L but Volume_Liters is {volume:g}')
+    if low_confidence and _text(row.get('subindustry')) in HOLD_LOW_CONFIDENCE_SUBINDUSTRIES:
+        reasons.append(f"model-only price in {_text(row.get('subindustry'))} (held for review)")
+    return '; '.join(reasons)
 
 
 def _market_columns(item):
@@ -462,7 +542,9 @@ def main(argv=None):
                 f"Low confidence (model only, fewer than {MIN_COMPETITORS_FOR_CLAMP} competitor rows): "
                 f"{int(report_df['low_confidence'].sum())} of {len(report_df)}. "
                 f"Stability-limited (same market, model moved more than {STABILITY_LIMIT:.0%}): "
-                f"{int(report_df['stability_limited'].sum())}.")
+                f"{int(report_df['stability_limited'].sum())}. "
+                f"Raised to a smaller size's price (family rule): {int(report_df['family_raised'].sum())}. "
+                f"Held from the upload: {int((report_df['hold_reason'] != '').sum())}.")
 
     # Save and analyze final report
     output_filename = 'ml_model/wayakit_prediction_report.csv'

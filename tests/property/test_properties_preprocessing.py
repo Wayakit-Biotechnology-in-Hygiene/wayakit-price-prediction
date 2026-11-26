@@ -188,3 +188,14 @@ def test_case_notations_are_flagged(name, size, volume, container, n, scent, ara
                         (f"كرتون {arabic} {n} حبة ({liters}لتر)", "l")):
         assert preprocessing.case_pack(title) == n, title
         assert preprocessing.flag_multipacks([title], [unit], [float(n * 500)]) == [True], title
+
+
+@given(arabic=ARABIC_NAMES, size=st.integers(1, 5000), unit=st.sampled_from(["مل", "ملي", "لتر", "ليتر"]),
+       n=st.integers(2, 9999), word=st.sampled_from(["حبات", "حبة", "عبوات", "قطع"]), before=st.booleans())
+def test_an_arabic_count_next_to_a_liquid_size_is_a_case_pack(arabic, size, unit, n, word, before):
+    """Audit 2026-11-26 (D2): "سائل الصحون 1 لتر 3 حبات" is a pack of 3 without any carton word;
+    without the count (or with a count of one) it is one bottle."""
+    title = f"{arabic} {n} {word} {size} {unit}" if before else f"{arabic} {size} {unit} {n} {word}"
+    assert preprocessing.case_pack(title) == n, title
+    assert preprocessing.case_pack(f"{arabic} {size} {unit}") == 1
+    assert preprocessing.case_pack(f"{arabic} {size} {unit} 1 {word}") == 1

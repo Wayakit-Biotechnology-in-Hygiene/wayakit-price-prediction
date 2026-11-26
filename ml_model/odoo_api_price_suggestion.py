@@ -5,6 +5,9 @@ Modes:
 - Products without a size (no-size parent templates: `has_size` False or `volume` 0) are never
   uploaded: their price is only the cost x 1.30 floor (F7a). In full mode their previous
   suggestions are removed with the rest.
+- Rows with a `hold_reason` (3_predicted_prices.py, audit 2026-11-26: cost 0, a name whose size
+  disagrees with Volume_Liters, Aviation's model-only prices) are not uploaded either; in full
+  mode their previous suggestions are removed with the rest.
 - `--dry-run`: builds the records and writes them to a CSV (default
   ml_model/price_suggestion_dry_run.csv). Reads no secrets and connects to nothing.
 - `--run_mode partial` (default): creates the new records; deletes nothing.
@@ -173,6 +176,14 @@ def without_size(df: pd.DataFrame) -> pd.Series:
     if 'has_size' in df:
         no_size |= df['has_size'].astype(str).str.strip().str.lower().isin(['false', '0'])
     return no_size.fillna(False).astype(bool)
+
+
+def held(df: pd.DataFrame) -> pd.Series:
+    """True for report rows with a non-empty `hold_reason` (False for reports without the
+    column, written before 2026-11-26). Pure."""
+    if 'hold_reason' not in df:
+        return pd.Series(False, index=df.index)
+    return (df['hold_reason'].fillna('').astype(str).str.strip() != '').astype(bool)
 
 
 def build_records(df: pd.DataFrame) -> tuple:
@@ -492,6 +503,12 @@ def main(argv=None, session: 'OdooSession' = None) -> int:
                            "margin floor, not a suggestion; fix their size in Odoo): "
                            f"{sorted(df_results.loc[no_size, 'Product_ID'].astype(str).unique())}")
             df_results = df_results[~no_size]
+        on_hold = held(df_results)
+        if on_hold.any():
+            for product_id, reason in df_results.loc[on_hold, ['Product_ID', 'hold_reason']].drop_duplicates().itertuples(index=False):
+                logger.warning(f"Held, not uploaded: {product_id}: {reason}")
+            logger.warning(f"{int(on_hold.sum())} rows held from the upload (see hold_reason in the report).")
+            df_results = df_results[~on_hold]
         records, skipped = build_records(df_results)
         check_parse_quality(records, skipped)
         logger.info(f"{len(records)} records ready ({len(skipped)} rows skipped).")
